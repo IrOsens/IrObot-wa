@@ -1,0 +1,29 @@
+{
+  "name": "iro-wabot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Lightweight personal WhatsApp bot using Baileys with QR terminal login.",
+  "main": "src/index.js",
+  "scripts": {
+    "setup": "node scripts/bootstrap.mjs",
+    "setup:full": "node scripts/bootstrap.mjs --with-tools",
+    "doctor": "node scripts/doctor.mjs",
+    "postinstall": "node scripts/bootstrap.mjs --prepare-only",
+    "start": "node src/index.js",
+    "check": "node --check src/index.js && node --check src/config.js && node --check src/logger.js && node --check src/tools.js && node --check src/text.js && node --check src/media.js && node --check src/sticker.js && node --check src/tasks.js && node --check src/pdf.js && node --check src/youtube.js && node --check src/saved.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc11",
+    "file-type": "^22.0.1",
+    "mime-types": "^2.1.35",
+    "node-webpmux": "^3.2.0",
+    "pdf-lib": "^1.17.1",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.33.5"
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+npm-debug.log*
+
+auth/
+data/tasks.json
+data/task-media/
+data/saved-messages.json
+data/saved-messages/
+logs/
+temp/
+
+.env
+.DS_Store
+Thumbs.db
