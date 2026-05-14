@@ -5,6 +5,7 @@ import { cleanupFiles } from './media.js';
 import { runTool } from './tools.js';
 
 const QUALITIES = new Set(['360', '480', '720', '1080']);
+const YOUTUBE_FALLBACK_EXTRACTOR_ARGS = 'youtube:player_client=default,mweb,web_embedded';
 
 export function parseYoutubeArgs(args) {
   const [url, kind = 'mp4', quality = '720'] = args;
@@ -29,27 +30,26 @@ export async function downloadYoutube(args, tools) {
   const outputTemplate = path.join(TEMP_DIR, `${prefix}.%(ext)s`);
   const baseArgs = [
     '--no-playlist',
+    '--no-cache-dir',
     '--restrict-filenames',
     '--windows-filenames',
     '-o', outputTemplate
   ];
 
-  if (parsed.type === 'mp3') {
-    await runTool(tools.ytDlp, [
-      ...baseArgs,
-      '-x',
-      '--audio-format', 'mp3',
-      '--audio-quality', '0',
-      parsed.url
-    ], { timeout: 10 * 60 * 1000 });
-  } else {
-    await runTool(tools.ytDlp, [
-      ...baseArgs,
-      '-f', `bestvideo[height<=${parsed.quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${parsed.quality}][ext=mp4]/best[height<=${parsed.quality}]`,
-      '--merge-output-format', 'mp4',
-      parsed.url
-    ], { timeout: 15 * 60 * 1000 });
+  const attempts = buildDownloadAttempts(parsed, baseArgs);
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      await runTool(tools.ytDlp, attempt.args, { timeout: attempt.timeout });
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      await cleanupPrefix(prefix);
+      if (!attempt.retryable || !isRetryableYoutubeError(error)) break;
+    }
   }
+  if (lastError) throw friendlyYoutubeError(lastError);
 
   const entries = await fs.readdir(TEMP_DIR);
   const matches = entries
@@ -68,4 +68,83 @@ export async function downloadYoutube(args, tools) {
     mimetype: parsed.type === 'mp3' ? 'audio/mpeg' : 'video/mp4',
     fileName: `youtube-${Date.now()}.${parsed.type}`
   };
+}
+
+function buildDownloadAttempts(parsed, baseArgs) {
+  if (parsed.type === 'mp3') {
+    return [
+      {
+        retryable: true,
+        timeout: 10 * 60 * 1000,
+        args: [...baseArgs, '-x', '--audio-format', 'mp3', '--audio-quality', '0', parsed.url]
+      },
+      {
+        retryable: false,
+        timeout: 10 * 60 * 1000,
+        args: [
+          ...baseArgs,
+          '--extractor-args', YOUTUBE_FALLBACK_EXTRACTOR_ARGS,
+          '-x',
+          '--audio-format', 'mp3',
+          '--audio-quality', '0',
+          parsed.url
+        ]
+      }
+    ];
+  }
+
+  const primaryFormat = `bestvideo[height<=${parsed.quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${parsed.quality}][ext=mp4]/best[height<=${parsed.quality}]`;
+  const fallbackFormat = `bv*[height<=${parsed.quality}]+ba/b[height<=${parsed.quality}]/b`;
+  return [
+    {
+      retryable: true,
+      timeout: 15 * 60 * 1000,
+      args: [...baseArgs, '-f', primaryFormat, '--merge-output-format', 'mp4', parsed.url]
+    },
+    {
+      retryable: false,
+      timeout: 15 * 60 * 1000,
+      args: [
+        ...baseArgs,
+        '--extractor-args', YOUTUBE_FALLBACK_EXTRACTOR_ARGS,
+        '-f', fallbackFormat,
+        '--merge-output-format', 'mp4',
+        '--remux-video', 'mp4',
+        parsed.url
+      ]
+    }
+  ];
+}
+
+async function cleanupPrefix(prefix) {
+  const entries = await fs.readdir(TEMP_DIR).catch(() => []);
+  const matches = entries
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => path.join(TEMP_DIR, name));
+  await cleanupFiles(matches);
+}
+
+function isRetryableYoutubeError(error) {
+  const text = `${error?.stderr || ''}\n${error?.stdout || ''}\n${error?.message || ''}`;
+  return /Precondition check failed|HTTP Error 403|HTTP Error 400|nsig extraction failed|Unable to download API page/i.test(text);
+}
+
+function friendlyYoutubeError(error) {
+  const text = `${error?.stderr || ''}\n${error?.stdout || ''}\n${error?.message || ''}`;
+  if (isRetryableYoutubeError(error)) {
+    return new Error([
+      'YouTube menolak download dari yt-dlp saat ini.',
+      'Coba update yt-dlp ke versi terbaru. Jika tetap gagal, video ini mungkin butuh cookies browser atau PO token YouTube.',
+      lastUsefulLine(text)
+    ].filter(Boolean).join('\n'));
+  }
+  return error;
+}
+
+function lastUsefulLine(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /ERROR|WARNING|HTTP Error|Precondition|Forbidden|nsig/i.test(line))
+    .at(-1);
 }

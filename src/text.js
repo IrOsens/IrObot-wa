@@ -37,6 +37,7 @@ export function unwrapMessage(message) {
   if (message.ephemeralMessage?.message) return unwrapMessage(message.ephemeralMessage.message);
   if (message.viewOnceMessage?.message) return unwrapMessage(message.viewOnceMessage.message);
   if (message.viewOnceMessageV2?.message) return unwrapMessage(message.viewOnceMessageV2.message);
+  if (message.viewOnceMessageV2Extension?.message) return unwrapMessage(message.viewOnceMessageV2Extension.message);
   if (message.documentWithCaptionMessage?.message) return unwrapMessage(message.documentWithCaptionMessage.message);
   return message;
 }

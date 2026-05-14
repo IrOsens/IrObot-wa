@@ -32,6 +32,23 @@ export function quotedMediaNode(message) {
   return quoted ? mediaNode(quoted) : null;
 }
 
+export function isViewOnceMediaMessage(message) {
+  const raw = message?.message;
+  const found = mediaNode(message);
+  if (!raw || !found) return false;
+  return hasViewOnceEnvelope(raw) || Boolean(found.node?.viewOnce);
+}
+
+function hasViewOnceEnvelope(content) {
+  if (!content) return false;
+  if (content.viewOnceMessage?.message) return true;
+  if (content.viewOnceMessageV2?.message) return true;
+  if (content.viewOnceMessageV2Extension?.message) return true;
+  if (content.ephemeralMessage?.message) return hasViewOnceEnvelope(content.ephemeralMessage.message);
+  if (content.documentWithCaptionMessage?.message) return hasViewOnceEnvelope(content.documentWithCaptionMessage.message);
+  return false;
+}
+
 export function isLikelyAnimated(media) {
   const mimetype = media?.mimetype || '';
   const fileName = media?.fileName || '';

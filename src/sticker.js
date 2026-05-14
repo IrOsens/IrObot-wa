@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
 import webp from 'node-webpmux';
-import { makeTempPath } from './config.js';
+import { TEMP_DIR, makeTempPath } from './config.js';
 import { cleanupFiles, isLikelyAnimated } from './media.js';
 import { runTool } from './tools.js';
 
@@ -68,8 +68,7 @@ export async function reverseSticker(media, tools) {
   const outPath = makeTempPath('reverse-sticker', animated ? '.gif' : '.png');
   try {
     if (animated) {
-      if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Install FFmpeg untuk reverse sticker bergerak.');
-      await runTool(tools.ffmpeg, ['-y', '-i', media.path, outPath]);
+      await animatedWebpToGif(media.path, outPath, tools);
       return {
         buffer: await fs.readFile(outPath),
         mimetype: 'image/gif',
@@ -84,6 +83,45 @@ export async function reverseSticker(media, tools) {
     };
   } finally {
     await cleanupFiles([outPath]);
+  }
+}
+
+async function animatedWebpToGif(inputPath, outPath, tools) {
+  try {
+    await sharp(inputPath, { animated: true, pages: -1 })
+      .gif({ loop: 0 })
+      .toFile(outPath);
+    return;
+  } catch (error) {
+    if (!tools.ffmpeg) {
+      throw new Error(`Gagal membaca sticker bergerak dan FFmpeg tidak tersedia untuk fallback: ${error.message}`);
+    }
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(TEMP_DIR, 'reverse-frames-'));
+  const framePaths = [];
+  try {
+    const image = new webp.Image();
+    await image.load(inputPath);
+    const frames = await image.demux({ buffers: true });
+    if (!frames?.length) throw new Error('Frame sticker bergerak tidak ditemukan.');
+
+    for (const [index, frame] of frames.entries()) {
+      const framePath = path.join(tempDir, `frame-${String(index).padStart(4, '0')}.png`);
+      framePaths.push(framePath);
+      await sharp(frame).png().toFile(framePath);
+    }
+
+    await runTool(tools.ffmpeg, [
+      '-y',
+      '-framerate', '15',
+      '-i', path.join(tempDir, 'frame-%04d.png'),
+      '-loop', '0',
+      outPath
+    ]);
+  } finally {
+    await cleanupFiles(framePaths);
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 

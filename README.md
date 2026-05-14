@@ -80,6 +80,17 @@ Scan QR yang muncul di terminal. Session akan disimpan di folder `auth/`.
 
 Bot tetap bisa start tanpa tool tersebut. Command yang membutuhkan tool hilang akan memberi pesan error yang jelas.
 
+Catatan YouTube:
+
+- Command `,yt` memakai fallback untuk beberapa error YouTube seperti HTTP 400/403 dan `nsig extraction failed`.
+- Jika YouTube tetap menolak, update `yt-dlp` ke versi terbaru. Beberapa video bisa membutuhkan cookies browser atau PO token YouTube.
+
+Catatan view-once:
+
+- `,rs [target]` memakai cache sementara selama bot hidup.
+- Cache hanya menyimpan metadata pesan terbaru, bukan file media view-once permanen.
+- Jika bot restart atau media sudah tidak valid di server WhatsApp, view-once lama mungkin tidak bisa diambil.
+
 ## Membuat Repo Baru dan Push ke GitHub
 
 Pastikan file sensitif tetap tidak ikut commit. `.gitignore` proyek ini sudah mengabaikan:
@@ -128,6 +139,7 @@ Jika ingin tetap login tanpa scan ulang, pindahkan folder `auth/` secara manual 
 - `,load del <id|judul>`
 - `,s [author] [title]`
 - `,rs`
+- `,rs <nama grup|nama kontak|nomor telepon>`
 - `,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal]`
 - `,ltask`
 - `,ltask true <id>`
@@ -138,3 +150,19 @@ Jika ingin tetap login tanpa scan ulang, pindahkan folder `auth/` secara manual 
 - `,cancel`
 
 Folder runtime dibuat otomatis: `auth/`, `data/`, `logs/`, `temp/`.
+
+## Alur PDF
+
+Cara normal:
+
+1. ketik `,topdf`
+2. reply media pertama dengan teks/caption `1`
+3. reply media kedua dengan teks/caption `2`
+4. lanjutkan sesuai urutan halaman
+5. ketik `,end`
+
+Mode lama tetap bisa dipakai: reply media langsung dengan `,topdf` atau `,topdf 1`.
+
+## Save/Load
+
+`,save` sekarang mencoba menyimpan konten umum WhatsApp: teks, image, video, audio, dokumen, sticker, lokasi/maps, kontak, multi-kontak, poll, dan event. Tipe yang belum bisa dikirim ulang native akan disimpan sebagai fallback supaya tetap ada jejak saat `,load`.

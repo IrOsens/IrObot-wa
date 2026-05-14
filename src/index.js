@@ -19,7 +19,15 @@ import {
 import { cleanupOldLogs, logger } from './logger.js';
 import { detectTools, formatBytes, formatDuration, getDiskInfo, getLoadAverageText } from './tools.js';
 import { getMessageText, parseCommand } from './text.js';
-import { cleanupFiles, downloadQuotedOrOwnMedia, downloadUrlMedia, mediaNode, quotedMediaNode } from './media.js';
+import {
+  cleanupFiles,
+  downloadMessageMedia,
+  downloadQuotedOrOwnMedia,
+  downloadUrlMedia,
+  isViewOnceMediaMessage,
+  mediaNode,
+  quotedMediaNode
+} from './media.js';
 import { makeSticker, parseStickerMeta, reverseSticker } from './sticker.js';
 import { TaskScheduler, createTask, formatTaskList, formatWib, listTasks, updateTaskState } from './tasks.js';
 import { PdfSessions } from './pdf.js';
@@ -37,15 +45,60 @@ import {
 class ChatDirectory {
   constructor() {
     this.byName = new Map();
+    this.byJid = new Map();
   }
 
   remember(jid, name) {
-    if (!jid || !name) return;
-    this.byName.set(String(name).trim(), jid);
+    if (!jid) return;
+    const cleanJid = String(jid).trim();
+    this.byJid.set(cleanJid, cleanJid);
+    if (!name) return;
+    const cleanName = normalizeLookupText(name);
+    if (cleanName) this.byName.set(cleanName, cleanJid);
   }
 
   findByName(name) {
-    return this.byName.get(name) || null;
+    const query = String(name || '').trim();
+    if (!query) return null;
+    if (this.byJid.has(query)) return query;
+    const phoneJid = tryNormalizePhoneToJid(query);
+    if (phoneJid) return phoneJid;
+
+    const normalized = normalizeLookupText(query);
+    if (this.byName.has(normalized)) return this.byName.get(normalized);
+    const matches = [...this.byName.entries()].filter(([key]) => key.includes(normalized));
+    return matches.length === 1 ? matches[0][1] : null;
+  }
+}
+
+class ViewOnceCache {
+  constructor({ maxPerTarget = 20, ttlMs = 24 * 60 * 60 * 1000 } = {}) {
+    this.maxPerTarget = maxPerTarget;
+    this.ttlMs = ttlMs;
+    this.byTarget = new Map();
+  }
+
+  remember(message) {
+    if (!isViewOnceMediaMessage(message)) return;
+    const now = Date.now();
+    const targets = [message.key?.remoteJid, message.key?.participant].filter(Boolean);
+    for (const target of targets) {
+      const entries = this.pruned(target, now);
+      entries.unshift({ message, seenAt: now });
+      this.byTarget.set(target, entries.slice(0, this.maxPerTarget));
+    }
+  }
+
+  latest(target) {
+    return this.pruned(target, Date.now())[0]?.message || null;
+  }
+
+  pruned(target, now) {
+    const entries = this.byTarget.get(target) || [];
+    const fresh = entries.filter((entry) => now - entry.seenAt <= this.ttlMs);
+    if (fresh.length) this.byTarget.set(target, fresh);
+    else this.byTarget.delete(target);
+    return fresh;
   }
 }
 
@@ -53,12 +106,17 @@ const state = {
   sock: null,
   tools: null,
   chatDirectory: new ChatDirectory(),
+  viewOnceCache: new ViewOnceCache(),
   scheduler: null,
   pdfSessions: null,
   saveRecorder: null,
   ignoredOwnMessageIds: new Set(),
   reconnecting: false
 };
+
+function normalizeLookupText(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
 
 function shouldReconnect(lastDisconnect) {
   const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -95,8 +153,10 @@ async function handleHelp(jid) {
     '',
     'Sticker & Media',
     ',s [author] [title] - buat sticker dari attach/reply/URL media',
-    ',rs - reverse sticker jadi PNG/GIF atau keluarkan ulang media/view-once',
+    ',rs - reverse sticker/media yang direply',
+    ',rs [nama grup|nama kontak|nomor] - kirim view-once terbaru dari target',
     ',topdf [urutan] - mulai sesi PDF; bisa reply media langsung',
+    'Saat sesi PDF aktif, reply media dengan caption/teks angka untuk urutan halaman',
     '',
     'Downloader',
     ',yt <link> <mp3|mp4> [360|480|720|1080]',
@@ -108,7 +168,7 @@ async function handleHelp(jid) {
     ',ltask true|false|del <id> - resume/pause/hapus task',
     '',
     'Saved Message',
-    ',save <judul> [teks awal] - mulai rekam',
+    ',save <judul> [teks awal] - mulai rekam teks/media/lokasi/kontak/poll/event',
     ',load - lihat semua save',
     ',load <id|judul> - kirim ulang save',
     ',load del <id|judul> - hapus save',
@@ -161,10 +221,14 @@ async function handleSticker(message, command) {
   }
 }
 
-async function handleReverseSticker(message) {
+async function handleReverseSticker(message, command) {
   const jid = message.key.remoteJid;
   let media = null;
   try {
+    if (command.rawArgs.trim()) {
+      await sendLatestViewOnce(jid, command.rawArgs.trim());
+      return;
+    }
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'reverse-source');
     if (!media) throw new Error('Reply atau attach sticker/media/view-once untuk memakai ,rs.');
     if (media.type === 'imageMessage') {
@@ -187,6 +251,41 @@ async function handleReverseSticker(message) {
     }
   } finally {
     await cleanupFiles([media?.path]);
+  }
+}
+
+async function sendLatestViewOnce(destinationJid, targetQuery) {
+  const targetJid = state.chatDirectory.findByName(targetQuery);
+  if (!targetJid) throw new Error(`Target "${targetQuery}" tidak ditemukan di cache chat/kontak bot.`);
+  const source = state.viewOnceCache.latest(targetJid);
+  if (!source) throw new Error(`Belum ada view-once terbaru dari "${targetQuery}" selama bot aktif.`);
+
+  let media = null;
+  try {
+    media = await downloadMessageMedia(state.sock, source, 'view-once');
+    if (!media) throw new Error('View-once ditemukan, tapi medianya tidak bisa dibaca.');
+    await sendDownloadedMedia(destinationJid, media);
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
+}
+
+async function sendDownloadedMedia(jid, media) {
+  const buffer = await fs.readFile(media.path);
+  if (media.type === 'imageMessage') {
+    await state.sock.sendMessage(jid, { image: buffer, mimetype: media.mimetype, caption: media.node?.caption || undefined });
+  } else if (media.type === 'videoMessage') {
+    await state.sock.sendMessage(jid, { video: buffer, mimetype: media.mimetype, caption: media.node?.caption || undefined });
+  } else if (media.type === 'audioMessage') {
+    await state.sock.sendMessage(jid, { audio: buffer, mimetype: media.mimetype });
+  } else if (media.type === 'stickerMessage') {
+    await state.sock.sendMessage(jid, { sticker: buffer, isAnimated: media.node?.isAnimated || undefined });
+  } else {
+    await state.sock.sendMessage(jid, {
+      document: buffer,
+      mimetype: media.mimetype || 'application/octet-stream',
+      fileName: media.fileName || `view-once-${Date.now()}`
+    });
   }
 }
 
@@ -223,6 +322,12 @@ function normalizePhoneToJid(input) {
   if (phone.startsWith('0')) phone = `62${phone.slice(1)}`;
   else if (phone.startsWith('8')) phone = `62${phone}`;
   return `${phone}@s.whatsapp.net`;
+}
+
+function tryNormalizePhoneToJid(input) {
+  const digits = String(input || '').replace(/[^\d]/g, '');
+  if (digits.length < 8) return null;
+  return normalizePhoneToJid(digits);
 }
 
 async function handleInfo(message, command) {
@@ -301,7 +406,7 @@ async function handleEndPdf(message) {
 async function handleSave(message, command) {
   const { title, firstText } = parseSaveStart(command);
   const session = state.saveRecorder.start(message.key.remoteJid, title, firstText);
-  await sendText(message.key.remoteJid, `Mulai rekam save "${session.title}". Kirim teks/media apa pun, lalu ,end untuk simpan atau ,cancel untuk batal.`);
+  await sendText(message.key.remoteJid, `Mulai rekam save "${session.title}". Kirim teks, media, lokasi, kontak, poll, atau event lalu ,end untuk simpan atau ,cancel untuk batal.`);
 }
 
 async function handleLoad(message, command) {
@@ -338,9 +443,9 @@ async function cancelSave(message) {
 
 async function maybeCollectPdfItem(message, text) {
   if (!state.pdfSessions.has(message.key.remoteJid)) return false;
-  if (!mediaNode(message)) return false;
+  if (!mediaNode(message) && !quotedMediaNode(message)) return false;
   const order = /^\s*\d+\s*$/.test(text) ? Number(text.trim()) : null;
-  const item = await state.pdfSessions.add(state.sock, message, order);
+  const item = await state.pdfSessions.addAny(state.sock, message, order);
   if (item) await sendText(message.key.remoteJid, `Ditambahkan ke PDF: ${item.fileName} (#${item.order})`);
   return Boolean(item);
 }
@@ -373,7 +478,7 @@ async function handleCommand(message, command) {
       await handleSticker(message, command);
       break;
     case 'rs':
-      await handleReverseSticker(message);
+      await handleReverseSticker(message, command);
       break;
     case 'task':
       await handleTask(message, command);
@@ -395,7 +500,10 @@ async function handleCommand(message, command) {
 
 async function onMessageUpsert(event) {
   for (const message of event.messages || []) {
-    if (!message.message || !message.key?.fromMe || message.key.remoteJid === 'status@broadcast') continue;
+    if (!message.message || !message.key?.remoteJid || message.key.remoteJid === 'status@broadcast') continue;
+    rememberMessageDirectory(message);
+    state.viewOnceCache.remember(message);
+    if (!message.key?.fromMe) continue;
     if (isIgnoredOwnOutput(message)) continue;
     const jid = message.key.remoteJid;
     const text = getMessageText(message);
@@ -415,6 +523,14 @@ async function onMessageUpsert(event) {
       await sendText(jid, `Error: ${error.message}`);
     }
   }
+}
+
+function rememberMessageDirectory(message) {
+  const remoteJid = message.key?.remoteJid;
+  if (!remoteJid) return;
+  state.chatDirectory.remember(remoteJid);
+  if (!remoteJid.endsWith('@g.us')) state.chatDirectory.remember(remoteJid, message.pushName);
+  if (message.key?.participant) state.chatDirectory.remember(message.key.participant, message.pushName);
 }
 
 async function loadGroups(sock) {
