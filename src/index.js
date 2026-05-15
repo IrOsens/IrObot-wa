@@ -23,13 +23,17 @@ import {
   TASKS_FILE,
   TELEGRAM_CLIENT_ID,
   TELEGRAM_PART_SIZE_BYTES,
+  UPDATE_BRANCH,
+  UPDATE_REMOTE,
+  UPDATE_RESTART_MODE,
+  UPDATE_SYSTEMD_SERVICE,
   WOL_FILE,
   YOUTUBE_COOKIE_FILE,
   cleanupStartupTemp,
   ensureRuntimeDirs
 } from './config.js';
 import { cleanupOldLogs, logger } from './logger.js';
-import { detectTools, formatBytes, formatDuration, getDiskInfo, getLoadAverageText } from './tools.js';
+import { detectTools, formatBytes, formatDuration, getDiskInfo, getLoadAverageText, runTool } from './tools.js';
 import { getMessageText, parseCommand } from './text.js';
 import {
   cleanupFiles,
@@ -58,8 +62,9 @@ import {
 import { handleLinkCommand, handleNoteCommand, listLinks, listNotes } from './notes.js';
 import { ReminderScheduler, createReminder, formatCountdown, listReminders } from './reminders.js';
 import { handleWolCommand, listWol } from './wol.js';
-import { sendDataBackupToTelegram } from './backup.js';
+import { DailyBackupScheduler, sendDataBackupToTelegram } from './backup.js';
 import { RestoreSessions } from './restore.js';
+import { PendingConfirmStore, parseSecretMediaTriggerText } from './confirm.js';
 import {
   hasYoutubeCookies,
   isYoutubeCookieNeededError,
@@ -137,6 +142,8 @@ const state = {
   pdfSessions: null,
   restoreSessions: null,
   saveRecorder: null,
+  backupScheduler: null,
+  confirmStore: new PendingConfirmStore(),
   youtubeCookieSessions: new Map(),
   ignoredOwnMessageIds: new Set(),
   reconnecting: false
@@ -177,44 +184,47 @@ function isIgnoredOwnOutput(message) {
 
 async function handleHelp(jid) {
   await sendText(jid, [
-    `${BOT_NAME} Help`,
-    'commands/',
-    '  media/',
-    '    ,s [author] [title]      buat sticker dari attach/reply/URL',
-    `    ,rs                     kirim media/view-once reply ke ${PRIMARY_TARGET_NAME}`,
-    '    ,topdf [nama]           mulai sesi PDF; ,end untuk selesai',
-    '  download/',
-    '    ,yt <link> <mp3|mp4> [360|480|720|1080] [00:00-01:00]',
-    '  reminder/',
-    '    ,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal]',
-    '    ,ltask                  lihat task',
-    '    ,ltask true|false|del <id>',
-    '    ,remindme <teks> <durasi>  contoh: ,remindme minum 10m',
-    '  save/',
-    '    ,save <judul> [teks awal]',
-    '    ,load                   list save',
-    '    ,load <id|judul>        kirim ulang save',
-    '    ,load del <id|judul>',
-    '    ,load change <id|judul> <judul-baru>',
-    '  notes-links/',
-    '    ,note | ,note <judul> <teks> | ,note <id|judul> | ,note del <id|judul>',
-    '    ,link | ,link <nama> <https://link> | ,link <id|nama> | ,link del <id|nama>',
-    '  utility/',
-    '    ,info <nomor>           cek info WhatsApp',
-    '    ,status                 status ringkas',
-    '    ,health                 status teknis',
-    '    ,won                    list Wake-on-LAN',
-    '    ,won <mac|id>           kirim magic packet',
-    '    ,won save|del <mac|id>',
-    '    ,backup                 kirim zip data/ ke Telegram',
-    '    ,restore                mulai restore zip WhatsApp',
-    '    ,clear                  hapus temp',
-    '    ,restartbot             restart aman',
-    '  session/',
-    '    ,end                    selesai save/PDF/restore',
-    '    ,cancel                 batalkan sesi aktif',
+    `✨ ${BOT_NAME} Help .`,
     '',
-    'Tips PDF: kirim/reply media saat sesi aktif; teks angka menjadi urutan halaman.'
+    '🎬 Media .',
+    '• ,s [author] [title] - buat sticker dari attach, reply, atau URL media .',
+    '• ,rs - kirim ulang media atau view-once reply ke chat ini .',
+    '• ,topdf [nama] - mulai sesi PDF, lalu tutup dengan ,end .',
+    '',
+    '📥 Download .',
+    '• ,yt <link> <mp3|mp4> [360|480|720|1080] [00:00-01:00] - download YouTube .',
+    '',
+    '⏰ Reminder dan task .',
+    '• ,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal] - buat task terjadwal .',
+    '• ,ltask - lihat semua task .',
+    '• ,ltask true|false|del <id> - aktifkan, pause, atau hapus task .',
+    '• ,remindme <teks> <durasi> - reminder cepat, contoh 10m atau 1h30m .',
+    '',
+    '💾 Save, note, dan link .',
+    '• ,save <judul> [teks awal] - mulai rekam save .',
+    '• ,load [id|judul] - list atau kirim ulang save .',
+    '• ,load del <id|judul> - hapus save dengan konfirmasi .',
+    '• ,load change <id|judul> <judul-baru> - ganti judul save .',
+    '• ,note | ,note <judul> <teks> | ,note <id|judul> | ,note del <id|judul> .',
+    '• ,link | ,link <nama> <https://link> | ,link <id|nama> | ,link del <id|nama> .',
+    '',
+    '🛠️ Utility .',
+    '• ,info <nomor> - cek info WhatsApp .',
+    '• ,status - status ringkas server .',
+    '• ,health - status teknis bot .',
+    '• ,won | ,won <mac|id> | ,won save <mac> | ,won del <id|mac> - Wake-on-LAN .',
+    '• ,backup - kirim zip data/ ke Telegram .',
+    '• ,restore - mulai restore zip WhatsApp, finalnya perlu ,confirm .',
+    '• ,clear - hapus temp dengan konfirmasi .',
+    '• ,update - git pull dan restart service dengan konfirmasi .',
+    '• ,restartbot - restart aman dengan konfirmasi .',
+    '',
+    '✅ Session dan konfirmasi .',
+    '• ,end - selesai save, PDF, atau restore .',
+    '• ,cancel - batalkan sesi aktif atau pending confirm .',
+    '• ,confirm - jalankan aksi yang sedang menunggu konfirmasi .',
+    '',
+    `🕵️ Rahasia: reply media lalu akhiri teks dengan spasi titik untuk kirim ke ${PRIMARY_TARGET_NAME}, contoh halo .`
   ].join('\n'));
 }
 
@@ -261,6 +271,26 @@ function hasAnyTempSession() {
   );
 }
 
+async function requestConfirmation(jid, action) {
+  state.confirmStore.set(jid, action);
+  await sendText(jid, [
+    `Konfirmasi diperlukan: ${action.title}`,
+    action.description,
+    '',
+    'Ketik ,confirm untuk lanjut atau ,cancel untuk batal.'
+  ].filter(Boolean).join('\n'));
+}
+
+async function handleConfirm(jid) {
+  const action = state.confirmStore.take(jid);
+  if (!action) {
+    await sendText(jid, 'Tidak ada aksi yang menunggu konfirmasi, atau waktunya sudah habis.');
+    return;
+  }
+  await sendText(jid, `Menjalankan: ${action.title}`);
+  await action.execute();
+}
+
 async function handleHealth(jid) {
   const mem = process.memoryUsage();
   const disk = await getDiskInfo(ROOT_DIR);
@@ -290,8 +320,8 @@ async function handleHealth(jid) {
     `Disk: ${diskText}`,
     `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, yt-dlp=${Boolean(state.tools.ytDlp)}, office=${Boolean(state.tools.office)}`,
     `Data counts: save=${saved.length}, note=${notes.length}, link=${links.length}, task=${tasks.length}, remind=${reminders.length}, wol=${wolItems.length}`,
-    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, ytCookies=${state.youtubeCookieSessions.size}`,
-    `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
+    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, ytCookies=${state.youtubeCookieSessions.size}, confirm=${state.confirmStore.count()}`,
+    `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
     `Target ${PRIMARY_TARGET_NAME}: ${targetJid || 'not found'}`,
     `Telegram client id: ${TELEGRAM_CLIENT_ID ? 'configured' : 'missing'}`,
     `Telegram part size: ${formatBytes(TELEGRAM_PART_SIZE_BYTES)}`,
@@ -302,7 +332,7 @@ async function handleHealth(jid) {
 
 async function handleSticker(message, command) {
   const jid = message.key.remoteJid;
-  const meta = parseStickerMeta(command.args);
+  const meta = parseStickerMeta(command.args.filter((arg) => !/^https?:\/\//i.test(arg)));
   const author = meta.author || DEFAULT_STICKER_AUTHOR;
   const title = meta.title || DEFAULT_STICKER_TITLE;
   let media = null;
@@ -322,12 +352,28 @@ async function handleReverseSticker(message, command) {
   let media = null;
   try {
     if (command.rawArgs.trim()) throw new Error('Format baru: reply media/view-once lalu ketik ,rs tanpa parameter.');
-    const destinationJid = state.chatDirectory.findByName(PRIMARY_TARGET_NAME);
-    if (!destinationJid) throw new Error(`Grup target "${PRIMARY_TARGET_NAME}" tidak ditemukan di cache chat bot.`);
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'reverse-source');
     if (!media) throw new Error('Reply media/view-once untuk memakai ,rs.');
-    await sendDownloadedMedia(destinationJid, media);
-    await sendText(jid, `Media terkirim ke ${PRIMARY_TARGET_NAME}.`);
+    await sendDownloadedMedia(jid, media);
+    await sendText(jid, 'Media terkirim di chat ini.');
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
+}
+
+async function maybeHandleSecretMediaTrigger(message, text) {
+  const trigger = parseSecretMediaTriggerText(text);
+  if (!trigger) return false;
+  const destinationJid = state.chatDirectory.findByName(PRIMARY_TARGET_NAME);
+  if (!destinationJid) throw new Error(`Grup target "${PRIMARY_TARGET_NAME}" tidak ditemukan di cache chat bot.`);
+
+  let media = null;
+  try {
+    media = await downloadQuotedOrOwnMedia(state.sock, message, 'secret-media');
+    if (!media) return false;
+    await sendDownloadedMedia(destinationJid, media, { caption: trigger.caption });
+    await sendText(message.key.remoteJid, `Media rahasia terkirim ke ${PRIMARY_TARGET_NAME}.`);
+    return true;
   } finally {
     await cleanupFiles([media?.path]);
   }
@@ -349,12 +395,13 @@ async function sendLatestViewOnce(destinationJid, targetQuery) {
   }
 }
 
-async function sendDownloadedMedia(jid, media) {
+async function sendDownloadedMedia(jid, media, options = {}) {
   const buffer = await fs.readFile(media.path);
+  const caption = options.caption || media.node?.caption || undefined;
   if (media.type === 'imageMessage') {
-    await state.sock.sendMessage(jid, { image: buffer, mimetype: media.mimetype, caption: media.node?.caption || undefined });
+    await state.sock.sendMessage(jid, { image: buffer, mimetype: media.mimetype, caption });
   } else if (media.type === 'videoMessage') {
-    await state.sock.sendMessage(jid, { video: buffer, mimetype: media.mimetype, caption: media.node?.caption || undefined });
+    await state.sock.sendMessage(jid, { video: buffer, mimetype: media.mimetype, caption });
   } else if (media.type === 'audioMessage') {
     await state.sock.sendMessage(jid, { audio: buffer, mimetype: media.mimetype });
   } else if (media.type === 'stickerMessage') {
@@ -363,7 +410,8 @@ async function sendDownloadedMedia(jid, media) {
     await state.sock.sendMessage(jid, {
       document: buffer,
       mimetype: media.mimetype || 'application/octet-stream',
-      fileName: media.fileName || `view-once-${Date.now()}`
+      fileName: media.fileName || `view-once-${Date.now()}`,
+      caption
     });
   }
 }
@@ -482,6 +530,18 @@ async function handleListTask(jid, command) {
   const [action, idRaw] = command.args;
   const id = Number(idRaw);
   if (!Number.isInteger(id)) throw new Error('Format: ,ltask true|false|del <id>');
+  if (action.toLowerCase() === 'del') {
+    await requestConfirmation(jid, {
+      title: `Hapus task #${id}`,
+      description: `Task #${id} akan dihapus permanen.`,
+      execute: async () => {
+        const result = await updateTaskState('del', id);
+        await sendText(jid, `Task #${id} dihapus.`);
+        return result;
+      }
+    });
+    return;
+  }
   const result = await updateTaskState(action.toLowerCase(), id);
   await sendText(jid, result.deleted ? `Task #${id} dihapus.` : `Task #${id} ${result.task.paused ? 'dipause' : 'aktif'}.`);
 }
@@ -543,8 +603,14 @@ async function handleLoad(message, command) {
   if (command.args[0].toLowerCase() === 'del') {
     const query = command.args.slice(1).join(' ').trim();
     if (!query) throw new Error('Format: ,load del <id|judul>');
-    const item = await deleteSaved(query);
-    await sendText(jid, `Save #${item.id} "${item.title}" dihapus.`);
+    await requestConfirmation(jid, {
+      title: `Hapus save "${query}"`,
+      description: 'Save ini akan dihapus permanen.',
+      execute: async () => {
+        const item = await deleteSaved(query);
+        await sendText(jid, `Save #${item.id} "${item.title}" dihapus.`);
+      }
+    });
     return;
   }
   const query = command.rawArgs.trim();
@@ -650,7 +716,7 @@ async function handleRestoreStart(message) {
   const jid = message.key.remoteJid;
   assertNoActiveSession(jid);
   await state.restoreSessions.start(jid);
-  await sendText(jid, 'Sesi restore dimulai. Kirim file .zip/PART zip sebagai dokumen WhatsApp, lalu ketik ,end untuk overwrite folder data/. Ketik ,cancel untuk batal.');
+  await sendText(jid, 'Sesi restore dimulai. Kirim file .zip/PART zip sebagai dokumen WhatsApp, lalu ketik ,end dan ,confirm untuk overwrite folder data/. Ketik ,cancel untuk batal.');
 }
 
 async function handleRestartBot(jid) {
@@ -658,8 +724,45 @@ async function handleRestartBot(jid) {
   await logger.info('restartbot requested', { jid });
   state.scheduler?.stop();
   state.reminderScheduler?.stop();
+  state.backupScheduler?.stop();
   state.sock?.end?.(new Error('restartbot'));
   setTimeout(() => process.exit(0), 700).unref?.();
+}
+
+async function handleUpdateBot(jid) {
+  await sendText(jid, `Menjalankan git pull ${UPDATE_REMOTE} ${UPDATE_BRANCH}...`);
+  const pull = await runTool('git', ['pull', UPDATE_REMOTE, UPDATE_BRANCH], { cwd: ROOT_DIR });
+  const pullText = formatCommandOutput(pull) || 'git pull selesai tanpa output.';
+
+  if (UPDATE_RESTART_MODE === 'systemctl') {
+    await sendText(jid, [
+      'Update repo berhasil.',
+      pullText,
+      '',
+      `Restart service ${UPDATE_SYSTEMD_SERVICE} dimulai.`
+    ].join('\n'));
+    await logger.info('update requested systemctl restart', { jid, service: UPDATE_SYSTEMD_SERVICE });
+    await runTool('systemctl', ['--no-block', 'restart', UPDATE_SYSTEMD_SERVICE]);
+    return;
+  }
+
+  await sendText(jid, [
+    'Update repo berhasil.',
+    pullText,
+    '',
+    'Restart mode bukan systemctl, bot akan melakukan graceful exit.'
+  ].join('\n'));
+  await handleRestartBot(jid);
+}
+
+function formatCommandOutput(result) {
+  const text = [result?.stdout, result?.stderr]
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+  if (!text) return '';
+  const lines = text.split(/\r?\n/).map((line) => line.trimEnd()).filter(Boolean);
+  return lines.slice(-12).join('\n').slice(0, 1500);
 }
 
 async function handleCommand(message, command) {
@@ -687,13 +790,44 @@ async function handleCommand(message, command) {
       await handleLoad(message, command);
       break;
     case 'note':
-      await sendText(jid, await handleNoteCommand(command));
+      if (command.args[0]?.toLowerCase() === 'del') {
+        const query = command.args.slice(1).join(' ').trim();
+        if (!query) throw new Error('Format: ,note del <id|judul>');
+        await requestConfirmation(jid, {
+          title: `Hapus note "${query}"`,
+          description: 'Note ini akan dihapus permanen.',
+          execute: async () => sendText(jid, await handleNoteCommand(command))
+        });
+      } else {
+        await sendText(jid, await handleNoteCommand(command));
+      }
       break;
     case 'link':
-      await sendText(jid, await handleLinkCommand(command));
+      if (command.args[0]?.toLowerCase() === 'del') {
+        const query = command.args.slice(1).join(' ').trim();
+        if (!query) throw new Error('Format: ,link del <id|nama>');
+        await requestConfirmation(jid, {
+          title: `Hapus link "${query}"`,
+          description: 'Link ini akan dihapus permanen.',
+          execute: async () => sendText(jid, await handleLinkCommand(command))
+        });
+      } else {
+        await sendText(jid, await handleLinkCommand(command));
+      }
       break;
     case 'cancel':
-      if (!(await cancelActiveSession(message))) await sendText(jid, 'Tidak ada sesi aktif.');
+      {
+        let cancelled = false;
+        if (state.confirmStore.cancel(jid)) {
+          cancelled = true;
+          await sendText(jid, 'Konfirmasi dibatalkan.');
+        }
+        if (await cancelActiveSession(message)) cancelled = true;
+        if (!cancelled) await sendText(jid, 'Tidak ada sesi aktif atau konfirmasi pending.');
+      }
+      break;
+    case 'confirm':
+      await handleConfirm(jid);
       break;
     case 's':
       await handleSticker(message, command);
@@ -714,7 +848,17 @@ async function handleCommand(message, command) {
       await handleTopdf(message, command);
       break;
     case 'won':
-      await sendText(jid, await handleWolCommand(command));
+      if (command.args[0]?.toLowerCase() === 'del') {
+        const query = command.args.slice(1).join(' ').trim();
+        if (!query) throw new Error('Format: ,won del <id|mac>');
+        await requestConfirmation(jid, {
+          title: `Hapus WOL "${query}"`,
+          description: 'Entry Wake-on-LAN ini akan dihapus permanen.',
+          execute: async () => sendText(jid, await handleWolCommand(command))
+        });
+      } else {
+        await sendText(jid, await handleWolCommand(command));
+      }
       break;
     case 'backup':
       await handleBackup(jid);
@@ -723,14 +867,36 @@ async function handleCommand(message, command) {
       await handleRestoreStart(message);
       break;
     case 'clear':
-      await handleClear(jid);
+      await requestConfirmation(jid, {
+        title: 'Hapus temp',
+        description: 'Semua file sementara di temp/ akan dibersihkan.',
+        execute: async () => handleClear(jid)
+      });
       break;
     case 'restartbot':
-      await handleRestartBot(jid);
+      await requestConfirmation(jid, {
+        title: 'Restart bot',
+        description: 'Proses bot akan keluar dan perlu dinyalakan ulang oleh supervisor.',
+        execute: async () => handleRestartBot(jid)
+      });
+      break;
+    case 'update':
+      await requestConfirmation(jid, {
+        title: 'Update repo dan restart service',
+        description: `Akan menjalankan git pull ${UPDATE_REMOTE} ${UPDATE_BRANCH}, lalu restart ${UPDATE_SYSTEMD_SERVICE}.`,
+        execute: async () => handleUpdateBot(jid)
+      });
       break;
     case 'end':
       if (await finishSave(message)) break;
-      if (await finishRestore(message)) break;
+      if (state.restoreSessions.has(jid)) {
+        await requestConfirmation(jid, {
+          title: 'Restore data',
+          description: 'Folder data/ akan ditimpa dari file restore yang sudah dikirim.',
+          execute: async () => finishRestore(message)
+        });
+        break;
+      }
       await handleEndPdf(message);
       break;
     default:
@@ -754,12 +920,15 @@ async function onMessageUpsert(event) {
         await state.saveRecorder.record(state.sock, message);
         continue;
       }
-      if (state.restoreSessions.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
+      if (state.restoreSessions.has(jid) && (!command || !['end', 'cancel', 'confirm'].includes(command.name))) {
         await maybeCollectRestorePart(message);
         continue;
       }
       if (state.youtubeCookieSessions.has(jid) && !command) {
         await finishYoutubeCookieInput(message, text);
+        continue;
+      }
+      if (!command && !state.pdfSessions.has(jid) && await maybeHandleSecretMediaTrigger(message, text)) {
         continue;
       }
       if (command) {
@@ -861,6 +1030,8 @@ async function main() {
   state.pdfSessions = new PdfSessions(state.tools);
   state.restoreSessions = new RestoreSessions();
   state.saveRecorder = new SaveRecorder();
+  state.backupScheduler = new DailyBackupScheduler(logger);
+  state.backupScheduler.start();
   await logger.info('Detected tools', state.tools);
   console.log('Tool check:', {
     ffmpeg: Boolean(state.tools.ffmpeg),
@@ -875,6 +1046,7 @@ process.on('SIGINT', async () => {
   await logger.info('SIGINT received');
   state.scheduler?.stop();
   state.reminderScheduler?.stop();
+  state.backupScheduler?.stop();
   process.exit(0);
 });
 

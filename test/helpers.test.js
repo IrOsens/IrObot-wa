@@ -9,6 +9,7 @@ import { normalizeMac } from '../src/wol.js';
 import { normalizeYoutubeCookies } from '../src/youtubeCookies.js';
 import { parseYoutubeArgs } from '../src/youtube.js';
 import { extractZipBuffer, zipDirectory } from '../src/zip.js';
+import { PendingConfirmStore, parseSecretMediaTriggerText } from '../src/confirm.js';
 
 test('parseDurationMs supports compact countdown formats', () => {
   assert.equal(parseDurationMs('10s'), 10_000);
@@ -56,6 +57,47 @@ test('normalizeYoutubeCookies supports raw Cookie header and Netscape text', () 
 
   const httpOnly = normalizeYoutubeCookies('#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\tdef');
   assert.match(httpOnly, /#HttpOnly_\.youtube\.com/);
+});
+
+test('normalizeYoutubeCookies supports browser JSON export', () => {
+  const normalized = normalizeYoutubeCookies(JSON.stringify({
+    cookies: [
+      {
+        domain: '.youtube.com',
+        hostOnly: false,
+        httpOnly: true,
+        name: 'SID',
+        path: '/',
+        secure: true,
+        expirationDate: 1813386668.9,
+        value: 'secret'
+      }
+    ]
+  }));
+  assert.match(normalized, /Netscape HTTP Cookie File/);
+  assert.match(normalized, /#HttpOnly_\.youtube\.com\tTRUE\t\/\tTRUE\t1813386668\tSID\tsecret/);
+});
+
+test('parseSecretMediaTriggerText detects text ending with space dot', () => {
+  assert.deepEqual(parseSecretMediaTriggerText('halo .'), { caption: 'halo' });
+  assert.deepEqual(parseSecretMediaTriggerText(' .'), { caption: '' });
+  assert.equal(parseSecretMediaTriggerText('halo.'), null);
+  assert.equal(parseSecretMediaTriggerText('halo . terus'), null);
+  assert.equal(parseSecretMediaTriggerText('halo . '), null);
+});
+
+test('PendingConfirmStore takes and expires pending actions', async () => {
+  const store = new PendingConfirmStore({ ttlMs: 50 });
+  const execute = async () => 'ok';
+  store.set('jid@test', { title: 'Test', execute });
+  assert.equal(store.count(), 1);
+  assert.equal(store.take('jid@test').title, 'Test');
+  assert.equal(store.take('jid@test'), null);
+
+  store.set('jid@test', { title: 'Expired', execute });
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  assert.equal(store.get('jid@test'), null);
+  assert.equal(store.count(), 0);
 });
 
 test('parseYoutubeArgs supports optional time range', () => {

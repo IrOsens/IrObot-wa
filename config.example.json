@@ -25,6 +25,14 @@
     "restoreTimeoutMs": 1800000
   },
   "backup": {
-    "telegramPartSizeMb": 45
+    "telegramPartSizeMb": 45,
+    "autoDaily": true,
+    "dailyTimeWib": "00:00"
+  },
+  "update": {
+    "restartMode": "systemctl",
+    "systemdService": "irobot-wa.service",
+    "remote": "origin",
+    "branch": "main"
   }
 }

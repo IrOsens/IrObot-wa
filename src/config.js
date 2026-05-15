@@ -45,7 +45,15 @@ export const DEFAULT_APP_CONFIG = {
     restoreTimeoutMs: 30 * 60 * 1000
   },
   backup: {
-    telegramPartSizeMb: 45
+    telegramPartSizeMb: 45,
+    autoDaily: true,
+    dailyTimeWib: '00:00'
+  },
+  update: {
+    restartMode: 'systemctl',
+    systemdService: 'irobot-wa.service',
+    remote: 'origin',
+    branch: 'main'
   }
 };
 
@@ -77,6 +85,12 @@ export const TELEGRAM_PART_SIZE_BYTES = Math.max(
   1024 * 1024,
   Math.floor(numberOr(process.env.TELEGRAM_PART_SIZE_MB, APP_CONFIG.backup?.telegramPartSizeMb || 45) * 1024 * 1024)
 );
+export const AUTO_DAILY_BACKUP = APP_CONFIG.backup?.autoDaily !== false;
+export const DAILY_BACKUP_TIME_WIB = APP_CONFIG.backup?.dailyTimeWib || '00:00';
+export const UPDATE_RESTART_MODE = APP_CONFIG.update?.restartMode || 'systemctl';
+export const UPDATE_SYSTEMD_SERVICE = APP_CONFIG.update?.systemdService || 'irobot-wa.service';
+export const UPDATE_REMOTE = APP_CONFIG.update?.remote || 'origin';
+export const UPDATE_BRANCH = APP_CONFIG.update?.branch || 'main';
 export const WOL_BROADCAST_ADDRESS = APP_CONFIG.wol?.broadcastAddress || '255.255.255.255';
 export const WOL_PORT = numberOr(APP_CONFIG.wol?.port, 9);
 

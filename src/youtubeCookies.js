@@ -7,6 +7,7 @@ const DEFAULT_EXPIRES = 2147483647;
 export function normalizeYoutubeCookies(input) {
   const text = String(input || '').trim();
   if (!text) throw new Error('Cookies kosong.');
+  if (looksLikeJson(text)) return cookieJsonToNetscape(text);
   if (isNetscapeCookieText(text)) return ensureNetscapeHeader(text);
   return cookieHeaderToNetscape(text);
 }
@@ -30,7 +31,7 @@ export async function hasYoutubeCookies(filePath) {
 export function youtubeCookiePrompt() {
   return [
     'YouTube butuh cookies untuk video ini.',
-    'Paste isi cookies.txt Netscape atau raw header Cookie: dari browser di pesan berikutnya.',
+    'Paste cookies JSON export browser, isi cookies.txt Netscape, atau raw header Cookie: di pesan berikutnya.',
     'Ketik ,cancel untuk batal.'
   ].join('\n');
 }
@@ -58,6 +59,65 @@ function ensureNetscapeHeader(text) {
   return [NETSCAPE_HEADER, ...lines].join('\n');
 }
 
+function looksLikeJson(text) {
+  return /^[\[{]/.test(String(text || '').trim());
+}
+
+function cookieJsonToNetscape(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('Format cookies JSON tidak valid.');
+  }
+
+  const cookies = Array.isArray(parsed) ? parsed : parsed?.cookies;
+  if (!Array.isArray(cookies) || !cookies.length) {
+    throw new Error('Format cookies JSON tidak dikenali. Pastikan ada array "cookies".');
+  }
+
+  const lines = cookies
+    .map(cookieJsonLine)
+    .filter(Boolean);
+  if (!lines.length) throw new Error('Cookies JSON tidak berisi cookie yang valid.');
+  return [NETSCAPE_HEADER, ...lines].join('\n');
+}
+
+function cookieJsonLine(cookie) {
+  if (!cookie || typeof cookie !== 'object') return null;
+  const name = cleanCookieField(cookie.name);
+  if (!name) return null;
+  const value = cleanCookieField(cookie.value ?? '');
+  const rawDomain = cleanDomain(cookie.domain);
+  const domain = rawDomain || '.youtube.com';
+  const includeSubdomains = cookie.hostOnly === false || domain.startsWith('.') ? 'TRUE' : 'FALSE';
+  const pathValue = cleanCookieField(cookie.path || '/');
+  const secure = cookie.secure ? 'TRUE' : 'FALSE';
+  const expires = normalizeExpires(cookie.expirationDate ?? cookie.expires ?? cookie.expiry);
+  const domainCell = cookie.httpOnly ? `#HttpOnly_${domain}` : domain;
+  return [domainCell, includeSubdomains, pathValue || '/', secure, expires, name, value].join('\t');
+}
+
+function cleanDomain(value) {
+  const domain = String(value || '').trim();
+  if (!domain) return '';
+  const normalized = domain.replace(/^https?:\/\//i, '').split('/')[0];
+  return /^#?\.?[\w.-]+$/.test(normalized) ? normalized.replace(/^#HttpOnly_/i, '') : '';
+}
+
+function normalizeExpires(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return DEFAULT_EXPIRES;
+  return String(Math.floor(number));
+}
+
+function cleanCookieField(value) {
+  return String(value ?? '')
+    .replace(/\t/g, '%09')
+    .replace(/\r/g, '%0D')
+    .replace(/\n/g, '%0A');
+}
+
 function cookieHeaderToNetscape(input) {
   const header = input
     .replace(/^cookie\s*:\s*/i, '')
@@ -79,7 +139,7 @@ function cookieHeaderToNetscape(input) {
     .filter(([name]) => !/^(\$|path$|domain$|expires$|max-age$|secure$|httponly$|samesite$)/i.test(name));
 
   if (!pairs.length) {
-    throw new Error('Format cookies tidak dikenali. Kirim cookies.txt Netscape atau raw header Cookie:.');
+    throw new Error('Format cookies tidak dikenali. Kirim JSON export browser, cookies.txt Netscape, atau raw header Cookie:.');
   }
 
   return [

@@ -19,6 +19,7 @@ const URL_MEDIA_EXTS = new Set([
   '.png', '.jpg', '.jpeg', '.webp', '.gif', '.mp4', '.mov', '.mkv', '.webm',
   '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
 ]);
+const URL_PAGE_HOSTS = new Set(['tenor.com', 'www.tenor.com']);
 
 export function mediaNode(message) {
   const content = unwrapMessage(message?.message);
@@ -117,16 +118,39 @@ export async function downloadQuotedOrOwnMedia(sock, message, prefix = 'media') 
 export async function downloadUrlMedia(text, prefix = 'url') {
   const url = firstUrl(text);
   if (!url) return null;
+  return downloadUrlMediaFile(url, prefix);
+}
+
+async function downloadUrlMediaFile(url, prefix, depth = 0) {
   const cleanUrl = url.split('?')[0].split('#')[0];
   const ext = path.extname(cleanUrl).toLowerCase();
-  if (!URL_MEDIA_EXTS.has(ext)) return null;
+  if (!URL_MEDIA_EXTS.has(ext) && !isKnownMediaPage(url)) return null;
   const response = await fetch(url, {
-    headers: { 'user-agent': 'iro-wabot/1.0' }
+    headers: {
+      accept: 'image/avif,image/webp,image/apng,image/*,video/*,*/*;q=0.8',
+      'user-agent': 'Mozilla/5.0 (compatible; iro-wabot/1.0)'
+    }
   });
   if (!response.ok) throw new Error(`Download URL gagal: HTTP ${response.status}`);
   const arrayBuffer = await response.arrayBuffer();
-  const saved = await saveBufferToTemp(Buffer.from(arrayBuffer), prefix, ext);
-  return { ...saved, fileName: path.basename(cleanUrl), url };
+  const buffer = Buffer.from(arrayBuffer);
+  if (!buffer.length) throw new Error('Download URL gagal: file kosong.');
+
+  const contentType = response.headers.get('content-type') || '';
+  const detected = await fileTypeFromBuffer(buffer).catch(() => null);
+  if (isHtmlResponse(buffer, contentType, detected)) {
+    if (depth >= 1) throw new Error('URL tidak mengarah ke file media langsung.');
+    const directUrl = extractDirectMediaUrl(buffer.toString('utf8'), url);
+    if (!directUrl) throw new Error('URL tersebut halaman HTML dan media langsungnya tidak ditemukan.');
+    return downloadUrlMediaFile(directUrl, prefix, depth + 1);
+  }
+
+  const saved = await saveBufferToTemp(buffer, prefix, bestFallbackExt({ detected, contentType, ext }));
+  if (!isSupportedDownloadedMedia(saved)) {
+    await cleanupFiles([saved.path]);
+    throw new Error(`URL tidak mengarah ke file media yang didukung (${saved.mimetype}).`);
+  }
+  return { ...saved, fileName: path.basename(cleanUrl) || `url-media${saved.ext}`, url };
 }
 
 export async function cleanupFiles(files) {
@@ -147,4 +171,96 @@ async function removeWithRetry(file) {
       await new Promise((resolve) => setTimeout(resolve, 250 + attempt * 150));
     }
   }
+}
+
+function isKnownMediaPage(url) {
+  try {
+    const parsed = new URL(url);
+    return URL_PAGE_HOSTS.has(parsed.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function isHtmlResponse(buffer, contentType, detected) {
+  if (/text\/html|application\/xhtml/i.test(contentType)) return true;
+  if (detected) return false;
+  return buffer.subarray(0, 256).toString('utf8').trimStart().startsWith('<');
+}
+
+function bestFallbackExt({ detected, contentType, ext }) {
+  if (detected?.ext) return `.${detected.ext}`;
+  const fromMime = mime.extension(String(contentType).split(';')[0].trim());
+  if (fromMime) return `.${fromMime}`;
+  return ext || '.bin';
+}
+
+function isSupportedDownloadedMedia(media) {
+  const ext = String(media?.ext || '').toLowerCase();
+  return URL_MEDIA_EXTS.has(ext) || /^(image|video|application\/pdf|application\/msword|application\/vnd\.|audio)\//i.test(media?.mimetype || '');
+}
+
+function extractDirectMediaUrl(html, baseUrl) {
+  const candidates = [];
+  const metaRe = /<meta\b[^>]*>/gi;
+  let match;
+  while ((match = metaRe.exec(html))) {
+    const tag = match[0];
+    const key = attrValue(tag, 'property') || attrValue(tag, 'name') || attrValue(tag, 'itemprop');
+    const content = attrValue(tag, 'content');
+    if (!key || !content) continue;
+    if (/^(og:(image|video)(:secure_url|:url)?|twitter:(image|player:stream)(:src)?|contentUrl)$/i.test(key)) {
+      candidates.push(content);
+    }
+  }
+
+  for (const pattern of [
+    /"contentUrl"\s*:\s*"([^"]+)"/gi,
+    /"media"\s*:\s*"([^"]+)"/gi,
+    /(https?:\\?\/\\?\/[^"'\s<>]+?\.(?:gif|mp4|webp|png|jpe?g)(?:\?[^"'\s<>]*)?)/gi
+  ]) {
+    while ((match = pattern.exec(html))) candidates.push(match[1]);
+  }
+
+  return candidates
+    .map((candidate) => normalizeExtractedUrl(candidate, baseUrl))
+    .filter(Boolean)
+    .filter((candidate, index, array) => array.indexOf(candidate) === index)
+    .sort((a, b) => mediaCandidateRank(a) - mediaCandidateRank(b))[0] || null;
+}
+
+function attrValue(tag, name) {
+  const match = String(tag).match(new RegExp(`\\b${name}\\s*=\\s*(['"])(.*?)\\1`, 'i'));
+  return match ? decodeHtml(match[2]) : '';
+}
+
+function normalizeExtractedUrl(value, baseUrl) {
+  const clean = decodeHtml(String(value || ''))
+    .replace(/\\\//g, '/')
+    .trim();
+  if (!clean) return null;
+  try {
+    const resolved = new URL(clean, baseUrl);
+    if (!/^https?:$/.test(resolved.protocol)) return null;
+    const ext = path.extname(resolved.pathname).toLowerCase();
+    return URL_MEDIA_EXTS.has(ext) ? resolved.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function mediaCandidateRank(url) {
+  const ext = path.extname(new URL(url).pathname).toLowerCase();
+  return ['.gif', '.mp4', '.webp', '.png', '.jpg', '.jpeg'].indexOf(ext) >= 0
+    ? ['.gif', '.mp4', '.webp', '.png', '.jpg', '.jpeg'].indexOf(ext)
+    : 99;
+}
+
+function decodeHtml(value) {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
 }

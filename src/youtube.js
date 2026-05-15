@@ -144,7 +144,7 @@ async function cleanupPrefix(prefix) {
 
 export function isRetryableYoutubeError(error) {
   const text = `${error?.stderr || ''}\n${error?.stdout || ''}\n${error?.message || ''}`;
-  return /Precondition check failed|HTTP Error 403|HTTP Error 400|nsig extraction failed|Unable to download API page/i.test(text);
+  return /Precondition check failed|HTTP Error 403|HTTP Error 400|nsig extraction failed|Unable to download API page|Error code:\s*152|Watch video on YouTube|Sign in to confirm|cookies/i.test(text);
 }
 
 function friendlyYoutubeError(error) {

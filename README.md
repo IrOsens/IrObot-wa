@@ -60,7 +60,7 @@ YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt
 TELEGRAM_PART_SIZE_MB=45
 ```
 
-`data/config.json` dibuat dari `config.example.json` dan berisi target grup, default sticker, nama PDF default, WOL broadcast/port, timeout sesi, dan ukuran part backup.
+`data/config.json` dibuat dari `config.example.json` dan berisi target grup, default sticker, nama PDF default, WOL broadcast/port, timeout sesi, backup otomatis, dan setting update/restart service.
 
 ## Cek Kesiapan
 
@@ -80,50 +80,13 @@ Scan QR yang muncul di terminal. Session WhatsApp disimpan di `auth/`.
 
 ## Command
 
-```text
-commands/
-  media/
-    ,s [author] [title]
-    ,rs
-    ,topdf [nama]
-  download/
-    ,yt <link> <mp3|mp4> [360|480|720|1080] [00:00-01:00]
-  reminder/
-    ,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal]
-    ,ltask
-    ,ltask true|false|del <id>
-    ,remindme <teks> <durasi>
-  save/
-    ,save <judul> [teks awal]
-    ,load
-    ,load <id|judul>
-    ,load del <id|judul>
-    ,load change <id|judul> <judul-baru>
-  notes-links/
-    ,note
-    ,note <judul> <teks>
-    ,note <id|judul>
-    ,note del <id|judul>
-    ,link
-    ,link <nama> <https://link>
-    ,link <id|nama>
-    ,link del <id|nama>
-  utility/
-    ,info <nomor>
-    ,status
-    ,health
-    ,won
-    ,won <mac|id>
-    ,won save <mac>
-    ,won del <id|mac>
-    ,backup
-    ,restore
-    ,clear
-    ,restartbot
-  session/
-    ,end
-    ,cancel
-```
+- 🎬 Media: `,s [author] [title]`, `,rs`, `,topdf [nama]`
+- 📥 Download: `,yt <link> <mp3|mp4> [360|480|720|1080] [00:00-01:00]`
+- ⏰ Reminder/task: `,task`, `,ltask`, `,ltask true|false|del <id>`, `,remindme <teks> <durasi>`
+- 💾 Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
+- 📝 Note/link: `,note`, `,note del <id|judul>`, `,link`, `,link del <id|nama>`
+- 🛠️ Utility: `,info`, `,status`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`
+- ✅ Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
 
@@ -131,7 +94,7 @@ YouTube:
 
 - `,yt` memakai `yt-dlp`.
 - Jika YouTube menolak dengan 403/400/nsig, bot meminta cookies.
-- Paste isi `cookies.txt` Netscape atau raw header `Cookie:` di pesan berikutnya.
+- Paste cookies JSON export browser, isi `cookies.txt` Netscape, atau raw header `Cookie:` di pesan berikutnya.
 - Cookies akan disimpan dan download diulang otomatis.
 - Jika cookies kadaluarsa, jalankan `,yt` lagi dan paste cookies baru saat diminta.
 - Tambahkan range waktu di akhir untuk potong durasi, contoh `,yt https://youtu.be/xxx mp4 720 00:00-01:00`.
@@ -139,7 +102,9 @@ YouTube:
 View-once/media:
 
 - Reply media atau view-once lalu ketik `,rs`.
-- Bot mengirim media itu ke grup target `IrOBot`.
+- Bot mengirim media itu kembali ke chat tempat command dijalankan.
+- Reply media lalu kirim teks yang berakhir spasi titik, contoh `halo .`, untuk mengirim media ke grup target `IrOBot`.
+- Teks sebelum ` .` dipakai sebagai caption baru jika media mendukung caption.
 - Ubah nama target di `data/config.json` bila perlu.
 
 PDF:
@@ -165,14 +130,22 @@ Reminder:
 Backup/restore:
 
 - `,backup` membuat zip folder `data/` dan mengirimnya ke Telegram client id di `.env`.
+- Backup otomatis berjalan setiap `00:00` WIB secara default dengan mekanisme yang sama seperti `,backup`.
 - Jika zip terlalu besar, bot mengirim part seperti `PART1-2026-05-15-18_12_49.zip`.
 - `,restore` dimulai dari WhatsApp, lalu kirim file zip/part sebagai dokumen.
-- Setelah semua part terkirim, ketik `,end`; folder `data/` akan ditimpa dari isi zip.
+- Setelah semua part terkirim, ketik `,end`, lalu `,confirm`; folder `data/` akan ditimpa dari isi zip.
 - Backup tidak mencakup `auth/`, `.env`, `logs/`, atau `temp/`.
 
-Restart:
+Konfirmasi:
+
+- Aksi hapus, `,clear`, final `,restore`, `,update`, dan `,restartbot` wajib dikonfirmasi dengan `,confirm`.
+- Ketik `,cancel` untuk membatalkan konfirmasi pending atau sesi aktif.
+
+Update/restart:
 
 - `,restartbot` melakukan graceful exit.
+- `,update` menjalankan `git pull origin main`, lalu restart service systemd.
+- Default service systemd adalah `irobot-wa.service`; ubah di `data/config.json` bagian `update.systemdService`.
 - Agar bot benar-benar hidup lagi, jalankan lewat supervisor seperti PM2, systemd, nodemon, atau service manager lain.
 
 ## Fitur yang Bergantung Tool Sistem
