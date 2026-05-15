@@ -23,6 +23,7 @@ import {
   TASKS_FILE,
   TELEGRAM_CLIENT_ID,
   TELEGRAM_PART_SIZE_BYTES,
+  LINUX_SUDO_PASSWORD,
   UPDATE_BRANCH,
   UPDATE_REMOTE,
   UPDATE_RESTART_MODE,
@@ -35,7 +36,7 @@ import {
   ensureRuntimeDirs
 } from './config.js';
 import { cleanupOldLogs, logger } from './logger.js';
-import { detectTools, formatBytes, formatDuration, getDiskInfo, getLoadAverageText, runTool } from './tools.js';
+import { detectTools, formatBytes, formatDuration, getDiskInfo, getLoadAverageText, runTool, runToolWithInput } from './tools.js';
 import { getMessageText, parseCommand } from './text.js';
 import {
   cleanupFiles,
@@ -67,6 +68,7 @@ import { handleWolCommand, listWol } from './wol.js';
 import { DailyBackupScheduler, sendDataBackupToTelegram } from './backup.js';
 import { RestoreSessions } from './restore.js';
 import { PendingConfirmStore, parseSecretMediaTriggerText } from './confirm.js';
+import { CommandAccessStore, PUBLIC_COMMANDS, parseAllowArgs } from './commandAccess.js';
 import {
   hasYoutubeCookies,
   isYoutubeCookieNeededError,
@@ -147,6 +149,7 @@ const state = {
   saveRecorder: null,
   backupScheduler: null,
   confirmStore: new PendingConfirmStore(),
+  commandAccess: null,
   youtubeCookieSessions: new Map(),
   ignoredOwnMessageIds: new Set(),
   reconnecting: false
@@ -187,46 +190,44 @@ function isIgnoredOwnOutput(message) {
 
 async function handleHelp(jid) {
   await sendText(jid, [
-    `✨ ${BOT_NAME} Help .`,
+    `${BOT_NAME} Help .`,
     '',
-    '🎬 Media .',
-    '• ,s [author] [title] - buat sticker dari attach, reply, atau URL media .',
-    '• ,smeme up/down <teks> [1-99] - buat sticker meme dari reply media .',
-    '• ,rs - kirim ulang media atau view-once reply ke chat ini .',
-    '• ,topdf [nama] - mulai sesi PDF, lalu tutup dengan ,end .',
+    'Media .',
+    '- ,s [title][,author] - buat sticker dari attach, reply, atau URL media .',
+    '- ,smeme up/down <teks> [1-99] - buat sticker meme dari reply media .',
+    '- ,rs - kirim ulang media atau view-once reply ke chat ini .',
+    '- ,topdf [nama] - mulai sesi PDF, lalu tutup dengan ,end .',
     '',
-    '📥 Download .',
-    '• ,yt <link> <mp3|mp4> [360|480|720|1080] [00:00-01:00] - download YouTube .',
+    'Reminder dan task .',
+    '- ,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal] - buat task terjadwal .',
+    '- ,ltask - lihat semua task .',
+    '- ,ltask true|false|del <id> - aktifkan, pause, atau hapus task .',
+    '- ,remindme <teks> <durasi> - reminder cepat, contoh 10m atau 1h30m .',
     '',
-    '⏰ Reminder dan task .',
-    '• ,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal] - buat task terjadwal .',
-    '• ,ltask - lihat semua task .',
-    '• ,ltask true|false|del <id> - aktifkan, pause, atau hapus task .',
-    '• ,remindme <teks> <durasi> - reminder cepat, contoh 10m atau 1h30m .',
+    'Save, note, dan link .',
+    '- ,save <judul> [teks awal] - mulai rekam save .',
+    '- ,load [id|judul] - list atau kirim ulang save .',
+    '- ,load del <id|judul> - hapus save dengan konfirmasi .',
+    '- ,load change <id|judul> <judul-baru> - ganti judul save .',
+    '- ,note | ,note <judul> <teks> | ,note <id|judul> | ,note del <id|judul> .',
+    '- ,link | ,link <nama> <https://link> | ,link <id|nama> | ,link del <id|nama> .',
     '',
-    '💾 Save, note, dan link .',
-    '• ,save <judul> [teks awal] - mulai rekam save .',
-    '• ,load [id|judul] - list atau kirim ulang save .',
-    '• ,load del <id|judul> - hapus save dengan konfirmasi .',
-    '• ,load change <id|judul> <judul-baru> - ganti judul save .',
-    '• ,note | ,note <judul> <teks> | ,note <id|judul> | ,note del <id|judul> .',
-    '• ,link | ,link <nama> <https://link> | ,link <id|nama> | ,link del <id|nama> .',
+    'Utility .',
+    '- ,info <nomor> - cek info WhatsApp .',
+    '- ,status - status ringkas server .',
+    '- ,health - status teknis bot .',
+    '- ,won | ,won <mac|id> | ,won save <mac> | ,won del <id|mac> - Wake-on-LAN .',
+    '- ,backup - kirim zip data/ ke Telegram .',
+    '- ,restore - mulai restore zip WhatsApp, finalnya perlu ,confirm .',
+    '- ,clear - hapus temp dengan konfirmasi .',
+    '- ,update - git pull dan restart service dengan konfirmasi .',
+    '- ,restartbot - restart aman dengan konfirmasi .',
+    '- ,allow here|all true|false - buka/tutup akses publik untuk ,s, ,smeme, ,rs .',
     '',
-    '🛠️ Utility .',
-    '• ,info <nomor> - cek info WhatsApp .',
-    '• ,status - status ringkas server .',
-    '• ,health - status teknis bot .',
-    '• ,won | ,won <mac|id> | ,won save <mac> | ,won del <id|mac> - Wake-on-LAN .',
-    '• ,backup - kirim zip data/ ke Telegram .',
-    '• ,restore - mulai restore zip WhatsApp, finalnya perlu ,confirm .',
-    '• ,clear - hapus temp dengan konfirmasi .',
-    '• ,update - git pull dan restart service dengan konfirmasi .',
-    '• ,restartbot - restart aman dengan konfirmasi .',
-    '',
-    '✅ Session dan konfirmasi .',
-    '• ,end - selesai save, PDF, atau restore .',
-    '• ,cancel - batalkan sesi aktif atau pending confirm .',
-    '• ,confirm - jalankan aksi yang sedang menunggu konfirmasi .'
+    'Session dan konfirmasi .',
+    '- ,end - selesai save, PDF, atau restore .',
+    '- ,cancel - batalkan sesi aktif atau pending confirm .',
+    '- ,confirm - jalankan aksi yang sedang menunggu konfirmasi .'
   ].join('\n'));
 }
 
@@ -323,6 +324,7 @@ async function handleHealth(jid) {
     `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, yt-dlp=${Boolean(state.tools.ytDlp)}, office=${Boolean(state.tools.office)}`,
     `Data counts: save=${saved.length}, note=${notes.length}, link=${links.length}, task=${tasks.length}, remind=${reminders.length}, wol=${wolItems.length}`,
     `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, ytCookies=${state.youtubeCookieSessions.size}, confirm=${state.confirmStore.count()}`,
+    `Public command access: all=${Boolean(state.commandAccess?.snapshot().all)}, chats=${state.commandAccess?.snapshot().chatCount || 0}`,
     `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
     `Target ${PRIMARY_TARGET_NAME}: ${targetJid || 'not found'}`,
     `Telegram client id: ${TELEGRAM_CLIENT_ID ? 'configured' : 'missing'}`,
@@ -334,15 +336,17 @@ async function handleHealth(jid) {
 
 async function handleSticker(message, command) {
   const jid = message.key.remoteJid;
-  const meta = parseStickerMeta(command.args.filter((arg) => !/^https?:\/\//i.test(arg)));
-  const author = meta.author || DEFAULT_STICKER_AUTHOR;
-  const title = meta.title || DEFAULT_STICKER_TITLE;
+  const metaText = command.args.filter((arg) => !/^https?:\/\//i.test(arg)).join(' ');
+  const meta = parseStickerMeta(metaText, {
+    defaultAuthor: DEFAULT_STICKER_AUTHOR,
+    defaultTitle: DEFAULT_STICKER_TITLE
+  });
   let media = null;
   try {
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'sticker-source');
     if (!media) media = await downloadUrlMedia(command.rawArgs, 'sticker-url');
     if (!media) throw new Error('Kirim/reply media atau sertakan URL media yang valid.');
-    const sticker = await makeSticker(media, { author, title, tools: state.tools });
+    const sticker = await makeSticker(media, { author: meta.author, title: meta.title, tools: state.tools });
     await state.sock.sendMessage(jid, { sticker });
   } finally {
     await cleanupFiles([media?.path]);
@@ -778,6 +782,28 @@ async function handleBackup(jid) {
   await sendText(jid, `Backup terkirim ke Telegram:\n${files.join('\n')}`);
 }
 
+async function handleAllow(message, command) {
+  const jid = message.key.remoteJid;
+  const { scope, enabled } = parseAllowArgs(command.args);
+  const commands = [...PUBLIC_COMMANDS].map((name) => `${COMMAND_PREFIX}${name}`).join(', ');
+  if (scope === 'all') {
+    const snapshot = await state.commandAccess.setAll(enabled);
+    await sendText(jid, [
+      `Akses publik semua chat: ${snapshot.all ? 'aktif' : 'nonaktif'}.`,
+      `Command publik: ${commands}.`,
+      enabled ? null : 'Semua izin here juga dihapus.'
+    ].filter(Boolean).join('\n'));
+    return;
+  }
+
+  const snapshot = await state.commandAccess.setHere(jid, enabled);
+  await sendText(jid, [
+    `Akses publik chat ini: ${snapshot.chats[jid] ? 'aktif' : 'nonaktif'}.`,
+    `Command publik: ${commands}.`,
+    snapshot.all ? 'Catatan: akses all sedang aktif, jadi semua chat tetap diizinkan.' : null
+  ].filter(Boolean).join('\n'));
+}
+
 async function handleRestoreStart(message) {
   const jid = message.key.remoteJid;
   assertNoActiveSession(jid);
@@ -808,7 +834,12 @@ async function handleUpdateBot(jid) {
       `Restart service ${UPDATE_SYSTEMD_SERVICE} dimulai.`
     ].join('\n'));
     await logger.info('update requested systemctl restart', { jid, service: UPDATE_SYSTEMD_SERVICE });
-    await runTool('systemctl', ['--no-block', 'restart', UPDATE_SYSTEMD_SERVICE]);
+    try {
+      await runTool('systemctl', ['--no-block', 'restart', UPDATE_SYSTEMD_SERVICE]);
+    } catch (error) {
+      if (!isSystemctlAuthError(error)) throw error;
+      await restartSystemctlWithAuthFallback(jid, error);
+    }
     return;
   }
 
@@ -819,6 +850,53 @@ async function handleUpdateBot(jid) {
     'Restart mode bukan systemctl, bot akan melakukan graceful exit.'
   ].join('\n'));
   await handleRestartBot(jid);
+}
+
+async function restartSystemctlWithAuthFallback(jid, systemctlError) {
+  const originalError = commandErrorText(systemctlError);
+  if (LINUX_SUDO_PASSWORD && process.platform !== 'win32') {
+    await sendText(jid, 'Systemctl butuh authentication. Mencoba sudo dengan LINUX_SUDO_PASSWORD dari .env...');
+    try {
+      await runToolWithInput('sudo', ['-S', '-p', '', 'systemctl', '--no-block', 'restart', UPDATE_SYSTEMD_SERVICE], `${LINUX_SUDO_PASSWORD}\n`);
+      await sendText(jid, `Restart service ${UPDATE_SYSTEMD_SERVICE} via sudo dimulai.`);
+      return;
+    } catch (sudoError) {
+      await logger.error('sudo systemctl restart failed', {
+        jid,
+        service: UPDATE_SYSTEMD_SERVICE,
+        error: sudoError.message,
+        stderr: sudoError.stderr
+      });
+      await sendText(jid, [
+        'Sudo restart gagal.',
+        commandErrorText(sudoError),
+        '',
+        'Bot akan fallback ke graceful exit; pastikan supervisor menjalankan ulang proses.'
+      ].join('\n'));
+      await handleRestartBot(jid);
+      return;
+    }
+  }
+
+  await sendText(jid, [
+    'Systemctl butuh authentication, tetapi LINUX_SUDO_PASSWORD belum diisi di .env.',
+    originalError,
+    '',
+    'Bot akan fallback ke graceful exit; pastikan supervisor menjalankan ulang proses.'
+  ].join('\n'));
+  await handleRestartBot(jid);
+}
+
+function isSystemctlAuthError(error) {
+  return /interactive authentication required|authentication required|authentication is required|polkit|permission denied/i.test(commandErrorText(error));
+}
+
+function commandErrorText(error) {
+  const text = [error?.stdout, error?.stderr, error?.message]
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+  return formatCommandOutput({ stdout: text }) || 'Error tidak diketahui.';
 }
 
 function formatCommandOutput(result) {
@@ -842,9 +920,6 @@ async function handleCommand(message, command) {
       break;
     case 'health':
       await handleHealth(jid);
-      break;
-    case 'yt':
-      await handleYoutube(message, command);
       break;
     case 'info':
       await handleInfo(message, command);
@@ -949,6 +1024,9 @@ async function handleCommand(message, command) {
         execute: async () => handleRestartBot(jid)
       });
       break;
+    case 'allow':
+      await handleAllow(message, command);
+      break;
     case 'update':
       await requestConfirmation(jid, {
         title: 'Update repo dan restart service',
@@ -974,17 +1052,40 @@ async function handleCommand(message, command) {
   }
 }
 
+async function handlePublicCommand(message, command) {
+  switch (command.name) {
+    case 's':
+      await handleSticker(message, command);
+      return true;
+    case 'smeme':
+      await handleSmeme(message, command);
+      return true;
+    case 'rs':
+      await handleReverseSticker(message, command);
+      return true;
+    default:
+      return false;
+  }
+}
+
 async function onMessageUpsert(event) {
   for (const message of event.messages || []) {
     if (!message.message || !message.key?.remoteJid || message.key.remoteJid === 'status@broadcast') continue;
     rememberMessageDirectory(message);
     state.viewOnceCache.remember(message);
-    if (!message.key?.fromMe) continue;
-    if (isIgnoredOwnOutput(message)) continue;
+    const isOwner = Boolean(message.key?.fromMe);
+    if (isOwner && isIgnoredOwnOutput(message)) continue;
     const jid = message.key.remoteJid;
     const text = getMessageText(message);
     const command = parseCommand(text);
     try {
+      if (!isOwner) {
+        if (command && state.commandAccess?.canUse(command.name, jid)) {
+          await handlePublicCommand(message, command);
+        }
+        continue;
+      }
+
       if (state.saveRecorder.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
         await state.saveRecorder.record(state.sock, message);
         continue;
@@ -1095,6 +1196,8 @@ async function main() {
   await ensureRuntimeDirs();
   await cleanupStartupTemp();
   await cleanupOldLogs();
+  state.commandAccess = new CommandAccessStore();
+  await state.commandAccess.load();
   state.tools = await detectTools();
   state.pdfSessions = new PdfSessions(state.tools);
   state.restoreSessions = new RestoreSessions();

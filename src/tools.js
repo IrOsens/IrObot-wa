@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -65,6 +65,44 @@ export async function runTool(command, args, options = {}) {
     ...options
   });
   return { stdout, stderr };
+}
+
+export async function runToolWithInput(command, args, input = '', options = {}) {
+  return new Promise((resolve, reject) => {
+    const { maxBuffer = 50 * 1024 * 1024, ...spawnOptions } = options;
+    const child = spawn(command, args, {
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      ...spawnOptions
+    });
+    const chunks = { stdout: [], stderr: [] };
+    let stdoutSize = 0;
+    let stderrSize = 0;
+
+    child.stdout.on('data', (chunk) => {
+      stdoutSize += chunk.length;
+      if (stdoutSize <= maxBuffer) chunks.stdout.push(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderrSize += chunk.length;
+      if (stderrSize <= maxBuffer) chunks.stderr.push(chunk);
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      const stdout = Buffer.concat(chunks.stdout).toString();
+      const stderr = Buffer.concat(chunks.stderr).toString();
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      const error = new Error(`Command failed: ${command} ${args.join(' ')}`);
+      error.code = code;
+      error.stdout = stdout;
+      error.stderr = stderr;
+      reject(error);
+    });
+    child.stdin.end(input);
+  });
 }
 
 export async function getDiskInfo(targetPath) {

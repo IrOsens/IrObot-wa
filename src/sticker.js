@@ -1,10 +1,19 @@
 import fs from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import path from 'node:path';
+import { parse as parseEmoji } from '@twemoji/parser';
 import sharp from 'sharp';
 import webp from 'node-webpmux';
 import { TEMP_DIR, makeTempPath } from './config.js';
 import { cleanupFiles, isLikelyAnimated } from './media.js';
 import { runTool } from './tools.js';
+
+const require = createRequire(import.meta.url);
+const TWEMOJI_SVG_DIR = path.dirname(require.resolve('@twemoji/svg/package.json'));
+const GRAPHEME_SEGMENTER = typeof Intl.Segmenter === 'function'
+  ? new Intl.Segmenter('und', { granularity: 'grapheme' })
+  : null;
+const emojiSvgCache = new Map();
 
 export const SMEME_STYLE = {
   baseSize: 512,
@@ -55,7 +64,8 @@ export async function makeSticker(media, { author, title, tools }) {
   try {
     const rawSticker = makeTempPath('sticker', '.webp');
     temp.push(rawSticker);
-    if (isLikelyAnimated({ mimetype: media.mimetype, fileName: media.fileName || media.path })) {
+    const animated = await isAnimatedMedia(media);
+    if (animated) {
       if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Install FFmpeg untuk membuat sticker bergerak.');
       await runTool(tools.ffmpeg, [
         '-y',
@@ -111,7 +121,7 @@ export function parseSmemeArgs(args) {
 
 export async function makeSmemeSticker(media, { author, title, tools, smeme }) {
   if (!smeme) throw new Error('Argumen smeme tidak valid.');
-  const animated = media.node?.isAnimated || isLikelyAnimated({ mimetype: media.mimetype, fileName: media.fileName || media.path });
+  const animated = await isAnimatedMedia(media);
   return animated
     ? makeAnimatedSmemeSticker(media, { author, title, tools, smeme })
     : makeStaticSmemeSticker(media, { author, title, smeme });
@@ -123,7 +133,7 @@ async function makeStaticSmemeSticker(media, { author, title, smeme }) {
     const rawSticker = makeTempPath('smeme', '.webp');
     temp.push(rawSticker);
     const canvas = smeme.canvasSize;
-    const overlay = makeSmemeOverlaySvg(smeme.text, smeme.position, canvas);
+    const overlay = await makeSmemeOverlaySvg(smeme.text, smeme.position, canvas);
     await sharp(media.path, { animated: false })
       .resize(canvas, canvas, { fit: 'inside', withoutEnlargement: true })
       .extend(await transparentExtendOptions(media.path, canvas))
@@ -160,7 +170,7 @@ async function makeAnimatedSmemeSticker(media, { author, title, tools, smeme }) 
       .sort();
     if (!entries.length) throw new Error('Frame smeme bergerak tidak ditemukan.');
 
-    const overlay = makeSmemeOverlaySvg(smeme.text, smeme.position, canvas);
+    const overlay = await makeSmemeOverlaySvg(smeme.text, smeme.position, canvas);
     for (const name of entries) {
       const source = path.join(tempDir, name);
       const out = path.join(tempDir, name.replace('frame-', 'overlay-'));
@@ -194,7 +204,7 @@ async function makeAnimatedSmemeSticker(media, { author, title, tools, smeme }) 
 }
 
 export async function reverseSticker(media, tools) {
-  const animated = media.node?.isAnimated || isLikelyAnimated({ mimetype: media.mimetype, fileName: media.fileName || media.path });
+  const animated = await isAnimatedMedia(media);
   const outPath = makeTempPath('reverse-sticker', animated ? '.gif' : '.png');
   try {
     if (animated) {
@@ -216,6 +226,13 @@ export async function reverseSticker(media, tools) {
   }
 }
 
+export async function isAnimatedMedia(media) {
+  if (media?.node?.isAnimated) return true;
+  if (isLikelyAnimated({ mimetype: media?.mimetype, fileName: media?.fileName || media?.path })) return true;
+  if (!isWebpMedia(media)) return false;
+  return isAnimatedWebpPath(media.path);
+}
+
 function smemeCanvasSize(quality) {
   return Math.max(SMEME_STYLE.minCanvasSize, Math.round(SMEME_STYLE.baseSize * (quality / 99)));
 }
@@ -234,7 +251,7 @@ async function transparentExtendOptions(inputPath, canvas) {
   };
 }
 
-function makeSmemeOverlaySvg(text, position, canvas) {
+export async function makeSmemeOverlaySvg(text, position, canvas) {
   const padding = Math.max(4, Math.round(canvas * SMEME_STYLE.paddingScale));
   const fontSize = Math.max(SMEME_STYLE.minFontSize, Math.round(canvas * SMEME_STYLE.fontScale));
   const strokeWidth = Math.max(SMEME_STYLE.minStrokeWidth, Math.round(canvas * SMEME_STYLE.strokeScale));
@@ -245,14 +262,15 @@ function makeSmemeOverlaySvg(text, position, canvas) {
   const firstBaseline = position === 'up'
     ? padding + fontSize
     : canvas - padding - blockHeight + fontSize;
-  const tspans = lines.map((line, index) => (
-    `<tspan x="50%" y="${firstBaseline + index * lineHeight}">${escapeSvg(line)}</tspan>`
-  )).join('');
+  const lineElements = [];
+  for (const [index, line] of lines.entries()) {
+    lineElements.push(await renderSmemeLineSvg(line, firstBaseline + index * lineHeight, canvas, fontSize));
+  }
 
   return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>
 <svg width="${canvas}" height="${canvas}" viewBox="0 0 ${canvas} ${canvas}" xmlns="http://www.w3.org/2000/svg">
   <style>
-    text {
+    .smeme-text {
       font-family: ${SMEME_STYLE.fontFamily};
       font-size: ${fontSize}px;
       font-weight: ${SMEME_STYLE.fontWeight};
@@ -262,12 +280,74 @@ function makeSmemeOverlaySvg(text, position, canvas) {
       stroke-width: ${strokeWidth}px;
       paint-order: stroke fill;
       stroke-linejoin: round;
-      text-anchor: middle;
-      text-transform: uppercase;
+      text-anchor: start;
     }
   </style>
-  <text>${tspans}</text>
+  ${lineElements.join('\n  ')}
 </svg>`);
+}
+
+async function renderSmemeLineSvg(line, baseline, canvas, fontSize) {
+  const runs = splitSmemeTextRuns(line);
+  const widths = runs.map((run) => measureSmemeRun(run, fontSize));
+  const totalWidth = widths.reduce((sum, width) => sum + width, 0);
+  let x = Math.max(0, (canvas - totalWidth) / 2);
+  const elements = [];
+
+  for (const [index, run] of runs.entries()) {
+    const width = widths[index];
+    if (run.type === 'emoji') {
+      const emojiSize = Math.round(fontSize * 1.08);
+      const emoji = await readTwemojiSvg(run.codepoint);
+      if (emoji) {
+        elements.push(renderInlineEmojiSvg(emoji, x, baseline - emojiSize * 0.86, emojiSize));
+      } else {
+        elements.push(renderTextSvg(run.text, x, baseline, false));
+      }
+    } else if (run.text) {
+      elements.push(renderTextSvg(run.text, x, baseline, true));
+    }
+    x += width;
+  }
+
+  return `<g>${elements.join('')}</g>`;
+}
+
+function renderTextSvg(text, x, baseline, uppercase) {
+  const renderedText = uppercase ? String(text).toUpperCase() : String(text);
+  return `<text class="smeme-text" x="${svgNumber(x)}" y="${svgNumber(baseline)}" xml:space="preserve">${escapeSvg(renderedText)}</text>`;
+}
+
+function renderInlineEmojiSvg(emoji, x, y, size) {
+  return `<svg class="smeme-emoji" x="${svgNumber(x)}" y="${svgNumber(y)}" width="${svgNumber(size)}" height="${svgNumber(size)}" viewBox="${escapeSvgAttribute(emoji.viewBox)}" overflow="visible">${emoji.body}</svg>`;
+}
+
+export function splitSmemeTextRuns(text) {
+  const value = String(text || '');
+  const entities = parseEmoji(value).sort((a, b) => a.indices[0] - b.indices[0]);
+  const runs = [];
+  let offset = 0;
+
+  for (const entity of entities) {
+    const [start, end] = entity.indices;
+    if (start > offset) runs.push({ type: 'text', text: value.slice(offset, start) });
+    runs.push({
+      type: 'emoji',
+      text: entity.text,
+      codepoint: emojiCodepointFromEntity(entity)
+    });
+    offset = Math.max(offset, end);
+  }
+
+  if (offset < value.length) runs.push({ type: 'text', text: value.slice(offset) });
+  return runs.filter((run) => run.text);
+}
+
+function measureSmemeRun(run, fontSize) {
+  if (run.type === 'emoji') return fontSize * 1.08;
+  return graphemes(run.text).reduce((width, char) => (
+    width + (/^\s+$/.test(char) ? fontSize * 0.35 : fontSize * 0.58)
+  ), 0);
 }
 
 function wrapSmemeText(text, maxChars) {
@@ -276,15 +356,15 @@ function wrapSmemeText(text, maxChars) {
   let current = '';
   for (const word of words) {
     const next = current ? `${current} ${word}` : word;
-    if (Array.from(next).length <= maxChars) {
+    if (graphemes(next).length <= maxChars) {
       current = next;
       continue;
     }
     if (current) lines.push(current);
-    if (Array.from(word).length <= maxChars) {
+    if (graphemes(word).length <= maxChars) {
       current = word;
     } else {
-      const chars = Array.from(word);
+      const chars = graphemes(word);
       while (chars.length) lines.push(chars.splice(0, maxChars).join(''));
       current = '';
     }
@@ -293,12 +373,89 @@ function wrapSmemeText(text, maxChars) {
   return lines.length ? lines : [''];
 }
 
+function graphemes(value) {
+  const text = String(value || '');
+  if (GRAPHEME_SEGMENTER) return [...GRAPHEME_SEGMENTER.segment(text)].map((item) => item.segment);
+  return Array.from(text);
+}
+
+function emojiCodepointFromEntity(entity) {
+  try {
+    return path.basename(new URL(entity.url).pathname, '.svg').toLowerCase();
+  } catch {
+    return Array.from(entity.text || '')
+      .map((char) => char.codePointAt(0).toString(16))
+      .join('-');
+  }
+}
+
+async function readTwemojiSvg(codepoint) {
+  const key = String(codepoint || '').toLowerCase();
+  if (!key) return null;
+  if (emojiSvgCache.has(key)) return emojiSvgCache.get(key);
+
+  try {
+    const svg = await fs.readFile(path.join(TWEMOJI_SVG_DIR, `${key}.svg`), 'utf8');
+    const parsed = extractInlineSvgData(svg);
+    emojiSvgCache.set(key, parsed);
+    return parsed;
+  } catch {
+    emojiSvgCache.set(key, null);
+    return null;
+  }
+}
+
+function extractInlineSvgData(svg) {
+  const match = String(svg || '').match(/<svg\b([^>]*)>([\s\S]*?)<\/svg>/i);
+  if (!match) return null;
+  return {
+    viewBox: svgAttribute(match[1], 'viewBox') || '0 0 36 36',
+    body: match[2].trim()
+  };
+}
+
+function svgAttribute(attrs, name) {
+  const match = String(attrs || '').match(new RegExp(`\\b${name}\\s*=\\s*(['"])(.*?)\\1`, 'i'));
+  return match ? match[2] : '';
+}
+
 function escapeSvg(value) {
   return String(value || '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function escapeSvgAttribute(value) {
+  return escapeSvg(value).replace(/'/g, '&apos;');
+}
+
+function svgNumber(value) {
+  return String(Math.round(Number(value) * 100) / 100);
+}
+
+async function isAnimatedWebpPath(filePath) {
+  if (!filePath) return false;
+  try {
+    const buffer = await fs.readFile(filePath);
+    if (buffer.includes(Buffer.from('ANIM')) || buffer.includes(Buffer.from('ANMF'))) return true;
+  } catch {
+    return false;
+  }
+
+  try {
+    const image = new webp.Image();
+    await image.load(filePath);
+    const frames = await image.demux({ buffers: false });
+    return Array.isArray(frames) && frames.length > 1;
+  } catch {
+    return false;
+  }
+}
+
+function isWebpMedia(media) {
+  return /webp/i.test(media?.mimetype || '') || /\.webp$/i.test(media?.fileName || media?.path || '');
 }
 
 async function animatedWebpToGif(inputPath, outPath, tools) {
@@ -340,11 +497,16 @@ async function animatedWebpToGif(inputPath, outPath, tools) {
   }
 }
 
-export function parseStickerMeta(args) {
-  if (!args.length) return { author: 'IrO', title: ':3' };
-  if (args.length === 1) return { author: args[0] || 'IrO', title: ':3' };
-  return {
-    author: args[0] || 'IrO',
-    title: args.slice(1).join(' ') || ':3'
-  };
+export function parseStickerMeta(input, options = {}) {
+  const defaultAuthor = options.defaultAuthor || 'IrO';
+  const defaultTitle = options.defaultTitle || ':3';
+  const text = (Array.isArray(input) ? input.join(' ') : String(input || ''))
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '')
+    .trim();
+  if (!text) return { author: defaultAuthor, title: defaultTitle };
+
+  const [titleRaw, ...authorParts] = text.split(',');
+  const title = titleRaw.trim() || defaultTitle;
+  const author = authorParts.join(',').trim() || defaultAuthor;
+  return { author, title };
 }

@@ -1,12 +1,12 @@
 # IrO WhatsApp Bot
 
-Bot WhatsApp pribadi berbasis Baileys. Login memakai QR di terminal, command memakai prefix koma, dan hanya pesan dari akun yang sedang login (`fromMe`) yang diproses.
+Bot WhatsApp pribadi berbasis Baileys. Login memakai QR di terminal, command memakai prefix koma, dan akun yang sedang login menjadi owner/superuser bot.
 
 ## Ringkas
 
 - Cocok dipindah ke Linux atau Windows lain.
 - Data runtime berada di `data/`, credential di `.env` dan `auth/`.
-- Tool sistem opsional dipakai untuk fitur media, YouTube, dan PDF.
+- Tool sistem opsional dipakai untuk fitur media dan PDF.
 - Backup `data/` bisa dikirim ke Telegram Bot API.
 
 ## Persiapan
@@ -20,7 +20,6 @@ Opsional untuk fitur penuh:
 
 - `ffmpeg`
 - `ffprobe`
-- `yt-dlp`
 - `libreoffice` atau `soffice`
 
 ## Setup Cepat
@@ -35,13 +34,13 @@ Jika PowerShell Windows memblokir `npm` karena execution policy:
 npm.cmd run setup
 ```
 
-Setup dan startup bot akan membuat folder runtime, `.env`, `data/config.json`, dan file JSON awal seperti `tasks`, `notes`, `links`, `reminders`, dan `wol` jika hilang. Jika `.env` sudah ada tetapi ada key wajib yang belum ada, key itu akan ditambahkan tanpa menimpa nilai lama.
+Setup dan startup bot akan membuat folder runtime, `.env`, `data/config.json`, dan file JSON awal seperti `command-access`, `tasks`, `notes`, `links`, `reminders`, dan `wol` jika hilang. Jika `.env` sudah ada tetapi ada key wajib yang belum ada, key itu akan ditambahkan tanpa menimpa nilai lama.
 
 Penting:
 
 - Isi `.env` sebelum memakai `,backup`.
 - Cek `data/config.json` bila nama grup target bukan `IrOBot`.
-- Cookie YouTube default disimpan di `auth/youtube-cookies.txt`.
+- Isi `LINUX_SUDO_PASSWORD` di `.env` jika `,update` perlu restart service systemd lewat sudo.
 
 Untuk mencoba memasang tool sistem otomatis:
 
@@ -56,7 +55,7 @@ npm run setup:full
 ```env
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CLIENT_ID=
-YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt
+LINUX_SUDO_PASSWORD=
 TELEGRAM_PART_SIZE_MB=45
 ```
 
@@ -80,25 +79,14 @@ Scan QR yang muncul di terminal. Session WhatsApp disimpan di `auth/`.
 
 ## Command
 
-- 🎬 Media: `,s [author] [title]`, `,smeme up/down <teks> [1-99]`, `,rs`, `,topdf [nama]`
-- 📥 Download: `,yt <link> <mp3|mp4> [360|480|720|1080] [00:00-01:00]`
+- Media: `,s [title][,author]`, `,smeme up/down <teks> [1-99]`, `,rs`, `,topdf [nama]`
 - ⏰ Reminder/task: `,task`, `,ltask`, `,ltask true|false|del <id>`, `,remindme <teks> <durasi>`
 - 💾 Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
 - 📝 Note/link: `,note`, `,note del <id|judul>`, `,link`, `,link del <id|nama>`
-- 🛠️ Utility: `,info`, `,status`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`
+- Utility: `,info`, `,status`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`
 - ✅ Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
-
-YouTube:
-
-- `,yt` memakai `yt-dlp`.
-- Jika YouTube menolak dengan 403/400/nsig, bot meminta cookies.
-- Paste cookies JSON export browser, isi `cookies.txt` Netscape, raw header `Cookie:`, atau kirim dokumen `.json`/`.txt` di pesan berikutnya.
-- Cookies akan disimpan dan download diulang otomatis.
-- Jika tetap gagal setelah cookies valid, video bisa membutuhkan PO Token/plugin yt-dlp. Isi `YOUTUBE_EXTRACTOR_ARGS` atau `YOUTUBE_PO_TOKEN` di `.env` / `data/config.json`.
-- Jika cookies kadaluarsa, jalankan `,yt` lagi dan paste cookies baru saat diminta.
-- Tambahkan range waktu di akhir untuk potong durasi, contoh `,yt https://youtu.be/xxx mp4 720 00:00-01:00`.
 
 View-once/media:
 
@@ -114,6 +102,18 @@ Smeme:
 - Reply image, GIF, video, sticker statis, atau sticker bergerak lalu ketik `,smeme up teks` atau `,smeme down teks`.
 - Tambahkan angka `1-99` di akhir untuk mengubah resolusi kerja dari default 512px, contoh `,smeme down halo dunia 80`.
 - Style teks meme bisa diubah dari konstanta `SMEME_STYLE` di `src/sticker.js`.
+
+Sticker:
+
+- `,s judul sticker,author sticker` memakai pemisah koma untuk author.
+- `,s judul sticker` memakai title custom dan author default dari config.
+
+Operasional:
+
+- Owner adalah akun WhatsApp yang sedang login.
+- `,allow here true|false` membuka/menutup akses publik di chat/grup tempat command dikirim.
+- `,allow all true|false` membuka/menutup akses publik di semua chat/grup.
+- Akses publik hanya berlaku untuk `,s`, `,smeme`, dan `,rs`.
 
 PDF:
 
@@ -153,13 +153,13 @@ Update/restart:
 
 - `,restartbot` melakukan graceful exit.
 - `,update` menjalankan `git pull origin main`, lalu restart service systemd.
+- Jika restart systemd butuh authentication, bot mencoba `sudo -S systemctl` memakai `LINUX_SUDO_PASSWORD` dari `.env`.
 - Default service systemd adalah `irobot-wa.service`; ubah di `data/config.json` bagian `update.systemdService`.
 - Agar bot benar-benar hidup lagi, jalankan lewat supervisor seperti PM2, systemd, nodemon, atau service manager lain.
 
 ## Fitur yang Bergantung Tool Sistem
 
 - Sticker/media dan sebagian konversi: butuh `ffmpeg`.
-- YouTube MP3/MP4: butuh `yt-dlp`; MP3 juga butuh `ffmpeg`.
 - Office ke PDF: butuh `libreoffice` atau `soffice`.
 
 Bot tetap bisa start tanpa tool tersebut. Command yang membutuhkan tool hilang akan memberi pesan error yang jelas.

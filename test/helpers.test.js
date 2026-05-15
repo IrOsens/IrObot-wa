@@ -10,7 +10,8 @@ import { normalizeYoutubeCookies, youtubeCookieWarnings } from '../src/youtubeCo
 import { parseYoutubeArgs } from '../src/youtube.js';
 import { extractZipBuffer, zipDirectory } from '../src/zip.js';
 import { PendingConfirmStore, parseSecretMediaTriggerText } from '../src/confirm.js';
-import { parseSmemeArgs } from '../src/sticker.js';
+import { CommandAccessStore, parseAllowArgs } from '../src/commandAccess.js';
+import { makeSmemeOverlaySvg, parseSmemeArgs, parseStickerMeta, splitSmemeTextRuns } from '../src/sticker.js';
 
 test('parseDurationMs supports compact countdown formats', () => {
   assert.equal(parseDurationMs('10s'), 10_000);
@@ -138,6 +139,61 @@ test('parseSmemeArgs supports position text and quality', () => {
   assert.throws(() => parseSmemeArgs(['middle', 'halo']), /Format/);
   assert.throws(() => parseSmemeArgs(['up', 'halo', '100']), /1-99/);
   assert.throws(() => parseSmemeArgs(['up']), /wajib/);
+});
+
+test('parseStickerMeta supports title comma author and URL media text', () => {
+  assert.deepEqual(parseStickerMeta('', { defaultAuthor: 'Author', defaultTitle: 'Title' }), {
+    author: 'Author',
+    title: 'Title'
+  });
+  assert.deepEqual(parseStickerMeta('judul saya', { defaultAuthor: 'Author', defaultTitle: 'Title' }), {
+    author: 'Author',
+    title: 'judul saya'
+  });
+  assert.deepEqual(parseStickerMeta('judul saya,author saya', { defaultAuthor: 'Author', defaultTitle: 'Title' }), {
+    author: 'author saya',
+    title: 'judul saya'
+  });
+  assert.deepEqual(parseStickerMeta('judul dari url https://example.com/a.gif', { defaultAuthor: 'Author', defaultTitle: 'Title' }), {
+    author: 'Author',
+    title: 'judul dari url'
+  });
+});
+
+test('smeme text keeps emoji as colored emoji run', async () => {
+  assert.deepEqual(splitSmemeTextRuns('halo 🐫 ok').map((run) => run.type), ['text', 'emoji', 'text']);
+  assert.equal(splitSmemeTextRuns('halo 🐫 ok')[1].codepoint, '1f42b');
+  const overlay = (await makeSmemeOverlaySvg('halo 🐫', 'up', 512)).toString('utf8');
+  assert.match(overlay, /class="smeme-emoji"/);
+  assert.match(overlay, /HALO/);
+  assert.doesNotMatch(overlay, /01F42B|1F42B/);
+});
+
+test('CommandAccessStore gates public commands', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const file = path.join(tempRoot, `command-access-${Date.now()}.json`);
+  const store = new CommandAccessStore(file);
+  try {
+    await store.load();
+    assert.equal(store.canUse('s', 'chat-a'), false);
+    assert.deepEqual(parseAllowArgs(['here', 'true']), { scope: 'here', enabled: true });
+
+    await store.setHere('chat-a', true);
+    assert.equal(store.canUse('s', 'chat-a'), true);
+    assert.equal(store.canUse('smeme', 'chat-a'), true);
+    assert.equal(store.canUse('help', 'chat-a'), false);
+    assert.equal(store.canUse('s', 'chat-b'), false);
+
+    await store.setAll(true);
+    assert.equal(store.canUse('rs', 'chat-b'), true);
+
+    await store.setAll(false);
+    assert.equal(store.canUse('s', 'chat-a'), false);
+    assert.equal(store.snapshot().chatCount, 0);
+  } finally {
+    await fs.rm(file, { force: true });
+  }
 });
 
 test('parseYoutubeArgs supports optional time range', () => {

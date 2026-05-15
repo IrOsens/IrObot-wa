@@ -12,6 +12,7 @@ export const LOG_DIR = path.join(ROOT_DIR, 'logs');
 export const TEMP_DIR = path.join(ROOT_DIR, 'temp');
 export const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+export const COMMAND_ACCESS_FILE = path.join(DATA_DIR, 'command-access.json');
 export const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
 export const LINKS_FILE = path.join(DATA_DIR, 'links.json');
 export const REMINDERS_FILE = path.join(DATA_DIR, 'reminders.json');
@@ -95,6 +96,7 @@ export const UPDATE_RESTART_MODE = APP_CONFIG.update?.restartMode || 'systemctl'
 export const UPDATE_SYSTEMD_SERVICE = APP_CONFIG.update?.systemdService || 'irobot-wa.service';
 export const UPDATE_REMOTE = APP_CONFIG.update?.remote || 'origin';
 export const UPDATE_BRANCH = APP_CONFIG.update?.branch || 'main';
+export const LINUX_SUDO_PASSWORD = process.env.LINUX_SUDO_PASSWORD || '';
 export const WOL_BROADCAST_ADDRESS = APP_CONFIG.wol?.broadcastAddress || '255.255.255.255';
 export const WOL_PORT = numberOr(APP_CONFIG.wol?.port, 9);
 
@@ -111,6 +113,7 @@ export async function ensureRuntimeDirs() {
   await Promise.all([
     ensureEnvFile(ENV_FILE),
     ensureJsonFile(CONFIG_FILE, DEFAULT_APP_CONFIG),
+    ensureJsonFile(COMMAND_ACCESS_FILE, { all: false, chats: {} }),
     ensureJsonFile(TASKS_FILE, { nextId: 1, tasks: [] }),
     ensureJsonFile(SAVED_MESSAGES_FILE, { nextId: 1, items: [] }),
     ensureJsonFile(NOTES_FILE, { nextId: 1, items: [] }),
@@ -186,6 +189,7 @@ function requiredEnvLines() {
     'YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt',
     'YOUTUBE_EXTRACTOR_ARGS=',
     'YOUTUBE_PO_TOKEN=',
+    'LINUX_SUDO_PASSWORD=',
     'TELEGRAM_PART_SIZE_MB=45'
   ];
 }
