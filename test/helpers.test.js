@@ -6,10 +6,11 @@ import { assertUniqueTitle } from '../src/namedStore.js';
 import { PdfSessions, parsePdfOrderText } from '../src/pdf.js';
 import { parseDurationMs } from '../src/reminders.js';
 import { normalizeMac } from '../src/wol.js';
-import { normalizeYoutubeCookies } from '../src/youtubeCookies.js';
+import { normalizeYoutubeCookies, youtubeCookieWarnings } from '../src/youtubeCookies.js';
 import { parseYoutubeArgs } from '../src/youtube.js';
 import { extractZipBuffer, zipDirectory } from '../src/zip.js';
 import { PendingConfirmStore, parseSecretMediaTriggerText } from '../src/confirm.js';
+import { parseSmemeArgs } from '../src/sticker.js';
 
 test('parseDurationMs supports compact countdown formats', () => {
   assert.equal(parseDurationMs('10s'), 10_000);
@@ -78,6 +79,27 @@ test('normalizeYoutubeCookies supports browser JSON export', () => {
   assert.match(normalized, /#HttpOnly_\.youtube\.com\tTRUE\t\/\tTRUE\t1813386668\tSID\tsecret/);
 });
 
+test('normalizeYoutubeCookies repairs damaged YouTube secure cookie names', () => {
+  const fromJson = normalizeYoutubeCookies(JSON.stringify({
+    cookies: [
+      { domain: '.youtube.com', name: '_Secure-3PSID', value: 'a', path: '/', secure: true, httpOnly: true },
+      { domain: '.youtube.com', name: 'Secure-1PSID', value: 'b', path: '/', secure: true, httpOnly: true }
+    ]
+  }));
+  assert.match(fromJson, /__Secure-3PSID\ta/);
+  assert.match(fromJson, /__Secure-1PSID\tb/);
+
+  const fromHeader = normalizeYoutubeCookies('Cookie: Secure-3PSID=a; _Secure-1PSID=b');
+  assert.match(fromHeader, /__Secure-3PSID\ta/);
+  assert.match(fromHeader, /__Secure-1PSID\tb/);
+});
+
+test('youtubeCookieWarnings reports missing important cookies', () => {
+  const warnings = youtubeCookieWarnings('Cookie: PREF=abc');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /SID/);
+});
+
 test('parseSecretMediaTriggerText detects text ending with space dot', () => {
   assert.deepEqual(parseSecretMediaTriggerText('halo .'), { caption: 'halo' });
   assert.deepEqual(parseSecretMediaTriggerText(' .'), { caption: '' });
@@ -98,6 +120,24 @@ test('PendingConfirmStore takes and expires pending actions', async () => {
   await new Promise((resolve) => setTimeout(resolve, 70));
   assert.equal(store.get('jid@test'), null);
   assert.equal(store.count(), 0);
+});
+
+test('parseSmemeArgs supports position text and quality', () => {
+  assert.deepEqual(parseSmemeArgs(['up', 'halo', 'dunia']), {
+    position: 'up',
+    text: 'halo dunia',
+    quality: 99,
+    canvasSize: 512
+  });
+  assert.deepEqual(parseSmemeArgs(['down', 'halo', '50']), {
+    position: 'down',
+    text: 'halo',
+    quality: 50,
+    canvasSize: 259
+  });
+  assert.throws(() => parseSmemeArgs(['middle', 'halo']), /Format/);
+  assert.throws(() => parseSmemeArgs(['up', 'halo', '100']), /1-99/);
+  assert.throws(() => parseSmemeArgs(['up']), /wajib/);
 });
 
 test('parseYoutubeArgs supports optional time range', () => {

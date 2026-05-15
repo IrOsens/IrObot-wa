@@ -15,7 +15,9 @@
     "sessionTimeoutMs": 1800000
   },
   "youtube": {
-    "cookieFile": "auth/youtube-cookies.txt"
+    "cookieFile": "auth/youtube-cookies.txt",
+    "extractorArgs": "",
+    "poToken": ""
   },
   "wol": {
     "broadcastAddress": "255.255.255.255",

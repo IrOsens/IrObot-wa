@@ -80,7 +80,7 @@ Scan QR yang muncul di terminal. Session WhatsApp disimpan di `auth/`.
 
 ## Command
 
-- 🎬 Media: `,s [author] [title]`, `,rs`, `,topdf [nama]`
+- 🎬 Media: `,s [author] [title]`, `,smeme up/down <teks> [1-99]`, `,rs`, `,topdf [nama]`
 - 📥 Download: `,yt <link> <mp3|mp4> [360|480|720|1080] [00:00-01:00]`
 - ⏰ Reminder/task: `,task`, `,ltask`, `,ltask true|false|del <id>`, `,remindme <teks> <durasi>`
 - 💾 Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
@@ -94,8 +94,9 @@ YouTube:
 
 - `,yt` memakai `yt-dlp`.
 - Jika YouTube menolak dengan 403/400/nsig, bot meminta cookies.
-- Paste cookies JSON export browser, isi `cookies.txt` Netscape, atau raw header `Cookie:` di pesan berikutnya.
+- Paste cookies JSON export browser, isi `cookies.txt` Netscape, raw header `Cookie:`, atau kirim dokumen `.json`/`.txt` di pesan berikutnya.
 - Cookies akan disimpan dan download diulang otomatis.
+- Jika tetap gagal setelah cookies valid, video bisa membutuhkan PO Token/plugin yt-dlp. Isi `YOUTUBE_EXTRACTOR_ARGS` atau `YOUTUBE_PO_TOKEN` di `.env` / `data/config.json`.
 - Jika cookies kadaluarsa, jalankan `,yt` lagi dan paste cookies baru saat diminta.
 - Tambahkan range waktu di akhir untuk potong durasi, contoh `,yt https://youtu.be/xxx mp4 720 00:00-01:00`.
 
@@ -103,9 +104,16 @@ View-once/media:
 
 - Reply media atau view-once lalu ketik `,rs`.
 - Bot mengirim media itu kembali ke chat tempat command dijalankan.
+- Jika `,rs` dipakai pada sticker, sticker statis dikirim sebagai PNG dan sticker bergerak dikirim sebagai GIF.
 - Reply media lalu kirim teks yang berakhir spasi titik, contoh `halo .`, untuk mengirim media ke grup target `IrOBot`.
 - Teks sebelum ` .` dipakai sebagai caption baru jika media mendukung caption.
 - Ubah nama target di `data/config.json` bila perlu.
+
+Smeme:
+
+- Reply image, GIF, video, sticker statis, atau sticker bergerak lalu ketik `,smeme up teks` atau `,smeme down teks`.
+- Tambahkan angka `1-99` di akhir untuk mengubah resolusi kerja dari default 512px, contoh `,smeme down halo dunia 80`.
+- Style teks meme bisa diubah dari konstanta `SMEME_STYLE` di `src/sticker.js`.
 
 PDF:
 

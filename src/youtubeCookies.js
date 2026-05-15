@@ -3,6 +3,7 @@ import path from 'node:path';
 
 const NETSCAPE_HEADER = '# Netscape HTTP Cookie File';
 const DEFAULT_EXPIRES = 2147483647;
+const IMPORTANT_COOKIES = ['SID', '__Secure-3PSID', 'LOGIN_INFO'];
 
 export function normalizeYoutubeCookies(input) {
   const text = String(input || '').trim();
@@ -19,6 +20,19 @@ export async function saveYoutubeCookies(input, filePath) {
   return filePath;
 }
 
+export function youtubeCookieWarnings(input) {
+  const normalized = isNetscapeCookieText(String(input || ''))
+    ? ensureNetscapeHeader(String(input || ''))
+    : normalizeYoutubeCookies(input);
+  const names = new Set(parseNetscapeCookieNames(normalized));
+  const missing = IMPORTANT_COOKIES.filter((name) => !names.has(name));
+  const warnings = [];
+  if (missing.length) {
+    warnings.push(`Cookie penting tidak ditemukan: ${missing.join(', ')}. Jika ,yt masih gagal, export cookies ulang dari browser.`);
+  }
+  return warnings;
+}
+
 export async function hasYoutubeCookies(filePath) {
   try {
     const stat = await fs.stat(filePath);
@@ -31,7 +45,8 @@ export async function hasYoutubeCookies(filePath) {
 export function youtubeCookiePrompt() {
   return [
     'YouTube butuh cookies untuk video ini.',
-    'Paste cookies JSON export browser, isi cookies.txt Netscape, atau raw header Cookie: di pesan berikutnya.',
+    'Paste cookies JSON export browser, isi cookies.txt Netscape, raw header Cookie:, atau kirim dokumen .json/.txt.',
+    'Jika tetap gagal, video ini mungkin butuh PO Token/plugin yt-dlp.',
     'Ketik ,cancel untuk batal.'
   ].join('\n');
 }
@@ -85,7 +100,7 @@ function cookieJsonToNetscape(text) {
 
 function cookieJsonLine(cookie) {
   if (!cookie || typeof cookie !== 'object') return null;
-  const name = cleanCookieField(cookie.name);
+  const name = normalizeYoutubeCookieName(cleanCookieField(cookie.name));
   if (!name) return null;
   const value = cleanCookieField(cookie.value ?? '');
   const rawDomain = cleanDomain(cookie.domain);
@@ -96,6 +111,24 @@ function cookieJsonLine(cookie) {
   const expires = normalizeExpires(cookie.expirationDate ?? cookie.expires ?? cookie.expiry);
   const domainCell = cookie.httpOnly ? `#HttpOnly_${domain}` : domain;
   return [domainCell, includeSubdomains, pathValue || '/', secure, expires, name, value].join('\t');
+}
+
+function normalizeYoutubeCookieName(name) {
+  const text = String(name || '');
+  const suffixes = [
+    '1PSIDTS',
+    '3PSIDTS',
+    '1PAPISID',
+    '3PAPISID',
+    '1PSID',
+    '3PSID',
+    '1PSIDCC',
+    '3PSIDCC'
+  ];
+  for (const suffix of suffixes) {
+    if (text === `Secure-${suffix}` || text === `_Secure-${suffix}`) return `__Secure-${suffix}`;
+  }
+  return text;
 }
 
 function cleanDomain(value) {
@@ -136,6 +169,7 @@ function cookieHeaderToNetscape(input) {
       return [part.slice(0, index).trim(), part.slice(index + 1).trim()];
     })
     .filter(Boolean)
+    .map(([name, value]) => [normalizeYoutubeCookieName(name), value])
     .filter(([name]) => !/^(\$|path$|domain$|expires$|max-age$|secure$|httponly$|samesite$)/i.test(name));
 
   if (!pairs.length) {
@@ -146,4 +180,13 @@ function cookieHeaderToNetscape(input) {
     NETSCAPE_HEADER,
     ...pairs.map(([name, value]) => ['.youtube.com', 'TRUE', '/', 'TRUE', DEFAULT_EXPIRES, name, value].join('\t'))
   ].join('\n');
+}
+
+function parseNetscapeCookieNames(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && (!line.startsWith('#') || line.startsWith('#HttpOnly_')))
+    .map((line) => line.split('\t')[5])
+    .filter(Boolean);
 }

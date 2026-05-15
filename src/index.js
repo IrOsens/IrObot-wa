@@ -28,7 +28,9 @@ import {
   UPDATE_RESTART_MODE,
   UPDATE_SYSTEMD_SERVICE,
   WOL_FILE,
+  YOUTUBE_EXTRACTOR_ARGS,
   YOUTUBE_COOKIE_FILE,
+  YOUTUBE_PO_TOKEN,
   cleanupStartupTemp,
   ensureRuntimeDirs
 } from './config.js';
@@ -44,7 +46,7 @@ import {
   mediaNode,
   quotedMediaNode
 } from './media.js';
-import { makeSticker, parseStickerMeta, reverseSticker } from './sticker.js';
+import { makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerMeta, reverseSticker } from './sticker.js';
 import { TaskScheduler, createTask, formatTaskList, formatWib, listTasks, updateTaskState } from './tasks.js';
 import { PdfSessions, parsePdfOrderText } from './pdf.js';
 import { downloadYoutube } from './youtube.js';
@@ -69,6 +71,7 @@ import {
   hasYoutubeCookies,
   isYoutubeCookieNeededError,
   saveYoutubeCookies,
+  youtubeCookieWarnings,
   youtubeCookiePrompt
 } from './youtubeCookies.js';
 
@@ -188,6 +191,7 @@ async function handleHelp(jid) {
     '',
     '🎬 Media .',
     '• ,s [author] [title] - buat sticker dari attach, reply, atau URL media .',
+    '• ,smeme up/down <teks> [1-99] - buat sticker meme dari reply media .',
     '• ,rs - kirim ulang media atau view-once reply ke chat ini .',
     '• ,topdf [nama] - mulai sesi PDF, lalu tutup dengan ,end .',
     '',
@@ -222,9 +226,7 @@ async function handleHelp(jid) {
     '✅ Session dan konfirmasi .',
     '• ,end - selesai save, PDF, atau restore .',
     '• ,cancel - batalkan sesi aktif atau pending confirm .',
-    '• ,confirm - jalankan aksi yang sedang menunggu konfirmasi .',
-    '',
-    `🕵️ Rahasia: reply media lalu akhiri teks dengan spasi titik untuk kirim ke ${PRIMARY_TARGET_NAME}, contoh halo .`
+    '• ,confirm - jalankan aksi yang sedang menunggu konfirmasi .'
   ].join('\n'));
 }
 
@@ -347,6 +349,29 @@ async function handleSticker(message, command) {
   }
 }
 
+async function handleSmeme(message, command) {
+  const jid = message.key.remoteJid;
+  const smeme = parseSmemeArgs(command.args);
+  let media = null;
+  try {
+    media = await downloadQuotedOrOwnMedia(state.sock, message, 'smeme-source');
+    if (!media) throw new Error('Reply image, GIF, video, atau sticker untuk memakai ,smeme.');
+    const supportedDocument = media.type === 'documentMessage' && /^(image|video)\//i.test(media.mimetype || '');
+    if (!['imageMessage', 'videoMessage', 'stickerMessage'].includes(media.type) && !supportedDocument) {
+      throw new Error('Smeme hanya mendukung image, GIF, video, atau sticker.');
+    }
+    const sticker = await makeSmemeSticker(media, {
+      author: DEFAULT_STICKER_AUTHOR,
+      title: DEFAULT_STICKER_TITLE,
+      tools: state.tools,
+      smeme
+    });
+    await state.sock.sendMessage(jid, { sticker });
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
+}
+
 async function handleReverseSticker(message, command) {
   const jid = message.key.remoteJid;
   let media = null;
@@ -354,11 +379,27 @@ async function handleReverseSticker(message, command) {
     if (command.rawArgs.trim()) throw new Error('Format baru: reply media/view-once lalu ketik ,rs tanpa parameter.');
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'reverse-source');
     if (!media) throw new Error('Reply media/view-once untuk memakai ,rs.');
+    if (media.type === 'stickerMessage') {
+      await sendReversedSticker(jid, media);
+      return;
+    }
     await sendDownloadedMedia(jid, media);
-    await sendText(jid, 'Media terkirim di chat ini.');
   } finally {
     await cleanupFiles([media?.path]);
   }
+}
+
+async function sendReversedSticker(jid, media) {
+  const converted = await reverseSticker(media, state.tools);
+  if (converted.mimetype === 'image/png') {
+    await state.sock.sendMessage(jid, { image: converted.buffer, mimetype: converted.mimetype });
+    return;
+  }
+  await state.sock.sendMessage(jid, {
+    document: converted.buffer,
+    mimetype: converted.mimetype,
+    fileName: converted.fileName
+  });
 }
 
 async function maybeHandleSecretMediaTrigger(message, text) {
@@ -372,7 +413,6 @@ async function maybeHandleSecretMediaTrigger(message, text) {
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'secret-media');
     if (!media) return false;
     await sendDownloadedMedia(destinationJid, media, { caption: trigger.caption });
-    await sendText(message.key.remoteJid, `Media rahasia terkirim ke ${PRIMARY_TARGET_NAME}.`);
     return true;
   } finally {
     await cleanupFiles([media?.path]);
@@ -432,7 +472,11 @@ async function sendYoutubeResult(jid, args) {
   let result = null;
   try {
     const cookieFile = await hasYoutubeCookies(YOUTUBE_COOKIE_FILE) ? YOUTUBE_COOKIE_FILE : null;
-    result = await downloadYoutube(args, state.tools, { cookieFile });
+    result = await downloadYoutube(args, state.tools, {
+      cookieFile,
+      extractorArgs: YOUTUBE_EXTRACTOR_ARGS,
+      poToken: YOUTUBE_PO_TOKEN
+    });
     const buffer = await fs.readFile(result.path);
     if (result.type === 'mp3') {
       await state.sock.sendMessage(jid, {
@@ -473,10 +517,32 @@ async function finishYoutubeCookieInput(message, text) {
   if (!session) return false;
   if (session.timer) clearTimeout(session.timer);
   state.youtubeCookieSessions.delete(jid);
-  await saveYoutubeCookies(text, YOUTUBE_COOKIE_FILE);
-  await sendText(jid, 'Cookies YouTube tersimpan. Mencoba download ulang...');
+  const cookieText = await readYoutubeCookieInput(message, text);
+  await saveYoutubeCookies(cookieText, YOUTUBE_COOKIE_FILE);
+  const warnings = youtubeCookieWarnings(cookieText);
+  await sendText(jid, [
+    'Cookies YouTube tersimpan. Mencoba download ulang...',
+    ...warnings.map((warning) => `Warning: ${warning}`)
+  ].join('\n'));
   await sendYoutubeResult(jid, session.args);
   return true;
+}
+
+async function readYoutubeCookieInput(message, text) {
+  const trimmed = String(text || '').trim();
+  if (trimmed) return trimmed;
+  let media = null;
+  try {
+    media = await downloadMessageMedia(state.sock, message, 'youtube-cookies');
+    if (!media) throw new Error('Kirim cookies sebagai teks atau dokumen .json/.txt.');
+    const ext = path.extname(media.fileName || media.path).toLowerCase();
+    if (media.type !== 'documentMessage' || !['.json', '.txt', '.cookies'].includes(ext)) {
+      throw new Error('Dokumen cookies harus file .json, .txt, atau .cookies.');
+    }
+    return await fs.readFile(media.path, 'utf8');
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
 }
 
 function normalizePhoneToJid(input) {
@@ -831,6 +897,9 @@ async function handleCommand(message, command) {
       break;
     case 's':
       await handleSticker(message, command);
+      break;
+    case 'smeme':
+      await handleSmeme(message, command);
       break;
     case 'rs':
       await handleReverseSticker(message, command);

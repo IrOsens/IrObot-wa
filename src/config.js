@@ -35,7 +35,9 @@ export const DEFAULT_APP_CONFIG = {
     sessionTimeoutMs: 30 * 60 * 1000
   },
   youtube: {
-    cookieFile: path.join('auth', 'youtube-cookies.txt')
+    cookieFile: path.join('auth', 'youtube-cookies.txt'),
+    extractorArgs: '',
+    poToken: ''
   },
   wol: {
     broadcastAddress: '255.255.255.255',
@@ -79,6 +81,8 @@ export const RESTORE_SESSION_TIMEOUT_MS = numberOr(APP_CONFIG.sessions?.restoreT
 export const YOUTUBE_COOKIE_FILE = resolveRuntimePath(
   process.env.YOUTUBE_COOKIE_FILE || APP_CONFIG.youtube?.cookieFile || path.join('auth', 'youtube-cookies.txt')
 );
+export const YOUTUBE_EXTRACTOR_ARGS = process.env.YOUTUBE_EXTRACTOR_ARGS || APP_CONFIG.youtube?.extractorArgs || '';
+export const YOUTUBE_PO_TOKEN = process.env.YOUTUBE_PO_TOKEN || APP_CONFIG.youtube?.poToken || '';
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 export const TELEGRAM_CLIENT_ID = process.env.TELEGRAM_CLIENT_ID || '';
 export const TELEGRAM_PART_SIZE_BYTES = Math.max(
@@ -180,6 +184,8 @@ function requiredEnvLines() {
     'TELEGRAM_BOT_TOKEN=',
     'TELEGRAM_CLIENT_ID=',
     'YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt',
+    'YOUTUBE_EXTRACTOR_ARGS=',
+    'YOUTUBE_PO_TOKEN=',
     'TELEGRAM_PART_SIZE_MB=45'
   ];
 }

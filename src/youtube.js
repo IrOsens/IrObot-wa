@@ -58,7 +58,7 @@ export async function downloadYoutube(args, tools, options = {}) {
   if (options.cookieFile) baseArgs.push('--cookies', options.cookieFile);
   if (parsed.range) baseArgs.push('--download-sections', `*${parsed.range}`, '--force-keyframes-at-cuts');
 
-  const attempts = buildDownloadAttempts(parsed, baseArgs);
+  const attempts = buildDownloadAttempts(parsed, baseArgs, options);
   let lastError = null;
   for (const attempt of attempts) {
     try {
@@ -92,23 +92,21 @@ export async function downloadYoutube(args, tools, options = {}) {
   };
 }
 
-function buildDownloadAttempts(parsed, baseArgs) {
+function buildDownloadAttempts(parsed, baseArgs, options = {}) {
   if (parsed.type === 'mp3') {
     return [
       {
         retryable: true,
-        args: [...baseArgs, '-x', '--audio-format', 'mp3', '--audio-quality', '0', parsed.url]
+        args: withYoutubeExtractorArgs([...baseArgs, '-x', '--audio-format', 'mp3', '--audio-quality', '0'], null, options).concat(parsed.url)
       },
       {
         retryable: false,
-        args: [
+        args: withYoutubeExtractorArgs([
           ...baseArgs,
-          '--extractor-args', YOUTUBE_FALLBACK_EXTRACTOR_ARGS,
           '-x',
           '--audio-format', 'mp3',
-          '--audio-quality', '0',
-          parsed.url
-        ]
+          '--audio-quality', '0'
+        ], YOUTUBE_FALLBACK_EXTRACTOR_ARGS, options).concat(parsed.url)
       }
     ];
   }
@@ -118,20 +116,40 @@ function buildDownloadAttempts(parsed, baseArgs) {
   return [
     {
       retryable: true,
-      args: [...baseArgs, '-f', primaryFormat, '--merge-output-format', 'mp4', parsed.url]
+      args: withYoutubeExtractorArgs([...baseArgs, '-f', primaryFormat, '--merge-output-format', 'mp4'], null, options).concat(parsed.url)
     },
     {
       retryable: false,
-      args: [
+      args: withYoutubeExtractorArgs([
         ...baseArgs,
-        '--extractor-args', YOUTUBE_FALLBACK_EXTRACTOR_ARGS,
         '-f', fallbackFormat,
         '--merge-output-format', 'mp4',
-        '--remux-video', 'mp4',
-        parsed.url
-      ]
+        '--remux-video', 'mp4'
+      ], YOUTUBE_FALLBACK_EXTRACTOR_ARGS, options).concat(parsed.url)
     }
   ];
+}
+
+function withYoutubeExtractorArgs(args, baseExtractorArgs, options = {}) {
+  const extractorArgs = buildYoutubeExtractorArgs(baseExtractorArgs, options);
+  return extractorArgs ? [...args, '--extractor-args', extractorArgs] : args;
+}
+
+function buildYoutubeExtractorArgs(baseExtractorArgs, options = {}) {
+  const parts = [];
+  for (const value of [baseExtractorArgs, options.extractorArgs]) {
+    const normalized = normalizeYoutubeExtractorArgs(value);
+    if (normalized) parts.push(normalized);
+  }
+  if (options.poToken) parts.push(`po_token=${options.poToken}`);
+  if (!parts.length) return '';
+  return `youtube:${parts.join(';')}`;
+}
+
+function normalizeYoutubeExtractorArgs(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  return text.replace(/^youtube:/i, '').replace(/^;+|;+$/g, '');
 }
 
 async function cleanupPrefix(prefix) {
@@ -152,7 +170,7 @@ function friendlyYoutubeError(error) {
   if (isRetryableYoutubeError(error)) {
     const friendly = new Error([
       'YouTube menolak download dari yt-dlp saat ini.',
-      'Coba update yt-dlp ke versi terbaru. Jika tetap gagal, video ini mungkin butuh cookies browser.',
+      'Coba update yt-dlp ke versi terbaru. Jika tetap gagal, video ini mungkin butuh cookies browser atau PO Token/plugin yt-dlp.',
       lastUsefulLine(text)
     ].filter(Boolean).join('\n'));
     friendly.code = 'YOUTUBE_COOKIES_NEEDED';
