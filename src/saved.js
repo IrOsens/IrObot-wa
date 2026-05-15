@@ -3,6 +3,7 @@ import path from 'node:path';
 import { getContentType } from 'baileys';
 import { SAVED_MESSAGES_DIR, SAVED_MESSAGES_FILE } from './config.js';
 import { cleanupFiles, downloadMessageMedia } from './media.js';
+import { assertUniqueTitle } from './namedStore.js';
 import { getMessageText, unwrapMessage } from './text.js';
 
 function emptyStore() {
@@ -218,6 +219,7 @@ export class SaveRecorder {
     if (!session) return null;
     if (!session.entries.length) throw new Error('Belum ada isi yang direkam.');
     const store = await readStore();
+    assertUniqueTitle(store, session.title);
     const id = store.nextId++;
     const dir = path.join(SAVED_MESSAGES_DIR, `${id}-${slug(session.title)}`);
     await fs.mkdir(dir, { recursive: true });
@@ -268,6 +270,11 @@ export async function listSaved() {
   return store.items;
 }
 
+export async function assertSavedTitleAvailable(title) {
+  const store = await readStore();
+  assertUniqueTitle(store, title);
+}
+
 export function formatSavedList(items) {
   if (!items.length) return 'Belum ada pesan tersimpan.';
   return items.map((item) => `#${item.id} - ${item.title} (${visibleEntries(item).length} item)`).join('\n');
@@ -287,6 +294,17 @@ export async function deleteSaved(query) {
 export async function getSaved(query) {
   const store = await readStore();
   return findSaved(store, query);
+}
+
+export async function renameSaved(query, newTitle) {
+  const store = await readStore();
+  const item = findSaved(store, query);
+  if (!item) throw new Error(`Save "${query}" tidak ditemukan.`);
+  assertUniqueTitle(store, newTitle, item.id);
+  item.title = String(newTitle || '').trim();
+  item.updatedAt = new Date().toISOString();
+  await writeStore(store);
+  return item;
 }
 
 async function sendUnsupported(sock, jid, entry) {

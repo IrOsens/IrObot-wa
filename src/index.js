@@ -1,5 +1,6 @@
 import os from 'node:os';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import pino from 'pino';
 import QRCode from 'qrcode';
 import makeWASocket, {
@@ -9,10 +10,21 @@ import makeWASocket, {
 } from 'baileys';
 import {
   AUTH_DIR,
+  BOT_NAME,
   COMMAND_PREFIX,
   DEFAULT_STICKER_AUTHOR,
   DEFAULT_STICKER_TITLE,
+  LINKS_FILE,
+  NOTES_FILE,
+  PDF_DEFAULT_FILE_NAME,
+  PRIMARY_TARGET_NAME,
+  REMINDERS_FILE,
   ROOT_DIR,
+  TASKS_FILE,
+  TELEGRAM_CLIENT_ID,
+  TELEGRAM_PART_SIZE_BYTES,
+  WOL_FILE,
+  YOUTUBE_COOKIE_FILE,
   cleanupStartupTemp,
   ensureRuntimeDirs
 } from './config.js';
@@ -30,17 +42,30 @@ import {
 } from './media.js';
 import { makeSticker, parseStickerMeta, reverseSticker } from './sticker.js';
 import { TaskScheduler, createTask, formatTaskList, formatWib, listTasks, updateTaskState } from './tasks.js';
-import { PdfSessions } from './pdf.js';
+import { PdfSessions, parsePdfOrderText } from './pdf.js';
 import { downloadYoutube } from './youtube.js';
 import {
   SaveRecorder,
+  assertSavedTitleAvailable,
   deleteSaved,
   formatSavedList,
   getSaved,
   listSaved,
   parseSaveStart,
+  renameSaved,
   sendSaved
 } from './saved.js';
+import { handleLinkCommand, handleNoteCommand, listLinks, listNotes } from './notes.js';
+import { ReminderScheduler, createReminder, formatCountdown, listReminders } from './reminders.js';
+import { handleWolCommand, listWol } from './wol.js';
+import { sendDataBackupToTelegram } from './backup.js';
+import { RestoreSessions } from './restore.js';
+import {
+  hasYoutubeCookies,
+  isYoutubeCookieNeededError,
+  saveYoutubeCookies,
+  youtubeCookiePrompt
+} from './youtubeCookies.js';
 
 class ChatDirectory {
   constructor() {
@@ -108,8 +133,11 @@ const state = {
   chatDirectory: new ChatDirectory(),
   viewOnceCache: new ViewOnceCache(),
   scheduler: null,
+  reminderScheduler: null,
   pdfSessions: null,
+  restoreSessions: null,
   saveRecorder: null,
+  youtubeCookieSessions: new Map(),
   ignoredOwnMessageIds: new Set(),
   reconnecting: false
 };
@@ -149,37 +177,44 @@ function isIgnoredOwnOutput(message) {
 
 async function handleHelp(jid) {
   await sendText(jid, [
-    'IrOBot Help',
+    `${BOT_NAME} Help`,
+    'commands/',
+    '  media/',
+    '    ,s [author] [title]      buat sticker dari attach/reply/URL',
+    `    ,rs                     kirim media/view-once reply ke ${PRIMARY_TARGET_NAME}`,
+    '    ,topdf [nama]           mulai sesi PDF; ,end untuk selesai',
+    '  download/',
+    '    ,yt <link> <mp3|mp4> [360|480|720|1080] [00:00-01:00]',
+    '  reminder/',
+    '    ,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal]',
+    '    ,ltask                  lihat task',
+    '    ,ltask true|false|del <id>',
+    '    ,remindme <teks> <durasi>  contoh: ,remindme minum 10m',
+    '  save/',
+    '    ,save <judul> [teks awal]',
+    '    ,load                   list save',
+    '    ,load <id|judul>        kirim ulang save',
+    '    ,load del <id|judul>',
+    '    ,load change <id|judul> <judul-baru>',
+    '  notes-links/',
+    '    ,note | ,note <judul> <teks> | ,note <id|judul> | ,note del <id|judul>',
+    '    ,link | ,link <nama> <https://link> | ,link <id|nama> | ,link del <id|nama>',
+    '  utility/',
+    '    ,info <nomor>           cek info WhatsApp',
+    '    ,status                 status ringkas',
+    '    ,health                 status teknis',
+    '    ,won                    list Wake-on-LAN',
+    '    ,won <mac|id>           kirim magic packet',
+    '    ,won save|del <mac|id>',
+    '    ,backup                 kirim zip data/ ke Telegram',
+    '    ,restore                mulai restore zip WhatsApp',
+    '    ,clear                  hapus temp',
+    '    ,restartbot             restart aman',
+    '  session/',
+    '    ,end                    selesai save/PDF/restore',
+    '    ,cancel                 batalkan sesi aktif',
     '',
-    'Sticker & Media',
-    ',s [author] [title] - buat sticker dari attach/reply/URL media',
-    ',rs - reverse sticker/media yang direply',
-    ',rs [nama grup|nama kontak|nomor] - kirim view-once terbaru dari target',
-    ',topdf [urutan] - mulai sesi PDF; bisa reply media langsung',
-    'Saat sesi PDF aktif, reply media dengan caption/teks angka untuk urutan halaman',
-    '',
-    'Downloader',
-    ',yt <link> <mp3|mp4> [360|480|720|1080]',
-    '',
-    'Reminder',
-    ',task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal]',
-    'Contoh: ,task "test" 12 49 02 07/12/2026',
-    ',ltask - lihat task',
-    ',ltask true|false|del <id> - resume/pause/hapus task',
-    '',
-    'Saved Message',
-    ',save <judul> [teks awal] - mulai rekam teks/media/lokasi/kontak/poll/event',
-    ',load - lihat semua save',
-    ',load <id|judul> - kirim ulang save',
-    ',load del <id|judul> - hapus save',
-    '',
-    'Utility',
-    ',info <nomor> - cek info WhatsApp dan foto profil',
-    ',status - status server',
-    '',
-    'Session',
-    ',end - selesai sesi save/PDF',
-    ',cancel - batalkan rekaman save'
+    'Tips PDF: kirim/reply media saat sesi aktif; teks angka menjadi urutan halaman.'
   ].join('\n'));
 }
 
@@ -200,6 +235,67 @@ async function handleStatus(jid) {
     `Disk: ${diskText}`,
     `Node: ${process.version}`,
     `Process RAM: RSS ${formatBytes(mem.rss)}, heap ${formatBytes(mem.heapUsed)}/${formatBytes(mem.heapTotal)}`,
+    `Time: ${new Date().toLocaleString()}`
+  ].join('\n'));
+}
+
+function activeSessionType(jid) {
+  if (state.saveRecorder?.has(jid)) return 'save';
+  if (state.pdfSessions?.has(jid)) return 'PDF';
+  if (state.restoreSessions?.has(jid)) return 'restore';
+  if (state.youtubeCookieSessions.has(jid)) return 'YouTube cookies';
+  return null;
+}
+
+function assertNoActiveSession(jid) {
+  const active = activeSessionType(jid);
+  if (active) throw new Error(`Masih ada sesi ${active} aktif. Selesaikan dengan ,end atau batalkan dengan ,cancel.`);
+}
+
+function hasAnyTempSession() {
+  return Boolean(
+    state.saveRecorder?.sessions?.size
+    || state.pdfSessions?.count()
+    || state.restoreSessions?.count()
+    || state.youtubeCookieSessions.size
+  );
+}
+
+async function handleHealth(jid) {
+  const mem = process.memoryUsage();
+  const disk = await getDiskInfo(ROOT_DIR);
+  const diskText = disk
+    ? `${formatBytes(disk.used)} / ${formatBytes(disk.size)} used, ${formatBytes(disk.free)} free (${disk.source})`
+    : 'unavailable';
+  const [saved, notes, links, reminders, tasks, wolItems] = await Promise.all([
+    listSaved(),
+    listNotes(),
+    listLinks(),
+    listReminders(),
+    listTasks(),
+    listWol()
+  ]);
+  const targetJid = state.chatDirectory.findByName(PRIMARY_TARGET_NAME);
+  await sendText(jid, [
+    `${BOT_NAME} health`,
+    `PID: ${process.pid}`,
+    `Platform: ${process.platform} ${process.arch}`,
+    `Node: ${process.version}`,
+    `Uptime bot: ${formatDuration(process.uptime())}`,
+    `Uptime OS: ${formatDuration(os.uptime())}`,
+    `Load: ${getLoadAverageText()}`,
+    `Memory RSS: ${formatBytes(mem.rss)}`,
+    `Memory heap: ${formatBytes(mem.heapUsed)} / ${formatBytes(mem.heapTotal)}`,
+    `External: ${formatBytes(mem.external)}`,
+    `Disk: ${diskText}`,
+    `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, yt-dlp=${Boolean(state.tools.ytDlp)}, office=${Boolean(state.tools.office)}`,
+    `Data counts: save=${saved.length}, note=${notes.length}, link=${links.length}, task=${tasks.length}, remind=${reminders.length}, wol=${wolItems.length}`,
+    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, ytCookies=${state.youtubeCookieSessions.size}`,
+    `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
+    `Target ${PRIMARY_TARGET_NAME}: ${targetJid || 'not found'}`,
+    `Telegram client id: ${TELEGRAM_CLIENT_ID ? 'configured' : 'missing'}`,
+    `Telegram part size: ${formatBytes(TELEGRAM_PART_SIZE_BYTES)}`,
+    `Runtime files: ${[TASKS_FILE, NOTES_FILE, LINKS_FILE, REMINDERS_FILE, WOL_FILE].map((file) => path.basename(file)).join(', ')}`,
     `Time: ${new Date().toLocaleString()}`
   ].join('\n'));
 }
@@ -225,30 +321,13 @@ async function handleReverseSticker(message, command) {
   const jid = message.key.remoteJid;
   let media = null;
   try {
-    if (command.rawArgs.trim()) {
-      await sendLatestViewOnce(jid, command.rawArgs.trim());
-      return;
-    }
+    if (command.rawArgs.trim()) throw new Error('Format baru: reply media/view-once lalu ketik ,rs tanpa parameter.');
+    const destinationJid = state.chatDirectory.findByName(PRIMARY_TARGET_NAME);
+    if (!destinationJid) throw new Error(`Grup target "${PRIMARY_TARGET_NAME}" tidak ditemukan di cache chat bot.`);
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'reverse-source');
-    if (!media) throw new Error('Reply atau attach sticker/media/view-once untuk memakai ,rs.');
-    if (media.type === 'imageMessage') {
-      await state.sock.sendMessage(jid, { image: await fs.readFile(media.path), mimetype: media.mimetype });
-      return;
-    }
-    if (media.type === 'videoMessage') {
-      await state.sock.sendMessage(jid, { video: await fs.readFile(media.path), mimetype: media.mimetype });
-      return;
-    }
-    const result = await reverseSticker(media, state.tools);
-    if (result.mimetype === 'image/png') {
-      await state.sock.sendMessage(jid, { image: result.buffer, mimetype: result.mimetype });
-    } else {
-      await state.sock.sendMessage(jid, {
-        document: result.buffer,
-        mimetype: result.mimetype,
-        fileName: result.fileName
-      });
-    }
+    if (!media) throw new Error('Reply media/view-once untuk memakai ,rs.');
+    await sendDownloadedMedia(destinationJid, media);
+    await sendText(jid, `Media terkirim ke ${PRIMARY_TARGET_NAME}.`);
   } finally {
     await cleanupFiles([media?.path]);
   }
@@ -291,10 +370,21 @@ async function sendDownloadedMedia(jid, media) {
 
 async function handleYoutube(message, command) {
   const jid = message.key.remoteJid;
-  let result = null;
   try {
     await sendText(jid, 'Mulai download YouTube...');
-    result = await downloadYoutube(command.args, state.tools);
+    await sendYoutubeResult(jid, command.args);
+  } catch (error) {
+    if (!isYoutubeCookieNeededError(error)) throw error;
+    startYoutubeCookieSession(jid, command.args);
+    await sendText(jid, `${error.message}\n\n${youtubeCookiePrompt()}`);
+  }
+}
+
+async function sendYoutubeResult(jid, args) {
+  let result = null;
+  try {
+    const cookieFile = await hasYoutubeCookies(YOUTUBE_COOKIE_FILE) ? YOUTUBE_COOKIE_FILE : null;
+    result = await downloadYoutube(args, state.tools, { cookieFile });
     const buffer = await fs.readFile(result.path);
     if (result.type === 'mp3') {
       await state.sock.sendMessage(jid, {
@@ -313,6 +403,32 @@ async function handleYoutube(message, command) {
   } finally {
     await cleanupFiles([result?.path]);
   }
+}
+
+function startYoutubeCookieSession(jid, args) {
+  const active = activeSessionType(jid);
+  if (active && active !== 'YouTube cookies') {
+    throw new Error(`Tidak bisa meminta cookies saat sesi ${active} aktif. Selesaikan dengan ,end atau batalkan dengan ,cancel.`);
+  }
+  const old = state.youtubeCookieSessions.get(jid);
+  if (old?.timer) clearTimeout(old.timer);
+  state.youtubeCookieSessions.set(jid, {
+    jid,
+    args: [...args],
+    startedAt: Date.now()
+  });
+}
+
+async function finishYoutubeCookieInput(message, text) {
+  const jid = message.key.remoteJid;
+  const session = state.youtubeCookieSessions.get(jid);
+  if (!session) return false;
+  if (session.timer) clearTimeout(session.timer);
+  state.youtubeCookieSessions.delete(jid);
+  await saveYoutubeCookies(text, YOUTUBE_COOKIE_FILE);
+  await sendText(jid, 'Cookies YouTube tersimpan. Mencoba download ulang...');
+  await sendYoutubeResult(jid, session.args);
+  return true;
 }
 
 function normalizePhoneToJid(input) {
@@ -370,18 +486,17 @@ async function handleListTask(jid, command) {
   await sendText(jid, result.deleted ? `Task #${id} dihapus.` : `Task #${id} ${result.task.paused ? 'dipause' : 'aktif'}.`);
 }
 
-async function handleTopdf(message) {
+async function handleTopdf(message, command) {
   const jid = message.key.remoteJid;
-  state.pdfSessions.start(jid);
-  const text = getMessageText(message);
-  const order = /^\s*,topdf\s+\d+\s*$/i.test(text) ? Number(text.trim().split(/\s+/).at(-1)) : null;
+  assertNoActiveSession(jid);
+  const session = state.pdfSessions.start(jid, command.rawArgs.trim());
   const hasInitialMedia = mediaNode(message) || quotedMediaNode(message);
   if (hasInitialMedia) {
-    const item = await state.pdfSessions.addAny(state.sock, message, order);
-    await sendText(jid, `Sesi PDF dimulai dan file pertama ditambahkan: ${item.fileName} (#${item.order}). Kirim media lain lalu ketik ,end.`);
+    const item = await state.pdfSessions.addAny(state.sock, message, null);
+    await sendText(jid, `Sesi PDF "${session.fileName}" dimulai dan file pertama ditambahkan: ${item.fileName} (#${item.order}). Kirim media lain lalu ketik ,end.`);
     return;
   }
-  await sendText(jid, 'Sesi PDF dimulai. Kirim media/dokumen, beri caption angka untuk urutan jika perlu, atau reply media dengan ,topdf <angka>. Ketik ,end untuk selesai.');
+  await sendText(jid, `Sesi PDF "${session.fileName}" dimulai. Kirim/reply media atau dokumen. Caption/teks angka dipakai sebagai urutan halaman. Ketik ,end untuk selesai.`);
 }
 
 async function handleEndPdf(message) {
@@ -396,7 +511,7 @@ async function handleEndPdf(message) {
     await state.sock.sendMessage(jid, {
       document: pdf,
       mimetype: 'application/pdf',
-      fileName: `IrOBot-${Date.now()}.pdf`
+      fileName: session.fileName || `${PDF_DEFAULT_FILE_NAME}-${Date.now()}.pdf`
     });
   } finally {
     await state.pdfSessions.cleanup(session);
@@ -405,6 +520,8 @@ async function handleEndPdf(message) {
 
 async function handleSave(message, command) {
   const { title, firstText } = parseSaveStart(command);
+  assertNoActiveSession(message.key.remoteJid);
+  await assertSavedTitleAvailable(title);
   const session = state.saveRecorder.start(message.key.remoteJid, title, firstText);
   await sendText(message.key.remoteJid, `Mulai rekam save "${session.title}". Kirim teks, media, lokasi, kontak, poll, atau event lalu ,end untuk simpan atau ,cancel untuk batal.`);
 }
@@ -413,6 +530,14 @@ async function handleLoad(message, command) {
   const jid = message.key.remoteJid;
   if (!command.args.length) {
     await sendText(jid, formatSavedList(await listSaved()));
+    return;
+  }
+  if (command.args[0].toLowerCase() === 'change') {
+    const query = command.args[1];
+    const newTitle = command.args.slice(2).join(' ').trim();
+    if (!query || !newTitle) throw new Error('Format: ,load change <id|judul-lama> <judul-baru>');
+    const item = await renameSaved(query, newTitle);
+    await sendText(jid, `Save #${item.id} diganti judul menjadi "${item.title}".`);
     return;
   }
   if (command.args[0].toLowerCase() === 'del') {
@@ -441,13 +566,100 @@ async function cancelSave(message) {
   return cancelled;
 }
 
+async function cancelActiveSession(message) {
+  const jid = message.key.remoteJid;
+  if (await cancelSave(message)) return true;
+
+  const pdfSession = state.pdfSessions.end(jid);
+  if (pdfSession) {
+    await state.pdfSessions.cleanup(pdfSession);
+    await sendText(jid, 'Sesi PDF dibatalkan.');
+    return true;
+  }
+
+  if (await state.restoreSessions.cancel(jid)) {
+    await sendText(jid, 'Sesi restore dibatalkan.');
+    return true;
+  }
+
+  const cookieSession = state.youtubeCookieSessions.get(jid);
+  if (cookieSession) {
+    if (cookieSession.timer) clearTimeout(cookieSession.timer);
+    state.youtubeCookieSessions.delete(jid);
+    await sendText(jid, 'Input cookies YouTube dibatalkan.');
+    return true;
+  }
+
+  return false;
+}
+
+async function finishRestore(message) {
+  const jid = message.key.remoteJid;
+  const session = state.restoreSessions.end(jid);
+  if (!session) return false;
+  state.scheduler?.stop();
+  state.reminderScheduler?.stop();
+  try {
+    const result = await state.restoreSessions.restore(session);
+    await sendText(jid, `Restore selesai. ${result.parts} part diproses, ${result.extracted} file diekstrak ke data/.`);
+  } finally {
+    state.scheduler?.start();
+    state.reminderScheduler?.start();
+  }
+  return true;
+}
+
+async function maybeCollectRestorePart(message) {
+  if (!state.restoreSessions.has(message.key.remoteJid)) return false;
+  const item = await state.restoreSessions.add(state.sock, message);
+  if (item) {
+    await sendText(message.key.remoteJid, `Restore part diterima: ${item.fileName}`);
+    return true;
+  }
+  await sendText(message.key.remoteJid, 'Kirim dokumen .zip untuk restore, atau ketik ,end jika semua part sudah dikirim.');
+  return true;
+}
+
 async function maybeCollectPdfItem(message, text) {
   if (!state.pdfSessions.has(message.key.remoteJid)) return false;
   if (!mediaNode(message) && !quotedMediaNode(message)) return false;
-  const order = /^\s*\d+\s*$/.test(text) ? Number(text.trim()) : null;
+  const order = parsePdfOrderText(text);
   const item = await state.pdfSessions.addAny(state.sock, message, order);
   if (item) await sendText(message.key.remoteJid, `Ditambahkan ke PDF: ${item.fileName} (#${item.order})`);
   return Boolean(item);
+}
+
+async function handleReminder(message, command) {
+  const reminder = await createReminder(command.args);
+  await sendText(message.key.remoteJid, `Reminder #${reminder.id} dibuat. Terkirim dalam ${formatCountdown(new Date(reminder.dueAt).getTime() - Date.now())} ke ${PRIMARY_TARGET_NAME}.`);
+}
+
+async function handleClear(jid) {
+  if (hasAnyTempSession()) throw new Error('Tidak bisa clear temp saat ada sesi save/PDF/restore/cookies aktif.');
+  await cleanupStartupTemp();
+  await sendText(jid, 'Temp dibersihkan.');
+}
+
+async function handleBackup(jid) {
+  await sendText(jid, 'Membuat backup data/ dan mengirim ke Telegram...');
+  const files = await sendDataBackupToTelegram();
+  await sendText(jid, `Backup terkirim ke Telegram:\n${files.join('\n')}`);
+}
+
+async function handleRestoreStart(message) {
+  const jid = message.key.remoteJid;
+  assertNoActiveSession(jid);
+  await state.restoreSessions.start(jid);
+  await sendText(jid, 'Sesi restore dimulai. Kirim file .zip/PART zip sebagai dokumen WhatsApp, lalu ketik ,end untuk overwrite folder data/. Ketik ,cancel untuk batal.');
+}
+
+async function handleRestartBot(jid) {
+  await sendText(jid, 'Restart bot dimulai. Proses akan keluar dengan aman; pastikan supervisor menjalankan ulang bot.');
+  await logger.info('restartbot requested', { jid });
+  state.scheduler?.stop();
+  state.reminderScheduler?.stop();
+  state.sock?.end?.(new Error('restartbot'));
+  setTimeout(() => process.exit(0), 700).unref?.();
 }
 
 async function handleCommand(message, command) {
@@ -458,6 +670,9 @@ async function handleCommand(message, command) {
       break;
     case 'status':
       await handleStatus(jid);
+      break;
+    case 'health':
+      await handleHealth(jid);
       break;
     case 'yt':
       await handleYoutube(message, command);
@@ -471,8 +686,14 @@ async function handleCommand(message, command) {
     case 'load':
       await handleLoad(message, command);
       break;
+    case 'note':
+      await sendText(jid, await handleNoteCommand(command));
+      break;
+    case 'link':
+      await sendText(jid, await handleLinkCommand(command));
+      break;
     case 'cancel':
-      if (!(await cancelSave(message))) await sendText(jid, 'Tidak ada rekaman save aktif.');
+      if (!(await cancelActiveSession(message))) await sendText(jid, 'Tidak ada sesi aktif.');
       break;
     case 's':
       await handleSticker(message, command);
@@ -486,11 +707,31 @@ async function handleCommand(message, command) {
     case 'ltask':
       await handleListTask(jid, command);
       break;
+    case 'remindme':
+      await handleReminder(message, command);
+      break;
     case 'topdf':
-      await handleTopdf(message);
+      await handleTopdf(message, command);
+      break;
+    case 'won':
+      await sendText(jid, await handleWolCommand(command));
+      break;
+    case 'backup':
+      await handleBackup(jid);
+      break;
+    case 'restore':
+      await handleRestoreStart(message);
+      break;
+    case 'clear':
+      await handleClear(jid);
+      break;
+    case 'restartbot':
+      await handleRestartBot(jid);
       break;
     case 'end':
-      if (!(await finishSave(message))) await handleEndPdf(message);
+      if (await finishSave(message)) break;
+      if (await finishRestore(message)) break;
+      await handleEndPdf(message);
       break;
     default:
       await sendText(jid, `Command tidak dikenal: ${COMMAND_PREFIX}${command.name}\nKetik ,help`);
@@ -511,6 +752,14 @@ async function onMessageUpsert(event) {
     try {
       if (state.saveRecorder.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
         await state.saveRecorder.record(state.sock, message);
+        continue;
+      }
+      if (state.restoreSessions.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
+        await maybeCollectRestorePart(message);
+        continue;
+      }
+      if (state.youtubeCookieSessions.has(jid) && !command) {
+        await finishYoutubeCookieInput(message, text);
         continue;
       }
       if (command) {
@@ -561,6 +810,8 @@ async function connect() {
   state.sock = sock;
   state.scheduler?.stop();
   state.scheduler = new TaskScheduler(sock, state.chatDirectory, logger);
+  state.reminderScheduler?.stop();
+  state.reminderScheduler = new ReminderScheduler(sock, state.chatDirectory, logger);
 
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('messages.upsert', onMessageUpsert);
@@ -583,9 +834,11 @@ async function connect() {
       await logger.info('WhatsApp connected');
       await loadGroups(sock);
       state.scheduler.start();
+      state.reminderScheduler.start();
     }
     if (connection === 'close') {
       state.scheduler?.stop();
+      state.reminderScheduler?.stop();
       await logger.warn('Connection closed', { error: lastDisconnect?.error?.message });
       if (shouldReconnect(lastDisconnect) && !state.reconnecting) {
         state.reconnecting = true;
@@ -606,6 +859,7 @@ async function main() {
   await cleanupOldLogs();
   state.tools = await detectTools();
   state.pdfSessions = new PdfSessions(state.tools);
+  state.restoreSessions = new RestoreSessions();
   state.saveRecorder = new SaveRecorder();
   await logger.info('Detected tools', state.tools);
   console.log('Tool check:', {
@@ -620,6 +874,7 @@ async function main() {
 process.on('SIGINT', async () => {
   await logger.info('SIGINT received');
   state.scheduler?.stop();
+  state.reminderScheduler?.stop();
   process.exit(0);
 });
 

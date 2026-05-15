@@ -1,0 +1,30 @@
+{
+  "botName": "IrOBot",
+  "commandPrefix": ",",
+  "targets": {
+    "primaryGroup": "IrOBot",
+    "taskChats": ["dev", "IrOBot"],
+    "reminderChat": "IrOBot"
+  },
+  "sticker": {
+    "defaultAuthor": "IrO",
+    "defaultTitle": ":3"
+  },
+  "pdf": {
+    "defaultFileName": "IrOBot",
+    "sessionTimeoutMs": 1800000
+  },
+  "youtube": {
+    "cookieFile": "auth/youtube-cookies.txt"
+  },
+  "wol": {
+    "broadcastAddress": "255.255.255.255",
+    "port": 9
+  },
+  "sessions": {
+    "restoreTimeoutMs": 1800000
+  },
+  "backup": {
+    "telegramPartSizeMb": 45
+  }
+}

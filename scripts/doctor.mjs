@@ -1,4 +1,5 @@
 import { detectTools } from '../src/tools.js';
+import { APP_CONFIG, TELEGRAM_BOT_TOKEN, TELEGRAM_CLIENT_ID, YOUTUBE_COOKIE_FILE } from '../src/config.js';
 
 function yesNo(value) {
   return value ? 'yes' : 'no';
@@ -17,6 +18,10 @@ async function main() {
   line('ffprobe', tools.ffprobe || 'missing');
   line('yt-dlp', tools.ytDlp || 'missing');
   line('LibreOffice/soffice', tools.office || 'missing');
+  line('Target primary group', APP_CONFIG.targets?.primaryGroup || 'missing');
+  line('YouTube cookie file', YOUTUBE_COOKIE_FILE);
+  line('Telegram bot token', TELEGRAM_BOT_TOKEN ? 'configured' : 'missing');
+  line('Telegram client id', TELEGRAM_CLIENT_ID ? 'configured' : 'missing');
   console.log('');
   line('Full sticker/media support', yesNo(Boolean(tools.ffmpeg)));
   line('Full YouTube support', yesNo(Boolean(tools.ffmpeg && tools.ytDlp)));

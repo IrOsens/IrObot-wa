@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import syncFs from 'node:fs';
 import path from 'node:path';
 
 export const ROOT_DIR = process.cwd();
@@ -10,12 +11,74 @@ export const SAVED_MESSAGES_FILE = path.join(DATA_DIR, 'saved-messages.json');
 export const LOG_DIR = path.join(ROOT_DIR, 'logs');
 export const TEMP_DIR = path.join(ROOT_DIR, 'temp');
 export const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
+export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+export const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
+export const LINKS_FILE = path.join(DATA_DIR, 'links.json');
+export const REMINDERS_FILE = path.join(DATA_DIR, 'reminders.json');
+export const WOL_FILE = path.join(DATA_DIR, 'wol.json');
+export const ENV_FILE = path.join(ROOT_DIR, '.env');
 
-export const COMMAND_PREFIX = ',';
-export const TASK_TARGET_NAMES = ['dev', 'IrOBot'];
-export const DEFAULT_STICKER_AUTHOR = 'IrO';
-export const DEFAULT_STICKER_TITLE = ':3';
-export const PDF_SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+export const DEFAULT_APP_CONFIG = {
+  botName: 'IrOBot',
+  commandPrefix: ',',
+  targets: {
+    primaryGroup: 'IrOBot',
+    taskChats: ['dev', 'IrOBot'],
+    reminderChat: 'IrOBot'
+  },
+  sticker: {
+    defaultAuthor: 'IrO',
+    defaultTitle: ':3'
+  },
+  pdf: {
+    defaultFileName: 'IrOBot',
+    sessionTimeoutMs: 30 * 60 * 1000
+  },
+  youtube: {
+    cookieFile: path.join('auth', 'youtube-cookies.txt')
+  },
+  wol: {
+    broadcastAddress: '255.255.255.255',
+    port: 9
+  },
+  sessions: {
+    restoreTimeoutMs: 30 * 60 * 1000
+  },
+  backup: {
+    telegramPartSizeMb: 45
+  }
+};
+
+ensureLocalRuntimeFilesSync();
+loadEnvFile();
+
+export const APP_CONFIG = loadAppConfig();
+
+export const COMMAND_PREFIX = APP_CONFIG.commandPrefix || ',';
+export const BOT_NAME = APP_CONFIG.botName || 'IrOBot';
+export const TARGET_CHAT_NAMES = uniqueStrings([
+  APP_CONFIG.targets?.primaryGroup,
+  APP_CONFIG.targets?.reminderChat
+]);
+export const PRIMARY_TARGET_NAME = APP_CONFIG.targets?.primaryGroup || 'IrOBot';
+export const REMINDER_TARGET_NAMES = uniqueStrings([APP_CONFIG.targets?.reminderChat || PRIMARY_TARGET_NAME]);
+export const TASK_TARGET_NAMES = asStringArray(APP_CONFIG.targets?.taskChats, ['dev', PRIMARY_TARGET_NAME]);
+export const DEFAULT_STICKER_AUTHOR = APP_CONFIG.sticker?.defaultAuthor || 'IrO';
+export const DEFAULT_STICKER_TITLE = APP_CONFIG.sticker?.defaultTitle || ':3';
+export const PDF_DEFAULT_FILE_NAME = APP_CONFIG.pdf?.defaultFileName || BOT_NAME;
+export const PDF_SESSION_TIMEOUT_MS = numberOr(APP_CONFIG.pdf?.sessionTimeoutMs, 30 * 60 * 1000);
+export const RESTORE_SESSION_TIMEOUT_MS = numberOr(APP_CONFIG.sessions?.restoreTimeoutMs, 30 * 60 * 1000);
+export const YOUTUBE_COOKIE_FILE = resolveRuntimePath(
+  process.env.YOUTUBE_COOKIE_FILE || APP_CONFIG.youtube?.cookieFile || path.join('auth', 'youtube-cookies.txt')
+);
+export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+export const TELEGRAM_CLIENT_ID = process.env.TELEGRAM_CLIENT_ID || '';
+export const TELEGRAM_PART_SIZE_BYTES = Math.max(
+  1024 * 1024,
+  Math.floor(numberOr(process.env.TELEGRAM_PART_SIZE_MB, APP_CONFIG.backup?.telegramPartSizeMb || 45) * 1024 * 1024)
+);
+export const WOL_BROADCAST_ADDRESS = APP_CONFIG.wol?.broadcastAddress || '255.255.255.255';
+export const WOL_PORT = numberOr(APP_CONFIG.wol?.port, 9);
 
 export async function ensureRuntimeDirs() {
   await Promise.all([
@@ -24,7 +87,18 @@ export async function ensureRuntimeDirs() {
     fs.mkdir(TASK_MEDIA_DIR, { recursive: true }),
     fs.mkdir(SAVED_MESSAGES_DIR, { recursive: true }),
     fs.mkdir(LOG_DIR, { recursive: true }),
-    fs.mkdir(TEMP_DIR, { recursive: true })
+    fs.mkdir(TEMP_DIR, { recursive: true }),
+    fs.mkdir(path.dirname(YOUTUBE_COOKIE_FILE), { recursive: true })
+  ]);
+  await Promise.all([
+    ensureEnvFile(ENV_FILE),
+    ensureJsonFile(CONFIG_FILE, DEFAULT_APP_CONFIG),
+    ensureJsonFile(TASKS_FILE, { nextId: 1, tasks: [] }),
+    ensureJsonFile(SAVED_MESSAGES_FILE, { nextId: 1, items: [] }),
+    ensureJsonFile(NOTES_FILE, { nextId: 1, items: [] }),
+    ensureJsonFile(LINKS_FILE, { nextId: 1, items: [] }),
+    ensureJsonFile(REMINDERS_FILE, { nextId: 1, items: [] }),
+    ensureJsonFile(WOL_FILE, { nextId: 1, items: [] })
   ]);
 }
 
@@ -56,4 +130,156 @@ export function makeTempPath(prefix, ext = '') {
   const safeExt = ext ? (ext.startsWith('.') ? ext : `.${ext}`) : '';
   const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   return path.join(TEMP_DIR, `${prefix}-${stamp}${safeExt}`);
+}
+
+function loadEnvFile() {
+  if (!syncFs.existsSync(ENV_FILE)) return;
+  const content = syncFs.readFileSync(ENV_FILE, 'utf8');
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    if (process.env[key] != null) continue;
+    process.env[key] = parseEnvValue(rawValue);
+  }
+}
+
+function ensureLocalRuntimeFilesSync() {
+  ensureDirSync(DATA_DIR);
+  ensureDirSync(AUTH_DIR);
+  ensureEnvFileSync(ENV_FILE);
+  ensureJsonFileSync(CONFIG_FILE, DEFAULT_APP_CONFIG);
+}
+
+function ensureDirSync(dir) {
+  if (!syncFs.existsSync(dir)) syncFs.mkdirSync(dir, { recursive: true });
+}
+
+function defaultEnvText() {
+  return `${requiredEnvLines().join('\n')}\n`;
+}
+
+function requiredEnvLines() {
+  return [
+    'TELEGRAM_BOT_TOKEN=',
+    'TELEGRAM_CLIENT_ID=',
+    'YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt',
+    'TELEGRAM_PART_SIZE_MB=45'
+  ];
+}
+
+function ensureTextFileSync(target, value) {
+  if (syncFs.existsSync(target)) return false;
+  ensureDirSync(path.dirname(target));
+  syncFs.writeFileSync(target, value);
+  return true;
+}
+
+function ensureEnvFileSync(target) {
+  if (!syncFs.existsSync(target)) return ensureTextFileSync(target, defaultEnvText());
+  const original = syncFs.readFileSync(target, 'utf8');
+  const keys = new Set(original.split(/\r?\n/).map((line) => line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/)?.[1]).filter(Boolean));
+  const missing = requiredEnvLines().filter((line) => !keys.has(line.split('=')[0]));
+  if (!missing.length) return false;
+  const suffix = `${original.endsWith('\n') ? '' : '\n'}${missing.join('\n')}\n`;
+  syncFs.writeFileSync(target, `${original}${suffix}`);
+  return true;
+}
+
+function ensureJsonFileSync(target, value) {
+  if (syncFs.existsSync(target)) return false;
+  ensureDirSync(path.dirname(target));
+  syncFs.writeFileSync(target, `${JSON.stringify(value, null, 2)}\n`);
+  return true;
+}
+
+function parseEnvValue(value) {
+  const trimmed = String(value || '').trim();
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1).replace(/\\n/g, '\n');
+  }
+  return trimmed;
+}
+
+function loadAppConfig() {
+  try {
+    const parsed = JSON.parse(syncFs.readFileSync(CONFIG_FILE, 'utf8'));
+    return deepMerge(DEFAULT_APP_CONFIG, parsed);
+  } catch {
+    return DEFAULT_APP_CONFIG;
+  }
+}
+
+function deepMerge(base, override) {
+  if (!override || typeof override !== 'object' || Array.isArray(override)) return base;
+  const result = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    if (value && typeof value === 'object' && !Array.isArray(value) && base[key] && typeof base[key] === 'object' && !Array.isArray(base[key])) {
+      result[key] = deepMerge(base[key], value);
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function numberOr(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function asStringArray(value, fallback = []) {
+  const items = Array.isArray(value) ? value : [value];
+  const clean = items.map((item) => String(item || '').trim()).filter(Boolean);
+  return clean.length ? clean : fallback;
+}
+
+function uniqueStrings(values) {
+  return [...new Set(asStringArray(values))];
+}
+
+function resolveRuntimePath(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return path.join(AUTH_DIR, 'youtube-cookies.txt');
+  return path.isAbsolute(raw) ? raw : path.join(ROOT_DIR, raw);
+}
+
+async function ensureJsonFile(target, value) {
+  try {
+    await fs.access(target);
+    return false;
+  } catch {
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, `${JSON.stringify(value, null, 2)}\n`);
+    return true;
+  }
+}
+
+async function ensureTextFile(target, value) {
+  try {
+    await fs.access(target);
+    return false;
+  } catch {
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, value);
+    return true;
+  }
+}
+
+async function ensureEnvFile(target) {
+  try {
+    const original = await fs.readFile(target, 'utf8');
+    const keys = new Set(original.split(/\r?\n/).map((line) => line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/)?.[1]).filter(Boolean));
+    const missing = requiredEnvLines().filter((line) => !keys.has(line.split('=')[0]));
+    if (!missing.length) return false;
+    const suffix = `${original.endsWith('\n') ? '' : '\n'}${missing.join('\n')}\n`;
+    await fs.writeFile(target, `${original}${suffix}`);
+    return true;
+  } catch {
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, defaultEnvText());
+    return true;
+  }
 }

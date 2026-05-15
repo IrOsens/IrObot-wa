@@ -246,6 +246,7 @@ export class TaskScheduler {
   }
 
   start() {
+    this.stop();
     this.timer = setInterval(() => this.tick().catch((error) => {
       this.logger.error('Task scheduler error', { error: error.message });
     }), 1000);
@@ -254,6 +255,11 @@ export class TaskScheduler {
 
   stop() {
     if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  isRunning() {
+    return Boolean(this.timer);
   }
 
   async tick() {

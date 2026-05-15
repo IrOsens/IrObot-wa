@@ -6,24 +6,44 @@ import { runTool } from './tools.js';
 
 const QUALITIES = new Set(['360', '480', '720', '1080']);
 const YOUTUBE_FALLBACK_EXTRACTOR_ARGS = 'youtube:player_client=default,mweb,web_embedded';
+const TIME_RANGE_RE = /^(?:(?:\d{1,2}:)?\d{1,2}:\d{2}|\d+)-(?:\d{1,2}:)?\d{1,2}:\d{2}$/;
 
 export function parseYoutubeArgs(args) {
-  const [url, kind = 'mp4', quality = '720'] = args;
+  const [url, kind = 'mp4', ...rest] = args;
   if (!url || !/^https?:\/\/(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)\//i.test(url)) {
-    throw new Error('Format: ,yt <link-youtube> <mp3|mp4> [360|480|720|1080]');
+    throw new Error('Format: ,yt <link-youtube> <mp3|mp4> [360|480|720|1080] [00:00-01:00]');
   }
   const type = kind.toLowerCase();
   if (!['mp3', 'mp4'].includes(type)) throw new Error('Jenis download harus mp3 atau mp4.');
+  let quality = type === 'mp4' ? '720' : null;
+  let range = null;
+
+  for (const token of rest) {
+    if (TIME_RANGE_RE.test(token)) {
+      if (range) throw new Error('Range waktu hanya boleh satu kali. Contoh: 00:00-01:00');
+      range = token;
+      continue;
+    }
+    if (type === 'mp4' && QUALITIES.has(String(token))) {
+      quality = String(token);
+      continue;
+    }
+    throw new Error('Format: ,yt <link-youtube> <mp3|mp4> [360|480|720|1080] [00:00-01:00]');
+  }
+
   const q = String(quality || '720');
   if (type === 'mp4' && !QUALITIES.has(q)) throw new Error('Quality video harus 360, 480, 720, atau 1080.');
-  return { url, type, quality: q };
+  return { url, type, quality: q, range };
 }
 
-export async function downloadYoutube(args, tools) {
+export async function downloadYoutube(args, tools, options = {}) {
   if (!tools.ytDlp) throw new Error('yt-dlp belum tersedia. Install yt-dlp di Windows/Linux dan pastikan ada di PATH.');
   const parsed = parseYoutubeArgs(args);
   if (parsed.type === 'mp3' && !tools.ffmpeg) {
     throw new Error('FFmpeg belum tersedia. yt-dlp butuh FFmpeg untuk convert MP3.');
+  }
+  if (parsed.range && !tools.ffmpeg) {
+    throw new Error('FFmpeg belum tersedia. Range waktu YouTube butuh FFmpeg.');
   }
 
   const prefix = path.basename(makeTempPath('yt', ''));
@@ -35,12 +55,14 @@ export async function downloadYoutube(args, tools) {
     '--windows-filenames',
     '-o', outputTemplate
   ];
+  if (options.cookieFile) baseArgs.push('--cookies', options.cookieFile);
+  if (parsed.range) baseArgs.push('--download-sections', `*${parsed.range}`, '--force-keyframes-at-cuts');
 
   const attempts = buildDownloadAttempts(parsed, baseArgs);
   let lastError = null;
   for (const attempt of attempts) {
     try {
-      await runTool(tools.ytDlp, attempt.args, { timeout: attempt.timeout });
+      await runTool(tools.ytDlp, attempt.args);
       lastError = null;
       break;
     } catch (error) {
@@ -75,12 +97,10 @@ function buildDownloadAttempts(parsed, baseArgs) {
     return [
       {
         retryable: true,
-        timeout: 10 * 60 * 1000,
         args: [...baseArgs, '-x', '--audio-format', 'mp3', '--audio-quality', '0', parsed.url]
       },
       {
         retryable: false,
-        timeout: 10 * 60 * 1000,
         args: [
           ...baseArgs,
           '--extractor-args', YOUTUBE_FALLBACK_EXTRACTOR_ARGS,
@@ -98,12 +118,10 @@ function buildDownloadAttempts(parsed, baseArgs) {
   return [
     {
       retryable: true,
-      timeout: 15 * 60 * 1000,
       args: [...baseArgs, '-f', primaryFormat, '--merge-output-format', 'mp4', parsed.url]
     },
     {
       retryable: false,
-      timeout: 15 * 60 * 1000,
       args: [
         ...baseArgs,
         '--extractor-args', YOUTUBE_FALLBACK_EXTRACTOR_ARGS,
@@ -124,7 +142,7 @@ async function cleanupPrefix(prefix) {
   await cleanupFiles(matches);
 }
 
-function isRetryableYoutubeError(error) {
+export function isRetryableYoutubeError(error) {
   const text = `${error?.stderr || ''}\n${error?.stdout || ''}\n${error?.message || ''}`;
   return /Precondition check failed|HTTP Error 403|HTTP Error 400|nsig extraction failed|Unable to download API page/i.test(text);
 }
@@ -132,11 +150,14 @@ function isRetryableYoutubeError(error) {
 function friendlyYoutubeError(error) {
   const text = `${error?.stderr || ''}\n${error?.stdout || ''}\n${error?.message || ''}`;
   if (isRetryableYoutubeError(error)) {
-    return new Error([
+    const friendly = new Error([
       'YouTube menolak download dari yt-dlp saat ini.',
-      'Coba update yt-dlp ke versi terbaru. Jika tetap gagal, video ini mungkin butuh cookies browser atau PO token YouTube.',
+      'Coba update yt-dlp ke versi terbaru. Jika tetap gagal, video ini mungkin butuh cookies browser.',
       lastUsefulLine(text)
     ].filter(Boolean).join('\n'));
+    friendly.code = 'YOUTUBE_COOKIES_NEEDED';
+    friendly.needsYoutubeCookies = true;
+    return friendly;
   }
   return error;
 }

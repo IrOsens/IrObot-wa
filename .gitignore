@@ -2,10 +2,16 @@ node_modules/
 npm-debug.log*
 
 auth/
+auth/youtube-cookies.txt
+data/config.json
+data/links.json
+data/notes.json
+data/reminders.json
 data/tasks.json
 data/task-media/
 data/saved-messages.json
 data/saved-messages/
+data/wol.json
 logs/
 temp/
 
