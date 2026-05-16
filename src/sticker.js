@@ -66,17 +66,24 @@ export async function makeSticker(media, { author, title, tools }) {
     temp.push(rawSticker);
     const animated = await isAnimatedMedia(media);
     if (animated) {
-      if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Install FFmpeg untuk membuat sticker bergerak.');
-      await runTool(tools.ffmpeg, [
-        '-y',
-        '-i', media.path,
-        '-t', '10',
-        '-vf', 'fps=15,scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:-1:-1:color=0x00000000',
-        '-loop', '0',
-        '-an',
-        '-vsync', '0',
-        rawSticker
-      ]);
+      if (await isAnimatedWebpMedia(media)) {
+        await animatedWebpToStickerWebp(media.path, rawSticker, {
+          canvas: SMEME_STYLE.baseSize,
+          quality: 90
+        });
+      } else {
+        if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Install FFmpeg untuk membuat sticker bergerak.');
+        await runTool(tools.ffmpeg, [
+          '-y',
+          '-i', media.path,
+          '-t', '10',
+          '-vf', 'fps=15,scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:-1:-1:color=0x00000000',
+          '-loop', '0',
+          '-an',
+          '-fps_mode', 'passthrough',
+          rawSticker
+        ]);
+      }
     } else {
       await sharp(media.path, { animated: false })
         .resize(512, 512, { fit: 'inside', withoutEnlargement: true })
@@ -150,13 +157,28 @@ async function makeStaticSmemeSticker(media, { author, title, smeme }) {
 }
 
 async function makeAnimatedSmemeSticker(media, { author, title, tools, smeme }) {
-  if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Smeme bergerak butuh FFmpeg.');
   const tempDir = await fs.mkdtemp(path.join(TEMP_DIR, 'smeme-frames-'));
   const framePaths = [];
   const overlayPaths = [];
   const temp = [];
   try {
     const canvas = smeme.canvasSize;
+    const overlay = await makeSmemeOverlaySvg(smeme.text, smeme.position, canvas);
+    if (await isAnimatedWebpMedia(media)) {
+      const rawSticker = makeTempPath('smeme', '.webp');
+      temp.push(rawSticker);
+      await animatedWebpToStickerWebp(media.path, rawSticker, {
+        canvas,
+        overlay,
+        quality: SMEME_STYLE.webpQuality
+      });
+
+      const withExif = await attachExif(rawSticker, author, title);
+      temp.push(withExif);
+      return await fs.readFile(withExif);
+    }
+
+    if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Smeme bergerak butuh FFmpeg.');
     await runTool(tools.ffmpeg, [
       '-y',
       '-i', media.path,
@@ -170,7 +192,6 @@ async function makeAnimatedSmemeSticker(media, { author, title, tools, smeme }) 
       .sort();
     if (!entries.length) throw new Error('Frame smeme bergerak tidak ditemukan.');
 
-    const overlay = await makeSmemeOverlaySvg(smeme.text, smeme.position, canvas);
     for (const name of entries) {
       const source = path.join(tempDir, name);
       const out = path.join(tempDir, name.replace('frame-', 'overlay-'));
@@ -205,9 +226,18 @@ async function makeAnimatedSmemeSticker(media, { author, title, tools, smeme }) 
 
 export async function reverseSticker(media, tools) {
   const animated = await isAnimatedMedia(media);
-  const outPath = makeTempPath('reverse-sticker', animated ? '.gif' : '.png');
+  const outPath = makeTempPath('reverse-sticker', animated && tools.ffmpeg ? '.mp4' : animated ? '.gif' : '.png');
   try {
     if (animated) {
+      if (tools.ffmpeg) {
+        await animatedWebpToGifPlaybackVideo(media.path, outPath, tools);
+        return {
+          buffer: await fs.readFile(outPath),
+          mimetype: 'video/mp4',
+          fileName: 'sticker.mp4',
+          gifPlayback: true
+        };
+      }
       await animatedWebpToGif(media.path, outPath, tools);
       return {
         buffer: await fs.readFile(outPath),
@@ -231,6 +261,10 @@ export async function isAnimatedMedia(media) {
   if (isLikelyAnimated({ mimetype: media?.mimetype, fileName: media?.fileName || media?.path })) return true;
   if (!isWebpMedia(media)) return false;
   return isAnimatedWebpPath(media.path);
+}
+
+async function isAnimatedWebpMedia(media) {
+  return isWebpMedia(media) && await isAnimatedWebpPath(media.path);
 }
 
 function smemeCanvasSize(quality) {
@@ -456,6 +490,152 @@ async function isAnimatedWebpPath(filePath) {
 
 function isWebpMedia(media) {
   return /webp/i.test(media?.mimetype || '') || /\.webp$/i.test(media?.fileName || media?.path || '');
+}
+
+async function animatedWebpToStickerWebp(inputPath, outPath, { canvas, overlay = null, quality = 90 }) {
+  const decoded = await decodeAnimatedWebpFrames(inputPath, {
+    maxDurationMs: SMEME_STYLE.maxDurationSeconds * 1000
+  });
+  const frames = [];
+  for (const frame of decoded.frames) {
+    let image = sharp(frame.data, {
+      raw: {
+        width: decoded.width,
+        height: decoded.height,
+        channels: 4
+      }
+    }).resize(canvas, canvas, {
+      fit: 'contain',
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    });
+    if (overlay) image = image.composite([{ input: overlay, top: 0, left: 0 }]);
+    const buffer = await image.webp({ quality }).toBuffer();
+    frames.push(await webp.Image.generateFrame({
+      buffer,
+      delay: frame.delay,
+      x: 0,
+      y: 0,
+      blend: false,
+      dispose: false
+    }));
+  }
+  if (!frames.length) throw new Error('Frame sticker bergerak tidak ditemukan.');
+  await webp.Image.save(outPath, {
+    width: canvas,
+    height: canvas,
+    frames,
+    bgColor: [0, 0, 0, 0],
+    loops: 0
+  });
+}
+
+async function decodeAnimatedWebpFrames(inputPath, { maxDurationMs = 10_000 } = {}) {
+  const image = new webp.Image();
+  await image.load(inputPath);
+  if (!image.hasAnim || !image.frames?.length) throw new Error('Frame sticker bergerak tidak ditemukan.');
+  await webp.Image.initLib();
+
+  const width = image.width;
+  const height = image.height;
+  let canvas = Buffer.alloc(width * height * 4);
+  const frames = [];
+  let elapsed = 0;
+
+  for (const [index, frame] of image.frames.entries()) {
+    const remaining = maxDurationMs - elapsed;
+    if (remaining <= 0) break;
+    const delay = Math.min(normalizeFrameDelay(frame.delay), remaining);
+    const base = Buffer.from(canvas);
+    const x = Math.max(0, Number(frame.x) || 0);
+    const y = Math.max(0, Number(frame.y) || 0);
+    const frameWidth = Number(frame.width) || width;
+    const frameHeight = Number(frame.height) || height;
+    if (frame.blend === false) clearRawRect(base, width, height, x, y, frameWidth, frameHeight);
+
+    const frameData = Buffer.from(await image.getFrameData(index));
+    const composited = await sharp(base, { raw: { width, height, channels: 4 } })
+      .composite([{
+        input: frameData,
+        raw: { width: frameWidth, height: frameHeight, channels: 4 },
+        left: x,
+        top: y
+      }])
+      .raw()
+      .toBuffer();
+
+    frames.push({ data: Buffer.from(composited), delay });
+    elapsed += delay;
+    canvas = Buffer.from(composited);
+    if (frame.dispose) clearRawRect(canvas, width, height, x, y, frameWidth, frameHeight);
+  }
+
+  return { width, height, frames };
+}
+
+function normalizeFrameDelay(delay) {
+  const value = Number(delay);
+  if (Number.isFinite(value) && value > 0) return Math.max(20, Math.round(value));
+  return Math.round(1000 / SMEME_STYLE.fps);
+}
+
+function clearRawRect(buffer, canvasWidth, canvasHeight, x, y, width, height) {
+  const left = Math.max(0, Math.min(canvasWidth, Math.round(x)));
+  const top = Math.max(0, Math.min(canvasHeight, Math.round(y)));
+  const right = Math.max(left, Math.min(canvasWidth, Math.round(x + width)));
+  const bottom = Math.max(top, Math.min(canvasHeight, Math.round(y + height)));
+  for (let row = top; row < bottom; row += 1) {
+    buffer.fill(0, (row * canvasWidth + left) * 4, (row * canvasWidth + right) * 4);
+  }
+}
+
+async function animatedWebpToGifPlaybackVideo(inputPath, outPath, tools) {
+  const tempDir = await fs.mkdtemp(path.join(TEMP_DIR, 'reverse-video-frames-'));
+  const framePaths = [];
+  const listPath = path.join(tempDir, 'frames.txt');
+  try {
+    const decoded = await decodeAnimatedWebpFrames(inputPath, {
+      maxDurationMs: SMEME_STYLE.maxDurationSeconds * 1000
+    });
+    for (const [index, frame] of decoded.frames.entries()) {
+      const framePath = path.join(tempDir, `frame-${String(index).padStart(4, '0')}.png`);
+      framePaths.push(framePath);
+      await sharp(frame.data, {
+        raw: {
+          width: decoded.width,
+          height: decoded.height,
+          channels: 4
+        }
+      })
+        .png()
+        .toFile(framePath);
+    }
+    if (!framePaths.length) throw new Error('Frame sticker bergerak tidak ditemukan.');
+    const lines = [];
+    for (const [index, framePath] of framePaths.entries()) {
+      lines.push(ffmpegConcatFileLine(framePath));
+      lines.push(`duration ${(decoded.frames[index].delay / 1000).toFixed(3)}`);
+    }
+    lines.push(ffmpegConcatFileLine(framePaths.at(-1)));
+    await fs.writeFile(listPath, `${lines.join('\n')}\n`);
+    await runTool(tools.ffmpeg, [
+      '-y',
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', listPath,
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
+      '-fps_mode', 'vfr',
+      '-movflags', '+faststart',
+      '-an',
+      outPath
+    ]);
+  } finally {
+    await cleanupFiles(framePaths);
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function ffmpegConcatFileLine(filePath) {
+  return `file '${String(filePath).replace(/\\/g, '/').replace(/'/g, "'\\''")}'`;
 }
 
 async function animatedWebpToGif(inputPath, outPath, tools) {

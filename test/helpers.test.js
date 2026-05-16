@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import sharp from 'sharp';
+import webp from 'node-webpmux';
 import { assertUniqueTitle } from '../src/namedStore.js';
 import { PdfSessions, parsePdfOrderText } from '../src/pdf.js';
 import { parseDurationMs } from '../src/reminders.js';
@@ -11,7 +13,18 @@ import { parseYoutubeArgs } from '../src/youtube.js';
 import { extractZipBuffer, zipDirectory } from '../src/zip.js';
 import { PendingConfirmStore, parseSecretMediaTriggerText } from '../src/confirm.js';
 import { CommandAccessStore, parseAllowArgs } from '../src/commandAccess.js';
-import { makeSmemeOverlaySvg, parseSmemeArgs, parseStickerMeta, splitSmemeTextRuns } from '../src/sticker.js';
+import {
+  isAnimatedMedia,
+  makeSmemeOverlaySvg,
+  makeSmemeSticker,
+  makeSticker,
+  parseSmemeArgs,
+  parseStickerMeta,
+  reverseSticker,
+  splitSmemeTextRuns
+} from '../src/sticker.js';
+import { detectTools } from '../src/tools.js';
+import { AnticallStore, formatAnticallStatus } from '../src/anticall.js';
 
 test('parseDurationMs supports compact countdown formats', () => {
   assert.equal(parseDurationMs('10s'), 10_000);
@@ -195,6 +208,134 @@ test('CommandAccessStore gates public commands', async () => {
     await fs.rm(file, { force: true });
   }
 });
+
+test('AnticallStore defaults, enable gating, and replacement session safety', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'anticall-test-'));
+  const store = new AnticallStore(path.join(work, 'anticall.json'), path.join(work, 'media'));
+  try {
+    await store.load();
+    assert.deepEqual(store.snapshot(), {
+      enabled: false,
+      hasMessage: false,
+      entryCount: 0,
+      updatedAt: null,
+      createdAt: null
+    });
+    await assert.rejects(() => store.setEnabled(true), /belum ada/);
+
+    store.store.entries = [{ kind: 'text', text: 'lagi gak bisa telepon' }];
+    await store.save();
+    assert.match(formatAnticallStatus(store.snapshot()), /1 item/);
+    assert.equal((await store.setEnabled(true)).enabled, true);
+
+    await store.start('jid@test');
+    store.sessions.get('jid@test').entries.push({ kind: 'text', text: 'pesan baru' });
+    await store.cancel('jid@test');
+    assert.equal(store.store.entries[0].text, 'lagi gak bisa telepon');
+
+    await store.start('jid@test');
+    store.sessions.get('jid@test').entries.push({ kind: 'text', text: 'pesan baru' });
+    const snapshot = await store.finish('jid@test');
+    assert.equal(snapshot.enabled, true);
+    assert.equal(snapshot.entryCount, 1);
+    assert.equal(store.store.entries[0].text, 'pesan baru');
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+test('animated WebP stickers convert without ffmpeg decoder support', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'animated-webp-test-'));
+  const source = path.join(work, 'source.webp');
+  try {
+    await writeTinyAnimatedWebp(source);
+    const media = {
+      path: source,
+      mimetype: 'image/webp',
+      fileName: 'source.webp',
+      node: { isAnimated: true }
+    };
+    assert.equal(await isAnimatedMedia(media), true);
+
+    const sticker = await makeSticker(media, { author: 'A', title: 'T', tools: {} });
+    const stickerImage = new webp.Image();
+    await stickerImage.load(sticker);
+    assert.equal(stickerImage.hasAnim, true);
+    assert.equal(stickerImage.frames.length, 2);
+
+    const smeme = await makeSmemeSticker(media, {
+      author: 'A',
+      title: 'T',
+      tools: {},
+      smeme: parseSmemeArgs(['up', 'halo'])
+    });
+    const smemeImage = new webp.Image();
+    await smemeImage.load(smeme);
+    assert.equal(smemeImage.hasAnim, true);
+    assert.equal(smemeImage.frames.length, 2);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+test('reverseSticker returns inline gif playback video for animated stickers when ffmpeg exists', async () => {
+  const tools = await detectTools();
+  if (!tools.ffmpeg) return;
+
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'reverse-webp-test-'));
+  const source = path.join(work, 'source.webp');
+  try {
+    await writeTinyAnimatedWebp(source);
+    const converted = await reverseSticker({
+      path: source,
+      mimetype: 'image/webp',
+      fileName: 'source.webp',
+      node: { isAnimated: true }
+    }, tools);
+    assert.equal(converted.mimetype, 'video/mp4');
+    assert.equal(converted.fileName, 'sticker.mp4');
+    assert.equal(converted.gifPlayback, true);
+    assert.ok(converted.buffer.length > 0);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+async function writeTinyAnimatedWebp(filePath) {
+  const red = await sharp({
+    create: {
+      width: 16,
+      height: 16,
+      channels: 4,
+      background: { r: 255, g: 0, b: 0, alpha: 1 }
+    }
+  }).webp().toBuffer();
+  const blue = await sharp({
+    create: {
+      width: 16,
+      height: 16,
+      channels: 4,
+      background: { r: 0, g: 0, b: 255, alpha: 1 }
+    }
+  }).webp().toBuffer();
+  const frames = [
+    await webp.Image.generateFrame({ buffer: red, delay: 80, blend: false, dispose: false }),
+    await webp.Image.generateFrame({ buffer: blue, delay: 120, blend: false, dispose: false })
+  ];
+  await webp.Image.save(filePath, {
+    width: 16,
+    height: 16,
+    frames,
+    bgColor: [0, 0, 0, 0],
+    loops: 0
+  });
+}
 
 test('parseYoutubeArgs supports optional time range', () => {
   assert.deepEqual(parseYoutubeArgs(['https://www.youtube.com/watch?v=abc', 'mp4', '720', '00:00-01:00']), {

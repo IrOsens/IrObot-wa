@@ -10,6 +10,7 @@ import makeWASocket, {
 } from 'baileys';
 import {
   AUTH_DIR,
+  ANTICALL_FILE,
   BOT_NAME,
   COMMAND_PREFIX,
   DEFAULT_STICKER_AUTHOR,
@@ -76,6 +77,7 @@ import {
   youtubeCookieWarnings,
   youtubeCookiePrompt
 } from './youtubeCookies.js';
+import { AnticallStore, formatAnticallStatus } from './anticall.js';
 
 class ChatDirectory {
   constructor() {
@@ -150,6 +152,8 @@ const state = {
   backupScheduler: null,
   confirmStore: new PendingConfirmStore(),
   commandAccess: null,
+  anticall: null,
+  rejectedCallIds: new Set(),
   youtubeCookieSessions: new Map(),
   ignoredOwnMessageIds: new Set(),
   reconnecting: false
@@ -179,6 +183,12 @@ function rememberOwnOutput(message) {
   if (!id) return;
   state.ignoredOwnMessageIds.add(id);
   setTimeout(() => state.ignoredOwnMessageIds.delete(id), 5 * 60 * 1000).unref?.();
+}
+
+function botSender() {
+  return {
+    sendMessage: (jid, content, options) => sendBotMessage(jid, content, options)
+  };
 }
 
 function isIgnoredOwnOutput(message) {
@@ -219,6 +229,7 @@ async function handleHelp(jid) {
     '- ,won | ,won <mac|id> | ,won save <mac> | ,won del <id|mac> - Wake-on-LAN .',
     '- ,backup - kirim zip data/ ke Telegram .',
     '- ,restore - mulai restore zip WhatsApp, finalnya perlu ,confirm .',
+    '- ,anticall | ,anticall new|on|off - tolak telepon otomatis dan kirim pesan .',
     '- ,clear - hapus temp dengan konfirmasi .',
     '- ,update - git pull dan restart service dengan konfirmasi .',
     '- ,restartbot - restart aman dengan konfirmasi .',
@@ -254,6 +265,7 @@ async function handleStatus(jid) {
 
 function activeSessionType(jid) {
   if (state.saveRecorder?.has(jid)) return 'save';
+  if (state.anticall?.has(jid)) return 'anticall';
   if (state.pdfSessions?.has(jid)) return 'PDF';
   if (state.restoreSessions?.has(jid)) return 'restore';
   if (state.youtubeCookieSessions.has(jid)) return 'YouTube cookies';
@@ -268,6 +280,7 @@ function assertNoActiveSession(jid) {
 function hasAnyTempSession() {
   return Boolean(
     state.saveRecorder?.sessions?.size
+    || state.anticall?.sessions?.size
     || state.pdfSessions?.count()
     || state.restoreSessions?.count()
     || state.youtubeCookieSessions.size
@@ -309,6 +322,7 @@ async function handleHealth(jid) {
     listWol()
   ]);
   const targetJid = state.chatDirectory.findByName(PRIMARY_TARGET_NAME);
+  const anticall = state.anticall?.snapshot() || { enabled: false, entryCount: 0, hasMessage: false };
   await sendText(jid, [
     `${BOT_NAME} health`,
     `PID: ${process.pid}`,
@@ -323,13 +337,14 @@ async function handleHealth(jid) {
     `Disk: ${diskText}`,
     `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, yt-dlp=${Boolean(state.tools.ytDlp)}, office=${Boolean(state.tools.office)}`,
     `Data counts: save=${saved.length}, note=${notes.length}, link=${links.length}, task=${tasks.length}, remind=${reminders.length}, wol=${wolItems.length}`,
-    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, ytCookies=${state.youtubeCookieSessions.size}, confirm=${state.confirmStore.count()}`,
+    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, ytCookies=${state.youtubeCookieSessions.size}, confirm=${state.confirmStore.count()}`,
+    `Anticall: ${anticall.enabled ? 'aktif' : 'nonaktif'}, pesan=${anticall.hasMessage ? `${anticall.entryCount} item` : 'belum ada'}`,
     `Public command access: all=${Boolean(state.commandAccess?.snapshot().all)}, chats=${state.commandAccess?.snapshot().chatCount || 0}`,
     `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
     `Target ${PRIMARY_TARGET_NAME}: ${targetJid || 'not found'}`,
     `Telegram client id: ${TELEGRAM_CLIENT_ID ? 'configured' : 'missing'}`,
     `Telegram part size: ${formatBytes(TELEGRAM_PART_SIZE_BYTES)}`,
-    `Runtime files: ${[TASKS_FILE, NOTES_FILE, LINKS_FILE, REMINDERS_FILE, WOL_FILE].map((file) => path.basename(file)).join(', ')}`,
+    `Runtime files: ${[TASKS_FILE, NOTES_FILE, LINKS_FILE, REMINDERS_FILE, WOL_FILE, ANTICALL_FILE].map((file) => path.basename(file)).join(', ')}`,
     `Time: ${new Date().toLocaleString()}`
   ].join('\n'));
 }
@@ -397,6 +412,14 @@ async function sendReversedSticker(jid, media) {
   const converted = await reverseSticker(media, state.tools);
   if (converted.mimetype === 'image/png') {
     await state.sock.sendMessage(jid, { image: converted.buffer, mimetype: converted.mimetype });
+    return;
+  }
+  if (converted.gifPlayback) {
+    await state.sock.sendMessage(jid, {
+      video: converted.buffer,
+      mimetype: converted.mimetype,
+      gifPlayback: true
+    });
     return;
   }
   await state.sock.sendMessage(jid, {
@@ -656,6 +679,43 @@ async function handleSave(message, command) {
   await sendText(message.key.remoteJid, `Mulai rekam save "${session.title}". Kirim teks, media, lokasi, kontak, poll, atau event lalu ,end untuk simpan atau ,cancel untuk batal.`);
 }
 
+async function handleAnticall(message, command) {
+  const jid = message.key.remoteJid;
+  const action = (command.args[0] || '').toLowerCase();
+  if (!action) {
+    await sendText(jid, formatAnticallStatus(state.anticall.snapshot()));
+    return;
+  }
+
+  if (action === 'new') {
+    assertNoActiveSession(jid);
+    if (state.anticall.hasMessage()) {
+      await requestConfirmation(jid, {
+        title: 'Ganti pesan anticall',
+        description: 'Pesan anticall lama tetap dipakai sampai rekaman baru selesai disimpan dengan ,end.',
+        execute: async () => startAnticallRecording(jid)
+      });
+      return;
+    }
+    await startAnticallRecording(jid);
+    return;
+  }
+
+  if (action === 'on' || action === 'off') {
+    const snapshot = await state.anticall.setEnabled(action === 'on');
+    await sendText(jid, `Anticall ${snapshot.enabled ? 'aktif' : 'nonaktif'}. Pesan: ${snapshot.hasMessage ? `${snapshot.entryCount} item` : 'belum ada'}.`);
+    return;
+  }
+
+  throw new Error('Format: ,anticall [new|on|off]');
+}
+
+async function startAnticallRecording(jid) {
+  assertNoActiveSession(jid);
+  await state.anticall.start(jid);
+  await sendText(jid, 'Mulai rekam pesan anticall. Kirim teks, media, lokasi, kontak, poll, atau event lalu ,end untuk simpan atau ,cancel untuk batal.');
+}
+
 async function handleLoad(message, command) {
   const jid = message.key.remoteJid;
   if (!command.args.length) {
@@ -686,7 +746,7 @@ async function handleLoad(message, command) {
   const query = command.rawArgs.trim();
   const item = await getSaved(query);
   if (!item) throw new Error(`Save "${query}" tidak ditemukan.`);
-  await sendSaved(state.sock, jid, item);
+  await sendSaved(botSender(), jid, item);
 }
 
 async function finishSave(message) {
@@ -696,15 +756,32 @@ async function finishSave(message) {
   return true;
 }
 
+async function finishAnticall(message) {
+  const snapshot = await state.anticall.finish(message.key.remoteJid);
+  if (!snapshot) return false;
+  await sendText(
+    message.key.remoteJid,
+    `Pesan anticall tersimpan (${snapshot.entryCount} item). Status: ${snapshot.enabled ? 'aktif' : 'nonaktif'}.`
+  );
+  return true;
+}
+
 async function cancelSave(message) {
   const cancelled = await state.saveRecorder.cancel(message.key.remoteJid);
   if (cancelled) await sendText(message.key.remoteJid, 'Rekaman save dibatalkan.');
   return cancelled;
 }
 
+async function cancelAnticall(message) {
+  const cancelled = await state.anticall.cancel(message.key.remoteJid);
+  if (cancelled) await sendText(message.key.remoteJid, 'Rekaman anticall dibatalkan.');
+  return cancelled;
+}
+
 async function cancelActiveSession(message) {
   const jid = message.key.remoteJid;
   if (await cancelSave(message)) return true;
+  if (await cancelAnticall(message)) return true;
 
   const pdfSession = state.pdfSessions.end(jid);
   if (pdfSession) {
@@ -771,7 +848,7 @@ async function handleReminder(message, command) {
 }
 
 async function handleClear(jid) {
-  if (hasAnyTempSession()) throw new Error('Tidak bisa clear temp saat ada sesi save/PDF/restore/cookies aktif.');
+  if (hasAnyTempSession()) throw new Error('Tidak bisa clear temp saat ada sesi save/anticall/PDF/restore/cookies aktif.');
   await cleanupStartupTemp();
   await sendText(jid, 'Temp dibersihkan.');
 }
@@ -930,6 +1007,9 @@ async function handleCommand(message, command) {
     case 'load':
       await handleLoad(message, command);
       break;
+    case 'anticall':
+      await handleAnticall(message, command);
+      break;
     case 'note':
       if (command.args[0]?.toLowerCase() === 'del') {
         const query = command.args.slice(1).join(' ').trim();
@@ -1036,6 +1116,7 @@ async function handleCommand(message, command) {
       break;
     case 'end':
       if (await finishSave(message)) break;
+      if (await finishAnticall(message)) break;
       if (state.restoreSessions.has(jid)) {
         await requestConfirmation(jid, {
           title: 'Restore data',
@@ -1090,6 +1171,10 @@ async function onMessageUpsert(event) {
         await state.saveRecorder.record(state.sock, message);
         continue;
       }
+      if (state.anticall.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
+        await state.anticall.record(state.sock, message);
+        continue;
+      }
       if (state.restoreSessions.has(jid) && (!command || !['end', 'cancel', 'confirm'].includes(command.name))) {
         await maybeCollectRestorePart(message);
         continue;
@@ -1133,6 +1218,45 @@ async function loadGroups(sock) {
   }
 }
 
+function rememberRejectedCall(id) {
+  if (!id) return false;
+  if (state.rejectedCallIds.has(id)) return true;
+  state.rejectedCallIds.add(id);
+  setTimeout(() => state.rejectedCallIds.delete(id), 10 * 60 * 1000).unref?.();
+  return false;
+}
+
+async function onCallUpdate(calls) {
+  for (const call of calls || []) {
+    try {
+      await maybeRejectCall(call);
+    } catch (error) {
+      await logger.error('Anticall error', {
+        callId: call?.id,
+        from: call?.from,
+        chatId: call?.chatId,
+        error: error.message
+      });
+    }
+  }
+}
+
+async function maybeRejectCall(call) {
+  const snapshot = state.anticall?.snapshot();
+  if (!snapshot?.enabled || !snapshot.hasMessage) return false;
+  if (call?.status !== 'offer') return false;
+  if (call.isGroup || call.chatId?.endsWith('@g.us') || call.from?.endsWith('@g.us')) return false;
+  if (rememberRejectedCall(call.id)) return false;
+
+  const caller = call.from || call.chatId;
+  const chatJid = call.chatId || caller;
+  if (!caller || !chatJid) return false;
+  await state.sock.rejectCall(call.id, caller);
+  await state.anticall.send(botSender(), chatJid);
+  await logger.info('Rejected call via anticall', { callId: call.id, caller, chatJid });
+  return true;
+}
+
 async function connect() {
   const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -1154,6 +1278,7 @@ async function connect() {
 
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('messages.upsert', onMessageUpsert);
+  sock.ev.on('call', onCallUpdate);
   sock.ev.on('chats.upsert', (chats) => {
     for (const chat of chats || []) state.chatDirectory.remember(chat.id, chat.name || chat.subject);
   });
@@ -1202,6 +1327,8 @@ async function main() {
   state.pdfSessions = new PdfSessions(state.tools);
   state.restoreSessions = new RestoreSessions();
   state.saveRecorder = new SaveRecorder();
+  state.anticall = new AnticallStore();
+  await state.anticall.load();
   state.backupScheduler = new DailyBackupScheduler(logger);
   state.backupScheduler.start();
   await logger.info('Detected tools', state.tools);

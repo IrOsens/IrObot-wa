@@ -8,6 +8,8 @@ export const DATA_DIR = path.join(ROOT_DIR, 'data');
 export const TASK_MEDIA_DIR = path.join(DATA_DIR, 'task-media');
 export const SAVED_MESSAGES_DIR = path.join(DATA_DIR, 'saved-messages');
 export const SAVED_MESSAGES_FILE = path.join(DATA_DIR, 'saved-messages.json');
+export const ANTICALL_MEDIA_DIR = path.join(DATA_DIR, 'anticall-media');
+export const ANTICALL_FILE = path.join(DATA_DIR, 'anticall.json');
 export const LOG_DIR = path.join(ROOT_DIR, 'logs');
 export const TEMP_DIR = path.join(ROOT_DIR, 'temp');
 export const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
@@ -106,6 +108,7 @@ export async function ensureRuntimeDirs() {
     fs.mkdir(DATA_DIR, { recursive: true }),
     fs.mkdir(TASK_MEDIA_DIR, { recursive: true }),
     fs.mkdir(SAVED_MESSAGES_DIR, { recursive: true }),
+    fs.mkdir(ANTICALL_MEDIA_DIR, { recursive: true }),
     fs.mkdir(LOG_DIR, { recursive: true }),
     fs.mkdir(TEMP_DIR, { recursive: true }),
     fs.mkdir(path.dirname(YOUTUBE_COOKIE_FILE), { recursive: true })
@@ -114,6 +117,7 @@ export async function ensureRuntimeDirs() {
     ensureEnvFile(ENV_FILE),
     ensureJsonFile(CONFIG_FILE, DEFAULT_APP_CONFIG),
     ensureJsonFile(COMMAND_ACCESS_FILE, { all: false, chats: {} }),
+    ensureJsonFile(ANTICALL_FILE, { enabled: false, entries: [], updatedAt: null }),
     ensureJsonFile(TASKS_FILE, { nextId: 1, tasks: [] }),
     ensureJsonFile(SAVED_MESSAGES_FILE, { nextId: 1, items: [] }),
     ensureJsonFile(NOTES_FILE, { nextId: 1, items: [] }),
