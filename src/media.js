@@ -1,10 +1,17 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import dns from 'node:dns';
 import { fileTypeFromBuffer } from 'file-type';
 import mime from 'mime-types';
 import { downloadMediaMessage, getContentType } from 'baileys';
 import { makeTempPath } from './config.js';
 import { extractQuotedMessage, firstUrl, unwrapMessage } from './text.js';
+
+try {
+  dns.setDefaultResultOrder?.('ipv4first');
+} catch {
+  // Older Node builds may not support changing DNS result order.
+}
 
 const silentDownloadLogger = {
   trace() {},
@@ -15,6 +22,10 @@ const silentDownloadLogger = {
 };
 
 const MEDIA_TYPES = new Set(['imageMessage', 'videoMessage', 'documentMessage', 'stickerMessage', 'audioMessage']);
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 25_000;
+const MEDIA_DOWNLOAD_RETRIES = 1;
+const MEDIA_DOWNLOAD_RETRY_BASE_MS = 600;
+const DEFAULT_WA_MEDIA_HOST = 'mmg.whatsapp.net';
 const URL_MEDIA_EXTS = new Set([
   '.png', '.jpg', '.jpeg', '.webp', '.gif', '.mp4', '.mov', '.mkv', '.webm',
   '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
@@ -85,12 +96,7 @@ export async function saveBufferToTemp(buffer, prefix, fallbackExt = '') {
 export async function downloadMessageMedia(sock, message, prefix = 'media') {
   const found = mediaNode(message);
   if (!found) return null;
-  const buffer = await downloadMediaMessage(
-    found.message,
-    'buffer',
-    {},
-    { logger: silentDownloadLogger, reuploadRequest: sock.updateMediaMessage }
-  );
+  const buffer = await downloadMediaBuffer(sock, found);
   const fileName = found.node.fileName || '';
   const fallbackExt = path.extname(fileName) || `.${mime.extension(found.node.mimetype || '') || 'bin'}`;
   const saved = await saveBufferToTemp(buffer, prefix, fallbackExt);
@@ -113,6 +119,127 @@ export async function downloadQuotedOrOwnMedia(sock, message, prefix = 'media') 
   const quoted = extractQuotedMessage(message);
   if (quoted && mediaNode(quoted)) return downloadMessageMedia(sock, quoted, prefix);
   return downloadMessageMedia(sock, message, prefix);
+}
+
+async function downloadMediaBuffer(sock, found) {
+  let message = found.message;
+  let reuploaded = false;
+  let lastError = null;
+  const hosts = mediaDownloadHosts(sock, found.node);
+
+  for (const host of [null, ...hosts]) {
+    for (let attempt = 0; attempt <= MEDIA_DOWNLOAD_RETRIES; attempt += 1) {
+      try {
+        return await downloadMediaMessage(
+          message,
+          'buffer',
+          mediaDownloadOptions(host),
+          {
+            logger: silentDownloadLogger,
+            reuploadRequest: async (msg) => {
+              if (!canRequestMediaReupload(sock, msg)) throw new Error('Media WhatsApp perlu reupload, tapi socket tidak mendukungnya.');
+              reuploaded = true;
+              return sock.updateMediaMessage(msg);
+            }
+          }
+        );
+      } catch (error) {
+        lastError = error;
+
+        if (!reuploaded && shouldRequestMediaReupload(error) && canRequestMediaReupload(sock, message)) {
+          try {
+            message = await sock.updateMediaMessage(message);
+            reuploaded = true;
+            await delay(MEDIA_DOWNLOAD_RETRY_BASE_MS);
+            continue;
+          } catch (reuploadError) {
+            lastError = reuploadError;
+          }
+        }
+
+        if (!isRetryableMediaDownloadError(error)) throw improveMediaDownloadError(error);
+        if (attempt < MEDIA_DOWNLOAD_RETRIES) {
+          await delay(MEDIA_DOWNLOAD_RETRY_BASE_MS * (attempt + 1));
+        }
+      }
+    }
+  }
+
+  throw improveMediaDownloadError(lastError);
+}
+
+function mediaDownloadOptions(host) {
+  return {
+    ...(host ? { host } : {}),
+    options: {
+      signal: AbortSignal.timeout(MEDIA_DOWNLOAD_TIMEOUT_MS)
+    }
+  };
+}
+
+function mediaDownloadHosts(sock, node) {
+  const implicitHost = hostFromUrl(node?.url) || DEFAULT_WA_MEDIA_HOST;
+  const hosts = [];
+  if (typeof sock?.getMediaHost === 'function') addHost(hosts, sock.getMediaHost());
+  addHost(hosts, DEFAULT_WA_MEDIA_HOST);
+  return hosts.filter((host) => host !== implicitHost);
+}
+
+function addHost(hosts, host) {
+  const clean = String(host || '').trim().toLowerCase();
+  if (clean && !hosts.includes(clean)) hosts.push(clean);
+}
+
+function hostFromUrl(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return '';
+  }
+}
+
+function canRequestMediaReupload(sock, message) {
+  return typeof sock?.updateMediaMessage === 'function'
+    && Boolean(message?.key?.id)
+    && Boolean(mediaNode(message)?.node?.mediaKey);
+}
+
+function shouldRequestMediaReupload(error) {
+  return [404, 410].includes(mediaErrorStatus(error)) || isRetryableMediaDownloadError(error);
+}
+
+function isRetryableMediaDownloadError(error) {
+  const status = mediaErrorStatus(error);
+  if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+  const text = mediaErrorText(error);
+  return /fetch failed|network|timeout|timed? out|aborted|terminated|socket|econnreset|etimedout|enotfound|eai_again|econnrefused|tls|dns/i.test(text);
+}
+
+function mediaErrorStatus(error) {
+  return Number(error?.status || error?.statusCode || error?.output?.statusCode || error?.cause?.status || 0);
+}
+
+function mediaErrorText(error) {
+  return [
+    error?.message,
+    error?.code,
+    error?.cause?.message,
+    error?.cause?.code,
+    error?.cause?.name
+  ].filter(Boolean).join(' ');
+}
+
+function improveMediaDownloadError(error) {
+  const status = mediaErrorStatus(error);
+  const detail = mediaErrorText(error) || 'unknown error';
+  const message = status
+    ? `Gagal mengunduh media WhatsApp setelah retry (HTTP ${status}). Coba kirim ulang media/sticker.`
+    : `Gagal mengunduh media WhatsApp setelah retry: ${detail}. Coba kirim ulang media/sticker.`;
+  return new Error(message, { cause: error });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export async function downloadUrlMedia(text, prefix = 'url') {
