@@ -4,8 +4,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
 import webp from 'node-webpmux';
-import { assertUniqueTitle } from '../src/namedStore.js';
-import { PdfSessions, parsePdfOrderText } from '../src/pdf.js';
+import { addNamedItem, assertUniqueTitle, deleteNamedItem, readCollection } from '../src/namedStore.js';
+import { defaultPdfBaseName, parsePdfSizeLimit, parsePdfStartArgs, PdfSessions, parsePdfOrderText } from '../src/pdf.js';
 import { parseDurationMs } from '../src/reminders.js';
 import { normalizeMac } from '../src/wol.js';
 import { normalizeYoutubeCookies, youtubeCookieWarnings } from '../src/youtubeCookies.js';
@@ -13,6 +13,9 @@ import { parseYoutubeArgs } from '../src/youtube.js';
 import { extractZipBuffer, zipDirectory } from '../src/zip.js';
 import { PendingConfirmStore, parseSecretMediaTriggerText } from '../src/confirm.js';
 import { CommandAccessStore, parseAllowArgs } from '../src/commandAccess.js';
+import { ReactionActionStore, reactionIntent } from '../src/reactionActions.js';
+import { normalizePhoneNumber, normalizePhoneToJid } from '../src/phone.js';
+import { handleLinkCommand, handleNoteCommand } from '../src/notes.js';
 import {
   isAnimatedMedia,
   makeSmemeOverlaySvg,
@@ -42,11 +45,34 @@ test('normalizeMac accepts common MAC separators', () => {
   assert.throws(() => normalizeMac('aa:bb'), /MAC address/);
 });
 
+test('normalizePhoneNumber accepts Indonesian public formats', () => {
+  assert.equal(normalizePhoneNumber('08123431212'), '628123431212');
+  assert.equal(normalizePhoneNumber('+62 123-1234-1234'), '6212312341234');
+  assert.equal(normalizePhoneToJid('+6212312341234'), '6212312341234@s.whatsapp.net');
+});
+
 test('assertUniqueTitle rejects case-insensitive duplicates', () => {
   const store = { items: [{ id: 1, title: 'Laporan' }] };
   assert.throws(() => assertUniqueTitle(store, 'laporan'), /sudah ada/);
   assert.doesNotThrow(() => assertUniqueTitle(store, 'Laporan Baru'));
   assert.doesNotThrow(() => assertUniqueTitle(store, 'laporan', 1));
+});
+
+test('deleteNamedItem renumbers remaining items', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const file = path.join(tempRoot, `named-${Date.now()}.json`);
+  try {
+    await addNamedItem(file, 'Satu', { text: '1' });
+    await addNamedItem(file, 'Dua', { text: '2' });
+    await addNamedItem(file, 'Tiga', { text: '3' });
+    await deleteNamedItem(file, '2', 'Item');
+    const store = await readCollection(file);
+    assert.deepEqual(store.items.map((item) => [item.id, item.title]), [[1, 'Satu'], [2, 'Tiga']]);
+    assert.equal(store.nextId, 3);
+  } finally {
+    await fs.rm(file, { force: true });
+  }
 });
 
 test('PdfSessions rejects duplicate explicit order', () => {
@@ -58,6 +84,28 @@ test('PdfSessions rejects duplicate explicit order', () => {
   }, /Urutan PDF #1/);
   assert.equal(parsePdfOrderText('2'), 2);
   assert.equal(parsePdfOrderText('bebas'), null);
+  sessions.end('jid@test');
+});
+
+test('PDF start args support WIB default name, size limit, and unsupported skips', () => {
+  assert.equal(defaultPdfBaseName(new Date('2026-05-23T04:57:00.000Z')), '23_5_2026_115700_IrOBot');
+  assert.equal(parsePdfSizeLimit('1mb'), 1024 * 1024);
+  assert.deepEqual(parsePdfStartArgs('Ini adalah nama pdf,1MB'), {
+    fileName: 'Ini adalah nama pdf',
+    maxSizeBytes: 1024 * 1024
+  });
+
+  const sessions = new PdfSessions({});
+  const session = sessions.start('jid@test', '');
+  const skipped = sessions.pushMedia(session, {
+    path: 'voice.mp3',
+    mimetype: 'audio/mpeg',
+    fileName: 'voice.mp3',
+    type: 'audioMessage'
+  });
+  assert.equal(skipped.skipped, true);
+  assert.match(skipped.reason, /audio/);
+  assert.equal(session.files.length, 0);
   sessions.end('jid@test');
 });
 
@@ -125,15 +173,27 @@ test('parseSecretMediaTriggerText detects text ending with space dot', () => {
 test('PendingConfirmStore takes and expires pending actions', async () => {
   const store = new PendingConfirmStore({ ttlMs: 50 });
   const execute = async () => 'ok';
-  store.set('jid@test', { title: 'Test', execute });
+  store.set('jid@test', 'actor-a@s.whatsapp.net', { title: 'Test', execute });
   assert.equal(store.count(), 1);
-  assert.equal(store.take('jid@test').title, 'Test');
-  assert.equal(store.take('jid@test'), null);
+  assert.equal(store.take('jid@test', 'actor-b@s.whatsapp.net'), null);
+  assert.equal(store.take('jid@test', 'actor-a@s.whatsapp.net').title, 'Test');
+  assert.equal(store.take('jid@test', 'actor-a@s.whatsapp.net'), null);
 
-  store.set('jid@test', { title: 'Expired', execute });
+  store.set('jid@test', 'actor-a@s.whatsapp.net', { title: 'Expired', execute });
   await new Promise((resolve) => setTimeout(resolve, 70));
-  assert.equal(store.get('jid@test'), null);
+  assert.equal(store.get('jid@test', 'actor-a@s.whatsapp.net'), null);
   assert.equal(store.count(), 0);
+});
+
+test('ReactionActionStore matches only the triggering actor and known emojis', () => {
+  const store = new ReactionActionStore({ ttlMs: 1000 });
+  const key = { remoteJid: 'chat@test', id: 'abc' };
+  store.register(key, { actorJid: '62812@s.whatsapp.net', onCancel: async () => 'ok' });
+  assert.equal(reactionIntent('✅'), 'confirm');
+  assert.equal(reactionIntent('❌'), 'cancel');
+  assert.equal(reactionIntent('🙂'), null);
+  assert.equal(store.get(key, '62813@s.whatsapp.net'), null);
+  assert.equal(store.get(key, '62812@s.whatsapp.net')?.key, 'chat@test:abc');
 });
 
 test('parseSmemeArgs supports position text and quality', () => {
@@ -195,17 +255,47 @@ test('CommandAccessStore gates public commands', async () => {
     await store.setHere('chat-a', true);
     assert.equal(store.canUse('s', 'chat-a'), true);
     assert.equal(store.canUse('smeme', 'chat-a'), true);
-    assert.equal(store.canUse('help', 'chat-a'), false);
+    assert.equal(store.canUse('help', 'chat-a'), true);
+    assert.equal(store.canUseAs('save', 'chat-a', '628111@s.whatsapp.net'), false);
     assert.equal(store.canUse('s', 'chat-b'), false);
 
     await store.setAll(true);
     assert.equal(store.canUse('rs', 'chat-b'), true);
+    const admin = await store.addAdmin('08123431212');
+    assert.equal(admin.jid, '628123431212@s.whatsapp.net');
+    assert.equal(store.canUseAs('save', 'chat-b', admin.jid), true);
+    assert.equal(store.canUseAs('backup', 'chat-b', admin.jid), false);
+    assert.equal(store.canUseAs('bot', 'chat-b', admin.jid), false);
+    const deleted = await store.deleteAdmin('08123431212');
+    assert.equal(deleted.id, 1);
+    assert.equal(store.snapshot().adminCount, 0);
 
     await store.setAll(false);
     assert.equal(store.canUse('s', 'chat-a'), false);
     assert.equal(store.snapshot().chatCount, 0);
   } finally {
     await fs.rm(file, { force: true });
+  }
+});
+
+test('note and link commands support change rename syntax', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'rename-test-'));
+  const notesFile = path.join(work, 'notes.json');
+  const linksFile = path.join(work, 'links.json');
+  try {
+    await fs.writeFile(notesFile, JSON.stringify({ nextId: 1, items: [] }, null, 2));
+    await fs.writeFile(linksFile, JSON.stringify({ nextId: 1, items: [] }, null, 2));
+    assert.match(await handleNoteCommand({ args: ['lama', 'isi'], rawArgs: 'lama isi' }, notesFile), /tersimpan/);
+    assert.match(await handleNoteCommand({ args: ['change', 'lama', 'baru'], rawArgs: 'change lama baru' }, notesFile), /baru/);
+    await handleNoteCommand({ args: ['lain', 'isi'], rawArgs: 'lain isi' }, notesFile);
+    await assert.rejects(() => handleNoteCommand({ args: ['change', 'lain', 'baru'], rawArgs: 'change lain baru' }, notesFile), /sudah ada/);
+    assert.match(await handleLinkCommand({ args: ['old', 'https://example.com'], rawArgs: 'old https://example.com' }, linksFile), /tersimpan/);
+    assert.match(await handleLinkCommand({ args: ['change', 'old', 'new'], rawArgs: 'change old new' }, linksFile), /new/);
+    await assert.rejects(() => handleNoteCommand({ args: ['baru2'], rawArgs: 'baru2' }, notesFile), /tidak ditemukan/);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
   }
 });
 
@@ -220,6 +310,8 @@ test('AnticallStore defaults, enable gating, and replacement session safety', as
       enabled: false,
       hasMessage: false,
       entryCount: 0,
+      exceptionCount: 0,
+      exceptions: [],
       updatedAt: null,
       createdAt: null
     });
@@ -241,6 +333,14 @@ test('AnticallStore defaults, enable gating, and replacement session safety', as
     assert.equal(snapshot.enabled, true);
     assert.equal(snapshot.entryCount, 1);
     assert.equal(store.store.entries[0].text, 'pesan baru');
+
+    const exception = await store.addException('+62 123-1234-1234');
+    assert.equal(exception.jid, '6212312341234@s.whatsapp.net');
+    assert.equal(store.isException('6212312341234@s.whatsapp.net'), true);
+    await store.addException('08123431212');
+    const deleted = await store.deleteException('1');
+    assert.equal(deleted.id, 1);
+    assert.deepEqual(store.listExceptions().map((item) => [item.id, item.title]), [[1, '628123431212']]);
   } finally {
     await fs.rm(work, { recursive: true, force: true });
   }

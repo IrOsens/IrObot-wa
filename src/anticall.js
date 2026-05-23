@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ANTICALL_FILE, ANTICALL_MEDIA_DIR } from './config.js';
 import { cleanupFiles } from './media.js';
+import { displayPhoneFromJid, normalizePhoneToJid, sameJid, tryNormalizeJid } from './phone.js';
 import {
   persistRecordedEntries,
   recordMessageEntry,
@@ -10,17 +11,21 @@ import {
 } from './recordedMessages.js';
 
 function defaultStore() {
-  return { enabled: false, entries: [], createdAt: null, updatedAt: null };
+  return { enabled: false, entries: [], exceptions: [], nextExceptionId: 1, createdAt: null, updatedAt: null };
 }
 
 function normalizeStore(value) {
   const store = value && typeof value === 'object' ? value : {};
-  return {
+  const normalized = {
     enabled: Boolean(store.enabled),
     entries: Array.isArray(store.entries) ? store.entries : [],
+    exceptions: normalizeExceptions(store.exceptions),
+    nextExceptionId: Number.isInteger(store.nextExceptionId) && store.nextExceptionId > 0 ? store.nextExceptionId : 1,
     createdAt: store.createdAt || null,
     updatedAt: store.updatedAt || null
   };
+  renumberExceptions(normalized);
+  return normalized;
 }
 
 function entryDirs(entries = []) {
@@ -39,9 +44,10 @@ export function formatAnticallStatus(snapshot) {
   return [
     `Anticall: ${snapshot.enabled ? 'aktif' : 'nonaktif'}.`,
     `Pesan: ${snapshot.hasMessage ? `${snapshot.entryCount} item` : 'belum ada'}.`,
+    `Exception: ${snapshot.exceptionCount || 0} nomor.`,
     snapshot.updatedAt ? `Update: ${new Date(snapshot.updatedAt).toLocaleString()}` : null,
     '',
-    'Command: ,anticall new | ,anticall on | ,anticall off'
+    'Command: ,anticall new | ,anticall on | ,anticall off | ,anticall except list|add|del <nomor|id>'
   ].filter(Boolean).join('\n');
 }
 
@@ -69,6 +75,8 @@ export class AnticallStore {
       enabled: Boolean(this.store.enabled),
       hasMessage: visible.length > 0,
       entryCount: visible.length,
+      exceptionCount: this.store.exceptions.length,
+      exceptions: this.listExceptions(),
       updatedAt: this.store.updatedAt,
       createdAt: this.store.createdAt
     };
@@ -82,16 +90,22 @@ export class AnticallStore {
     return this.snapshot().hasMessage;
   }
 
-  async start(jid) {
+  async start(jid, actorJid = jid) {
     await this.cancel(jid);
     const session = {
       jid,
+      actorJid,
       entries: [],
       tempFiles: [],
       startedAt: Date.now()
     };
     this.sessions.set(jid, session);
     return session;
+  }
+
+  isActor(jid, actorJid) {
+    const session = this.sessions.get(jid);
+    return !session || !actorJid || session.actorJid === actorJid;
   }
 
   async record(sock, message) {
@@ -104,9 +118,10 @@ export class AnticallStore {
     return { type: recorded.type, count: session.entries.length };
   }
 
-  async finish(jid) {
+  async finish(jid, actorJid = null) {
     const session = this.sessions.get(jid);
     if (!session) return null;
+    if (actorJid && session.actorJid !== actorJid) return null;
     if (!session.entries.length) throw new Error('Belum ada isi pesan anticall yang direkam.');
 
     const oldEntries = this.store.entries;
@@ -118,6 +133,8 @@ export class AnticallStore {
       this.store = {
         enabled: Boolean(this.store.enabled),
         entries,
+        exceptions: this.store.exceptions,
+        nextExceptionId: this.store.nextExceptionId,
         createdAt: this.store.createdAt || now,
         updatedAt: now
       };
@@ -132,9 +149,10 @@ export class AnticallStore {
     }
   }
 
-  async cancel(jid) {
+  async cancel(jid, actorJid = null) {
     const session = this.sessions.get(jid);
     if (!session) return false;
+    if (actorJid && session.actorJid !== actorJid) return false;
     this.sessions.delete(jid);
     await cleanupFiles(session.tempFiles);
     return true;
@@ -153,9 +171,82 @@ export class AnticallStore {
     return true;
   }
 
+  listExceptions() {
+    return this.store.exceptions.map((item) => ({ ...item }));
+  }
+
+  async addException(input) {
+    const jid = normalizePhoneToJid(input);
+    const existing = this.store.exceptions.find((item) => sameJid(item.jid, jid));
+    if (existing) throw new Error(`Exception ${existing.title} sudah tersimpan sebagai #${existing.id}.`);
+    const item = {
+      id: this.store.nextExceptionId++,
+      title: displayPhoneFromJid(jid),
+      jid,
+      createdAt: new Date().toISOString()
+    };
+    this.store.exceptions.push(item);
+    renumberExceptions(this.store);
+    await this.save();
+    return { ...item };
+  }
+
+  async deleteException(query) {
+    const item = findException(this.store.exceptions, query);
+    if (!item) throw new Error(`Exception "${query}" tidak ditemukan.`);
+    this.store.exceptions = this.store.exceptions.filter((candidate) => candidate.id !== item.id);
+    renumberExceptions(this.store);
+    await this.save();
+    return { ...item };
+  }
+
+  isException(jid) {
+    return Boolean(findException(this.store.exceptions, jid));
+  }
+
   async save() {
     await fs.mkdir(path.dirname(this.file), { recursive: true });
     await fs.mkdir(this.mediaDir, { recursive: true });
     await fs.writeFile(this.file, `${JSON.stringify(this.store, null, 2)}\n`);
   }
+}
+
+function normalizeExceptions(value) {
+  const exceptions = [];
+  const seen = new Set();
+  if (!Array.isArray(value)) return exceptions;
+  for (const raw of value) {
+    const jid = tryNormalizeJid(raw?.jid) || (typeof raw === 'string' ? tryNormalizeJid(raw) : null);
+    if (!jid || seen.has(jid)) continue;
+    seen.add(jid);
+    exceptions.push({
+      id: Number.isInteger(raw?.id) && raw.id > 0 ? raw.id : exceptions.length + 1,
+      title: String(raw?.title || displayPhoneFromJid(jid)).trim() || displayPhoneFromJid(jid),
+      jid,
+      createdAt: raw?.createdAt || null,
+      updatedAt: raw?.updatedAt || null
+    });
+  }
+  return exceptions.sort((a, b) => a.id - b.id);
+}
+
+function findException(items, query) {
+  const text = String(query || '').trim();
+  if (!text) return null;
+  const id = Number(text);
+  if (/^\d{1,6}$/.test(text) && Number.isInteger(id)) return items.find((item) => item.id === id) || null;
+  let jid = tryNormalizeJid(text);
+  if (!jid) {
+    try {
+      jid = normalizePhoneToJid(text);
+    } catch {
+      return null;
+    }
+  }
+  return items.find((item) => sameJid(item.jid, jid)) || null;
+}
+
+function renumberExceptions(store) {
+  store.exceptions = [...(store.exceptions || [])].map((item, index) => ({ ...item, id: index + 1 }));
+  store.nextExceptionId = store.exceptions.length + 1;
 }

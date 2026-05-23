@@ -34,7 +34,7 @@ Jika PowerShell Windows memblokir `npm` karena execution policy:
 npm.cmd run setup
 ```
 
-Setup dan startup bot akan membuat folder runtime, `.env`, `data/config.json`, dan file JSON awal seperti `command-access`, `tasks`, `notes`, `links`, `reminders`, dan `wol` jika hilang. Jika `.env` sudah ada tetapi ada key wajib yang belum ada, key itu akan ditambahkan tanpa menimpa nilai lama.
+Setup dan startup bot akan membuat folder runtime, `.env`, `data/config.json`, dan file JSON awal seperti `bot-state`, `command-access`, `tasks`, `notes`, `links`, `reminders`, dan `wol` jika hilang.
 
 Penting:
 
@@ -69,6 +69,8 @@ npm run check
 npm test
 ```
 
+Di PowerShell Windows, gunakan `npm.cmd run check` dan `npm.cmd test` bila `npm.ps1` diblokir.
+
 ## Jalankan Bot
 
 ```bash
@@ -79,12 +81,12 @@ Scan QR yang muncul di terminal. Session WhatsApp disimpan di `auth/`.
 
 ## Command
 
-- Media: `,s [title][,author]`, `,smeme up/down <teks> [1-99]`, `,rs`, `,topdf [nama]`
-- ⏰ Reminder/task: `,task`, `,ltask`, `,ltask true|false|del <id>`, `,remindme <teks> <durasi>`
-- 💾 Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
-- 📝 Note/link: `,note`, `,note del <id|judul>`, `,link`, `,link del <id|nama>`
-- Utility: `,info`, `,status`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`
-- ✅ Session: `,end`, `,cancel`, `,confirm`
+- Media: `,s [title][,author]`, `,smeme up/down <teks> [1-99]`, `,rs`, `,topdf [nama][,1MB]`
+- Reminder/task: `,task`, `,ltask`, `,ltask true|false|del <id>`, `,remindme <teks> <durasi>`
+- Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
+- Note/link: `,note`, `,note del <id|judul>`, `,note change <id|judul> <judul-baru>`, `,link`, `,link del <id|nama>`, `,link change <id|nama> <nama-baru>`
+- Utility: `,info`, `,status`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`
+- Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
 
@@ -95,34 +97,35 @@ View-once/media:
 - Jika `,rs` dipakai pada sticker, sticker statis dikirim sebagai PNG dan sticker bergerak dikirim sebagai GIF.
 - Reply media lalu kirim teks yang berakhir spasi titik, contoh `halo .`, untuk mengirim media ke grup target `IrOBot`.
 - Teks sebelum ` .` dipakai sebagai caption baru jika media mendukung caption.
-- Ubah nama target di `data/config.json` bila perlu.
-
-Smeme:
-
-- Reply image, GIF, video, sticker statis, atau sticker bergerak lalu ketik `,smeme up teks` atau `,smeme down teks`.
-- Tambahkan angka `1-99` di akhir untuk mengubah resolusi kerja dari default 512px, contoh `,smeme down halo dunia 80`.
-- Style teks meme bisa diubah dari konstanta `SMEME_STYLE` di `src/sticker.js`.
-
-Sticker:
-
-- `,s judul sticker,author sticker` memakai pemisah koma untuk author.
-- `,s judul sticker` memakai title custom dan author default dari config.
 
 Operasional:
 
 - Owner adalah akun WhatsApp yang sedang login.
 - `,allow here true|false` membuka/menutup akses publik di chat/grup tempat command dikirim.
 - `,allow all true|false` membuka/menutup akses publik di semua chat/grup.
-- Akses publik hanya berlaku untuk `,s`, `,smeme`, dan `,rs`.
+- Akses publik biasa berlaku untuk `,help`, `,s`, `,smeme`, dan `,rs`.
+- `,help` dinamis: publik hanya melihat command publik, admin tambahan melihat command yang boleh dia pakai, owner melihat semuanya.
+- `,admin list|add|del <nomor|id>` mengelola admin tambahan. Hanya owner/session WhatsApp yang bisa menjalankannya.
+- Admin tambahan hanya aktif saat akses publik chat/all terbuka, dan tetap tidak bisa memakai command server/security seperti `,admin`, `,bot`, `,backup`, `,restore`, `,update`, dan `,restartbot`.
+- `,bot` mengecek status. `,bot off` mem-pause command, session, scheduler, backup otomatis, dan anticall; hanya owner bisa `,bot on`.
 
 PDF:
 
 - Ketik `,topdf` atau `,topdf laporan`.
+- Jika nama kosong, nama PDF default memakai format WIB seperti `23_5_2026_115700_IrOBot.pdf`.
+- Batas ukuran opsional bisa ditulis setelah koma, contoh `,topdf laporan,1MB`; `mb` dan `MB` sama-sama dibaca sebagai megabytes.
 - Kirim/reply beberapa media atau dokumen.
 - Caption/teks angka dipakai sebagai urutan PDF.
 - Jika nomor sudah terisi, bot memberi warning dan media tidak ditambahkan.
-- Teks bebas tetap masuk urutan otomatis.
+- Audio, video, GIF, dan animasi dilewati dengan pesan alasan.
+- Jika batas ukuran dipasang, bot mencoba kompres gambar. Jika tetap melebihi batas, PDF tidak dikirim.
 - Ketik `,end` untuk membuat PDF.
+
+Anticall:
+
+- `,anticall new|on|off` mengatur pesan dan status anticall.
+- `,anticall except list|add|del <nomor|id>` mengelola nomor yang tetap boleh menelepon walaupun anticall aktif.
+- Format nomor menerima contoh `08123431212`, `+62 123-1234-1234`, dan `+6212312341234`.
 
 Save/load:
 
@@ -146,8 +149,11 @@ Backup/restore:
 
 Konfirmasi:
 
-- Aksi hapus, `,clear`, final `,restore`, `,update`, dan `,restartbot` wajib dikonfirmasi dengan `,confirm`.
+- Aksi hapus, `,clear`, final `,restore`, `,update`, `,restartbot`, dan perubahan admin wajib dikonfirmasi dengan `,confirm`.
 - Ketik `,cancel` untuk membatalkan konfirmasi pending atau sesi aktif.
+- Konfirmasi dan prompt session juga menerima reaction `👍`, `❤️`, `✅` untuk lanjut/end/confirm dan `❌`, `👎`, `❎` untuk cancel.
+- Reaction hanya diterima dari user yang memicu command, dan kedaluwarsa setelah 1 menit.
+- List seperti `,load`, `,note`, `,link`, `,ltask`, `,won`, `,admin list`, dan `,anticall except list` dikirim per item. React `❌`, `👎`, atau `❎` pada item untuk memulai konfirmasi hapus.
 
 Update/restart:
 

@@ -61,6 +61,7 @@ export async function deleteNamedItem(file, query, label = 'Item') {
   const item = findByIdOrTitle(store, query);
   if (!item) throw new Error(`${label} "${query}" tidak ditemukan.`);
   store.items = store.items.filter((candidate) => candidate.id !== item.id);
+  renumberCollection(store);
   await writeCollection(file, store);
   return item;
 }
@@ -79,4 +80,11 @@ export async function renameNamedItem(file, query, newTitle, label = 'Item') {
 export function formatNamedList(items, emptyText) {
   if (!items.length) return emptyText;
   return items.map((item) => `#${item.id} - ${item.title}`).join('\n');
+}
+
+export function renumberCollection(store, key = 'items') {
+  const items = Array.isArray(store?.[key]) ? store[key] : [];
+  store[key] = items.map((item, index) => ({ ...item, id: index + 1 }));
+  store.nextId = store[key].length + 1;
+  return store;
 }

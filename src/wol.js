@@ -1,6 +1,6 @@
 import dgram from 'node:dgram';
 import { WOL_BROADCAST_ADDRESS, WOL_FILE, WOL_PORT } from './config.js';
-import { readCollection, writeCollection } from './namedStore.js';
+import { readCollection, renumberCollection, writeCollection } from './namedStore.js';
 
 export function normalizeMac(input) {
   const hex = String(input || '').replace(/[^a-fA-F0-9]/g, '').toUpperCase();
@@ -61,6 +61,7 @@ export async function handleWolCommand(command) {
     const item = findWol(store.items, query);
     if (!item) throw new Error(`WOL "${query}" tidak ditemukan.`);
     store.items = store.items.filter((candidate) => candidate.id !== item.id);
+    renumberCollection(store);
     await writeCollection(WOL_FILE, store);
     return `WOL #${item.id} ${item.mac} dihapus.`;
   }

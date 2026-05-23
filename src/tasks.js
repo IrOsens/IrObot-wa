@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { TASKS_FILE, TASK_MEDIA_DIR, TASK_TARGET_NAMES } from './config.js';
 import { cleanupFiles, downloadQuotedOrOwnMedia } from './media.js';
+import { renumberCollection } from './namedStore.js';
 
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000;
 const TIME_NUMBER = /^\d{1,2}$/;
@@ -191,6 +192,7 @@ export async function updateTaskState(action, id) {
   if (!task) throw new Error(`Task ID ${id} tidak ditemukan.`);
   if (action === 'del') {
     store.tasks = store.tasks.filter((item) => item.id !== id);
+    renumberCollection(store, 'tasks');
     await writeStore(store);
     if (task.media?.path) await cleanupFiles([task.media.path]);
     return { deleted: true, task };
@@ -283,6 +285,7 @@ export class TaskScheduler {
         if (!task.loop) task.remaining -= 1;
         if (!task.loop && task.remaining <= 0) {
           store.tasks = store.tasks.filter((item) => item.id !== task.id);
+          renumberCollection(store, 'tasks');
           if (task.media?.path) await cleanupFiles([task.media.path]);
         } else {
           task.second = task.second ?? 0;

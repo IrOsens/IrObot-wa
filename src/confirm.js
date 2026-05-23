@@ -1,39 +1,44 @@
 export class PendingConfirmStore {
-  constructor({ ttlMs = 2 * 60 * 1000 } = {}) {
+  constructor({ ttlMs = 60 * 1000 } = {}) {
     this.ttlMs = ttlMs;
     this.pending = new Map();
   }
 
-  set(jid, action) {
+  set(jid, actorOrAction, maybeAction = null) {
+    const actorJid = maybeAction ? actorOrAction : jid;
+    const action = maybeAction || actorOrAction;
     if (!jid || !action?.execute) throw new Error('Pending confirm action tidak valid.');
     const item = {
       ...action,
       jid,
+      actorJid,
       createdAt: Date.now(),
       expiresAt: Date.now() + this.ttlMs
     };
-    this.pending.set(jid, item);
+    this.pending.set(confirmKey(jid, actorJid), item);
     return item;
   }
 
-  get(jid) {
-    const item = this.pending.get(jid);
+  get(jid, actorJid = jid) {
+    const key = confirmKey(jid, actorJid);
+    const item = this.pending.get(key);
     if (!item) return null;
     if (item.expiresAt <= Date.now()) {
-      this.pending.delete(jid);
+      this.pending.delete(key);
       return null;
     }
     return item;
   }
 
-  take(jid) {
-    const item = this.get(jid);
-    if (item) this.pending.delete(jid);
+  take(jid, actorJid = jid) {
+    const key = confirmKey(jid, actorJid);
+    const item = this.get(jid, actorJid);
+    if (item) this.pending.delete(key);
     return item;
   }
 
-  cancel(jid) {
-    return this.pending.delete(jid);
+  cancel(jid, actorJid = jid) {
+    return this.pending.delete(confirmKey(jid, actorJid));
   }
 
   count() {
@@ -47,6 +52,10 @@ export class PendingConfirmStore {
       if (item.expiresAt <= now) this.pending.delete(jid);
     }
   }
+}
+
+function confirmKey(jid, actorJid) {
+  return `${jid}:${actorJid || jid}`;
 }
 
 export function parseSecretMediaTriggerText(text) {

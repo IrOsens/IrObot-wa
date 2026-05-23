@@ -9,12 +9,13 @@ export class RestoreSessions {
     this.sessions = new Map();
   }
 
-  async start(jid) {
+  async start(jid, actorJid = jid) {
     const old = this.end(jid);
     if (old) await this.cleanup(old);
     const tempDir = await fs.mkdtemp(path.join(TEMP_DIR, 'restore-'));
     const session = {
       jid,
+      actorJid,
       tempDir,
       files: [],
       startedAt: Date.now(),
@@ -27,6 +28,11 @@ export class RestoreSessions {
     return session;
   }
 
+  isActor(jid, actorJid) {
+    const session = this.sessions.get(jid);
+    return !session || !actorJid || session.actorJid === actorJid;
+  }
+
   has(jid) {
     return this.sessions.has(jid);
   }
@@ -35,16 +41,17 @@ export class RestoreSessions {
     return this.sessions.size;
   }
 
-  end(jid) {
+  end(jid, actorJid = null) {
     const session = this.sessions.get(jid);
     if (!session) return null;
+    if (actorJid && session.actorJid !== actorJid) return null;
     clearTimeout(session.timer);
     this.sessions.delete(jid);
     return session;
   }
 
-  async cancel(jid) {
-    const session = this.end(jid);
+  async cancel(jid, actorJid = null) {
+    const session = this.end(jid, actorJid);
     if (!session) return false;
     await this.cleanup(session);
     return true;

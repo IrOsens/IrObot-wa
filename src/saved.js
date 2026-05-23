@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { SAVED_MESSAGES_DIR, SAVED_MESSAGES_FILE } from './config.js';
 import { cleanupFiles } from './media.js';
-import { assertUniqueTitle } from './namedStore.js';
+import { assertUniqueTitle, renumberCollection } from './namedStore.js';
 import {
   persistRecordedEntries,
   recordMessageEntry,
@@ -59,10 +59,11 @@ export class SaveRecorder {
     this.sessions = new Map();
   }
 
-  start(jid, title, firstText = '') {
+  start(jid, title, firstText = '', actorJid = jid) {
     this.cancel(jid);
     const session = {
       jid,
+      actorJid,
       title,
       entries: [],
       tempFiles: [],
@@ -77,6 +78,11 @@ export class SaveRecorder {
     return this.sessions.has(jid);
   }
 
+  isActor(jid, actorJid) {
+    const session = this.sessions.get(jid);
+    return !session || !actorJid || session.actorJid === actorJid;
+  }
+
   async record(sock, message) {
     const session = this.sessions.get(message.key.remoteJid);
     if (!session) return null;
@@ -87,9 +93,10 @@ export class SaveRecorder {
     return { type: recorded.type, count: session.entries.length };
   }
 
-  async finish(jid) {
+  async finish(jid, actorJid = null) {
     const session = this.sessions.get(jid);
     if (!session) return null;
+    if (actorJid && session.actorJid !== actorJid) return null;
     if (!session.entries.length) throw new Error('Belum ada isi yang direkam.');
     const store = await readStore();
     assertUniqueTitle(store, session.title);
@@ -111,9 +118,10 @@ export class SaveRecorder {
     return item;
   }
 
-  async cancel(jid) {
+  async cancel(jid, actorJid = null) {
     const session = this.sessions.get(jid);
     if (!session) return false;
+    if (actorJid && session.actorJid !== actorJid) return false;
     this.sessions.delete(jid);
     await cleanupFiles(session.tempFiles);
     return true;
@@ -140,6 +148,7 @@ export async function deleteSaved(query) {
   const item = findSaved(store, query);
   if (!item) throw new Error(`Save "${query}" tidak ditemukan.`);
   store.items = store.items.filter((saved) => saved.id !== item.id);
+  renumberCollection(store);
   await writeStore(store);
   const dirs = new Set(item.entries.filter((entry) => entry.path).map((entry) => path.dirname(entry.path)));
   await Promise.all([...dirs].map((dir) => fs.rm(dir, { recursive: true, force: true })));

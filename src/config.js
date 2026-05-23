@@ -15,6 +15,7 @@ export const TEMP_DIR = path.join(ROOT_DIR, 'temp');
 export const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 export const COMMAND_ACCESS_FILE = path.join(DATA_DIR, 'command-access.json');
+export const BOT_STATE_FILE = path.join(DATA_DIR, 'bot-state.json');
 export const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
 export const LINKS_FILE = path.join(DATA_DIR, 'links.json');
 export const REMINDERS_FILE = path.join(DATA_DIR, 'reminders.json');
@@ -116,7 +117,8 @@ export async function ensureRuntimeDirs() {
   await Promise.all([
     ensureEnvFile(ENV_FILE),
     ensureJsonFile(CONFIG_FILE, DEFAULT_APP_CONFIG),
-    ensureJsonFile(COMMAND_ACCESS_FILE, { all: false, chats: {} }),
+    ensureJsonFile(COMMAND_ACCESS_FILE, { all: false, chats: {}, admins: [], nextAdminId: 1 }),
+    ensureJsonFile(BOT_STATE_FILE, { enabled: true, updatedAt: null }),
     ensureJsonFile(ANTICALL_FILE, { enabled: false, entries: [], updatedAt: null }),
     ensureJsonFile(TASKS_FILE, { nextId: 1, tasks: [] }),
     ensureJsonFile(SAVED_MESSAGES_FILE, { nextId: 1, items: [] }),
