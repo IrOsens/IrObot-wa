@@ -15,6 +15,7 @@ const GRAPHEME_SEGMENTER = typeof Intl.Segmenter === 'function'
   : null;
 const emojiSvgCache = new Map();
 
+//edit smeme
 export const SMEME_STYLE = {
   baseSize: 512,
   minCanvasSize: 64,
@@ -29,6 +30,11 @@ export const SMEME_STYLE = {
   minStrokeWidth: 2,
   fontWeight: 900,
   paddingScale: 0.045,
+  maxTextBlockScale: 0.34,
+  maxLines: 6,
+  characterWidthScale: 0.58,
+  spaceWidthScale: 0.35,
+  emojiScale: 1.08,
   lineHeight: 1.05,
   letterSpacing: 0,
   webpQuality: 90
@@ -287,18 +293,16 @@ async function transparentExtendOptions(inputPath, canvas) {
 
 export async function makeSmemeOverlaySvg(text, position, canvas) {
   const padding = Math.max(4, Math.round(canvas * SMEME_STYLE.paddingScale));
-  const fontSize = Math.max(SMEME_STYLE.minFontSize, Math.round(canvas * SMEME_STYLE.fontScale));
+  const layout = layoutSmemeText(text, canvas, padding);
+  const { lines, fontSize, lineHeight } = layout;
   const strokeWidth = Math.max(SMEME_STYLE.minStrokeWidth, Math.round(canvas * SMEME_STYLE.strokeScale));
-  const maxChars = Math.max(4, Math.floor((canvas - padding * 2) / (fontSize * 0.58)));
-  const lines = wrapSmemeText(text, maxChars).slice(0, 4);
-  const lineHeight = Math.round(fontSize * SMEME_STYLE.lineHeight);
   const blockHeight = lineHeight * lines.length;
   const firstBaseline = position === 'up'
     ? padding + fontSize
     : canvas - padding - blockHeight + fontSize;
   const lineElements = [];
   for (const [index, line] of lines.entries()) {
-    lineElements.push(await renderSmemeLineSvg(line, firstBaseline + index * lineHeight, canvas, fontSize));
+    lineElements.push(await renderSmemeLineSvg(line, firstBaseline + index * lineHeight, canvas, fontSize, padding));
   }
 
   return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>
@@ -321,11 +325,37 @@ export async function makeSmemeOverlaySvg(text, position, canvas) {
 </svg>`);
 }
 
-async function renderSmemeLineSvg(line, baseline, canvas, fontSize) {
+function layoutSmemeText(text, canvas, padding) {
+  const baseFontSize = Math.max(SMEME_STYLE.minFontSize, Math.round(canvas * SMEME_STYLE.fontScale));
+  const maxWidth = Math.max(1, canvas - padding * 2);
+  const maxBlockHeight = Math.max(
+    SMEME_STYLE.minFontSize,
+    Math.round(canvas * SMEME_STYLE.maxTextBlockScale)
+  );
+
+  for (let size = baseFontSize; size >= SMEME_STYLE.minFontSize; size -= 1) {
+    const lineHeight = Math.max(1, Math.round(size * SMEME_STYLE.lineHeight));
+    const maxLines = Math.max(1, Math.min(SMEME_STYLE.maxLines, Math.floor(maxBlockHeight / lineHeight)));
+    const lines = wrapSmemeTextToWidth(text, maxWidth, size, maxLines);
+    if (lines.length <= maxLines && lines.every((line) => measureSmemeLine(line, size) <= maxWidth)) {
+      return { lines, fontSize: size, lineHeight };
+    }
+  }
+
+  const lineHeight = Math.max(1, Math.round(SMEME_STYLE.minFontSize * SMEME_STYLE.lineHeight));
+  const maxLines = Math.max(1, Math.min(SMEME_STYLE.maxLines, Math.floor(maxBlockHeight / lineHeight)));
+  return {
+    lines: wrapSmemeTextToWidth(text, maxWidth, SMEME_STYLE.minFontSize, maxLines, true),
+    fontSize: SMEME_STYLE.minFontSize,
+    lineHeight
+  };
+}
+
+async function renderSmemeLineSvg(line, baseline, canvas, fontSize, padding) {
   const runs = splitSmemeTextRuns(line);
   const widths = runs.map((run) => measureSmemeRun(run, fontSize));
   const totalWidth = widths.reduce((sum, width) => sum + width, 0);
-  let x = Math.max(0, (canvas - totalWidth) / 2);
+  let x = Math.max(padding, (canvas - totalWidth) / 2);
   const elements = [];
 
   for (const [index, run] of runs.entries()) {
@@ -378,10 +408,73 @@ export function splitSmemeTextRuns(text) {
 }
 
 function measureSmemeRun(run, fontSize) {
-  if (run.type === 'emoji') return fontSize * 1.08;
+  if (run.type === 'emoji') return fontSize * SMEME_STYLE.emojiScale;
   return graphemes(run.text).reduce((width, char) => (
-    width + (/^\s+$/.test(char) ? fontSize * 0.35 : fontSize * 0.58)
+    width + (/^\s+$/.test(char) ? fontSize * SMEME_STYLE.spaceWidthScale : fontSize * SMEME_STYLE.characterWidthScale)
   ), 0);
+}
+
+function measureSmemeLine(line, fontSize) {
+  return splitSmemeTextRuns(line).reduce((width, run) => width + measureSmemeRun(run, fontSize), 0);
+}
+
+function wrapSmemeTextToWidth(text, maxWidth, fontSize, maxLines, forceTruncate = false) {
+  const words = String(text || '').split(/\s+/).filter(Boolean);
+  const lines = [];
+  let current = '';
+
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (measureSmemeLine(next, fontSize) <= maxWidth) {
+      current = next;
+      continue;
+    }
+    if (current) lines.push(current);
+    if (lines.length >= maxLines) return trimSmemeLines(lines, maxLines, fontSize, maxWidth);
+    if (measureSmemeLine(word, fontSize) <= maxWidth) {
+      current = word;
+    } else {
+      const parts = splitLongSmemeWord(word, maxWidth, fontSize);
+      while (parts.length) {
+        lines.push(parts.shift());
+        if (lines.length >= maxLines) return trimSmemeLines(lines, maxLines, fontSize, maxWidth);
+      }
+      current = '';
+    }
+  }
+
+  if (current) lines.push(current);
+  const result = lines.length ? lines : [''];
+  if (forceTruncate && result.length > maxLines) return trimSmemeLines(result, maxLines, fontSize, maxWidth);
+  return result.slice(0, maxLines);
+}
+
+function splitLongSmemeWord(word, maxWidth, fontSize) {
+  const chars = graphemes(word);
+  const parts = [];
+  let current = '';
+  for (const char of chars) {
+    const next = `${current}${char}`;
+    if (!current || measureSmemeLine(next, fontSize) <= maxWidth) {
+      current = next;
+    } else {
+      parts.push(current);
+      current = char;
+    }
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
+function trimSmemeLines(lines, maxLines, fontSize, maxWidth) {
+  const result = lines.slice(0, maxLines);
+  if (!result.length) return [''];
+  let last = result.at(-1);
+  while (last && measureSmemeLine(`${last}...`, fontSize) > maxWidth) {
+    last = graphemes(last).slice(0, -1).join('');
+  }
+  result[result.length - 1] = `${last || ''}...`;
+  return result;
 }
 
 function wrapSmemeText(text, maxChars) {

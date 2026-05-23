@@ -32,6 +32,7 @@ export class PdfSessions {
       actorJid: opts.actorJid || jid,
       fileName: normalizePdfFileName(opts.fileName),
       maxSizeBytes: Number.isInteger(opts.maxSizeBytes) && opts.maxSizeBytes > 0 ? opts.maxSizeBytes : null,
+      split: opts.split === true,
       files: [],
       nextOrder: 1,
       startedAt: Date.now(),
@@ -128,6 +129,21 @@ export class PdfSessions {
     return this.buildPdfBuffer(session);
   }
 
+  async buildSplit(session) {
+    if (!session?.files?.length) throw new Error('Belum ada file untuk dibuat PDF.');
+    const ordered = orderedSessionFiles(session);
+    const files = [];
+    for (const [index, item] of ordered.entries()) {
+      const singleSession = { ...session, files: [item], maxSizeBytes: session.maxSizeBytes };
+      const buffer = session.maxSizeBytes ? await this.buildWithinSize(singleSession) : await this.buildPdfBuffer(singleSession);
+      files.push({
+        buffer,
+        fileName: splitPdfFileName(session.fileName, item, index + 1)
+      });
+    }
+    return files;
+  }
+
   async buildWithinSize(session) {
     const normal = await this.buildPdfBuffer(session);
     if (normal.length <= session.maxSizeBytes) return normal;
@@ -214,12 +230,16 @@ export function defaultPdfBaseName(date = new Date(), botName = PDF_DEFAULT_FILE
 
 export function parsePdfStartArgs(rawArgs) {
   const raw = String(rawArgs || '').trim();
-  if (!raw) return { fileName: '', maxSizeBytes: null };
-  const match = raw.match(PDF_SIZE_RE);
-  if (!match) return { fileName: raw, maxSizeBytes: null };
+  if (!raw) return { fileName: '', maxSizeBytes: null, split: false };
+  const split = /^split(?:\s+|$)/i.test(raw);
+  const body = split ? raw.replace(/^split\s*/i, '').trim() : raw;
+  if (!body) return { fileName: '', maxSizeBytes: null, split };
+  const match = body.match(PDF_SIZE_RE);
+  if (!match) return { fileName: body, maxSizeBytes: null, split };
   return {
     fileName: match[1].trim(),
-    maxSizeBytes: parsePdfSizeLimit(`${match[2]}${match[3]}`)
+    maxSizeBytes: parsePdfSizeLimit(`${match[2]}${match[3]}`),
+    split
   };
 }
 
@@ -263,6 +283,19 @@ function resolvePdfOrder(session, order) {
 
 function orderedSessionFiles(session) {
   return [...session.files].sort((a, b) => a.order - b.order || a.addedAt - b.addedAt);
+}
+
+function splitPdfFileName(sessionFileName, item, index) {
+  const base = String(sessionFileName || PDF_DEFAULT_FILE_NAME)
+    .replace(/\.pdf$/i, '')
+    .trim() || PDF_DEFAULT_FILE_NAME;
+  const source = String(item?.fileName || `item-${index}`)
+    .replace(/\.[^.]+$/i, '')
+    .replace(/[<>:"/\\|?*\x00-\x1F]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60) || `item-${index}`;
+  return normalizePdfFileName(`${base}-${String(index).padStart(2, '0')}-${source}`);
 }
 
 function pdfMediaSupport(media) {

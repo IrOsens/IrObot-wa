@@ -36,11 +36,13 @@ export async function detectTools() {
       ]
     : ['soffice', 'libreoffice'];
 
-  const [ffmpeg, ffprobe, ytDlp, ytDlpExe] = await Promise.all([
+  const [ffmpeg, ffprobe, ytDlp, ytDlpExe, pdftoppm, magick] = await Promise.all([
     which('ffmpeg'),
     which('ffprobe'),
     which('yt-dlp'),
-    process.platform === 'win32' ? which('yt-dlp.exe') : Promise.resolve(null)
+    process.platform === 'win32' ? which('yt-dlp.exe') : Promise.resolve(null),
+    process.platform === 'win32' ? which('pdftoppm.exe') : which('pdftoppm'),
+    process.platform === 'win32' ? which('magick.exe') : which('magick')
   ]);
   let office = null;
   for (const candidate of officeCandidates) {
@@ -55,7 +57,7 @@ export async function detectTools() {
     }
   }
 
-  return { ffmpeg, ffprobe, office, ytDlp: ytDlp || ytDlpExe };
+  return { ffmpeg, ffprobe, office, ytDlp: ytDlp || ytDlpExe, pdftoppm, magick };
 }
 
 export async function runTool(command, args, options = {}) {

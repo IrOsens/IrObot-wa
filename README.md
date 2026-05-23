@@ -21,6 +21,7 @@ Opsional untuk fitur penuh:
 - `ffmpeg`
 - `ffprobe`
 - `libreoffice` atau `soffice`
+- `pdftoppm` dari Poppler atau ImageMagick `magick` untuk fallback `,toimg`
 
 ## Setup Cepat
 
@@ -81,11 +82,11 @@ Scan QR yang muncul di terminal. Session WhatsApp disimpan di `auth/`.
 
 ## Command
 
-- Media: `,s [title][,author]`, `,smeme up/down <teks> [1-99]`, `,rs`, `,topdf [nama][,1MB]`
+- Media: `,s [title][,author]`, `,smeme up/down <teks> [1-99]`, `,rs`, `,topdf [split] [nama][,1MB]`, `,toimg`
 - Reminder/task: `,task`, `,ltask`, `,ltask true|false|del <id>`, `,remindme <teks> <durasi>`
 - Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
 - Note/link: `,note`, `,note del <id|judul>`, `,note change <id|judul> <judul-baru>`, `,link`, `,link del <id|nama>`, `,link change <id|nama> <nama-baru>`
-- Utility: `,info`, `,status`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`
+- Utility: `,info`, `,status`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,log`, `,net`, `,button`
 - Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
@@ -112,6 +113,7 @@ Operasional:
 PDF:
 
 - Ketik `,topdf` atau `,topdf laporan`.
+- Ketik `,topdf split` untuk membuat setiap media dalam sesi menjadi PDF terpisah saat `,end`.
 - Jika nama kosong, nama PDF default memakai format WIB seperti `23_5_2026_115700_IrOBot.pdf`.
 - Batas ukuran opsional bisa ditulis setelah koma, contoh `,topdf laporan,1MB`; `mb` dan `MB` sama-sama dibaca sebagai megabytes.
 - Kirim/reply beberapa media atau dokumen.
@@ -120,6 +122,12 @@ PDF:
 - Audio, video, GIF, dan animasi dilewati dengan pesan alasan.
 - Jika batas ukuran dipasang, bot mencoba kompres gambar. Jika tetap melebihi batas, PDF tidak dikirim.
 - Ketik `,end` untuk membuat PDF.
+
+PDF ke image:
+
+- Reply/kirim dokumen PDF lalu ketik `,toimg`.
+- Bot mengirim setiap halaman PDF sebagai image PNG.
+- Jika runtime sharp tidak bisa render PDF langsung, fallback butuh Poppler `pdftoppm` atau ImageMagick `magick`.
 
 Anticall:
 
@@ -155,6 +163,12 @@ Konfirmasi:
 - Reaction hanya diterima dari user yang memicu command, dan kedaluwarsa setelah 1 menit.
 - List seperti `,load`, `,note`, `,link`, `,ltask`, `,won`, `,admin list`, dan `,anticall except list` dikirim per item. React `❌`, `👎`, atau `❎` pada item untuk memulai konfirmasi hapus.
 
+Utility tambahan:
+
+- `,log [baris]` menampilkan log server terbaru, default 30 baris dan maksimal 80 baris.
+- `,net` mengecek public IP, DNS, HTTP latency, local IP, dan estimasi download kecil.
+- `,button <pesan>` mengirim pesan test dengan satu tombol. Jika tombol ditekan, reply tombol dibaca sebagai command `,<pesan>`.
+
 Update/restart:
 
 - `,restartbot` melakukan graceful exit.
@@ -167,6 +181,7 @@ Update/restart:
 
 - Sticker/media dan sebagian konversi: butuh `ffmpeg`.
 - Office ke PDF: butuh `libreoffice` atau `soffice`.
+- PDF ke image: butuh dukungan PDF di sharp, Poppler `pdftoppm`, atau ImageMagick `magick`.
 
 Bot tetap bisa start tanpa tool tersebut. Command yang membutuhkan tool hilang akan memberi pesan error yang jelas.
 

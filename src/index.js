@@ -1,6 +1,7 @@
 import os from 'node:os';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import dns from 'node:dns/promises';
 import pino from 'pino';
 import QRCode from 'qrcode';
 import makeWASocket, {
@@ -8,7 +9,9 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   getKeyAuthor,
+  generateWAMessageFromContent,
   jidNormalizedUser,
+  proto,
   useMultiFileAuthState
 } from 'baileys';
 import {
@@ -20,6 +23,7 @@ import {
   DEFAULT_STICKER_AUTHOR,
   DEFAULT_STICKER_TITLE,
   LINKS_FILE,
+  LOG_DIR,
   NOTES_FILE,
   PDF_DEFAULT_FILE_NAME,
   PRIMARY_TARGET_NAME,
@@ -48,6 +52,7 @@ import {
   downloadMessageMedia,
   downloadQuotedOrOwnMedia,
   downloadUrlMedia,
+  isPdfFile,
   isViewOnceMediaMessage,
   mediaNode,
   quotedMediaNode
@@ -55,6 +60,7 @@ import {
 import { makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerMeta, reverseSticker } from './sticker.js';
 import { TaskScheduler, createTask, formatTaskList, formatWib, listTasks, updateTaskState } from './tasks.js';
 import { PdfSessions, parsePdfOrderText, parsePdfStartArgs } from './pdf.js';
+import { pdfToImages } from './pdfImages.js';
 import { downloadYoutube } from './youtube.js';
 import {
   SaveRecorder,
@@ -271,7 +277,8 @@ const HELP_SECTIONS = [
       { name: 's', text: '- ,s [title][,author] - buat sticker dari attach, reply, atau URL media .' },
       { name: 'smeme', text: '- ,smeme up/down <teks> [1-99] - buat sticker meme dari reply media .' },
       { name: 'rs', text: '- ,rs - kirim ulang media atau view-once reply ke chat ini .' },
-      { name: 'topdf', text: '- ,topdf [nama][,1MB] - mulai sesi PDF, lalu tutup dengan ,end .' }
+      { name: 'topdf', text: '- ,topdf [split] [nama][,1MB] - mulai sesi PDF, lalu tutup dengan ,end .' },
+      { name: 'toimg', text: '- ,toimg - ubah PDF reply/dokumen menjadi image per halaman .' }
     ]
   },
   {
@@ -309,7 +316,10 @@ const HELP_SECTIONS = [
       { name: 'restartbot', text: '- ,restartbot - restart aman dengan konfirmasi .' },
       { name: 'allow', text: '- ,allow here|all true|false - buka/tutup akses publik .' },
       { name: 'admin', text: '- ,admin list|add|del <nomor|id> - kelola admin tambahan .' },
-      { name: 'bot', text: '- ,bot | ,bot on|off - cek atau ubah status layanan bot .' }
+      { name: 'bot', text: '- ,bot | ,bot on|off - cek atau ubah status layanan bot .' },
+      { name: 'log', text: '- ,log [baris] - lihat log server terbaru .' },
+      { name: 'net', text: '- ,net - cek IP, DNS, latency, dan estimasi download .' },
+      { name: 'button', text: '- ,button <pesan> - tes pesan dengan tombol interaktif .' }
     ]
   },
   {
@@ -498,7 +508,7 @@ async function handleHealth(jid) {
     `Memory heap: ${formatBytes(mem.heapUsed)} / ${formatBytes(mem.heapTotal)}`,
     `External: ${formatBytes(mem.external)}`,
     `Disk: ${diskText}`,
-    `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, yt-dlp=${Boolean(state.tools.ytDlp)}, office=${Boolean(state.tools.office)}`,
+    `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, yt-dlp=${Boolean(state.tools.ytDlp)}, office=${Boolean(state.tools.office)}, pdftoppm=${Boolean(state.tools.pdftoppm)}, magick=${Boolean(state.tools.magick)}`,
     `Data counts: save=${saved.length}, note=${notes.length}, link=${links.length}, task=${tasks.length}, remind=${reminders.length}, wol=${wolItems.length}`,
     `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, ytCookies=${state.youtubeCookieSessions.size}, confirm=${state.confirmStore.count()}`,
     `Anticall: ${anticall.enabled ? 'aktif' : 'nonaktif'}, pesan=${anticall.hasMessage ? `${anticall.entryCount} item` : 'belum ada'}, exception=${anticall.exceptionCount || 0}`,
@@ -568,6 +578,33 @@ async function handleReverseSticker(message, command) {
     await sendDownloadedMedia(jid, media);
   } finally {
     await cleanupFiles([media?.path]);
+  }
+}
+
+async function handleToImg(message) {
+  const jid = message.key.remoteJid;
+  let media = null;
+  let images = [];
+  try {
+    media = await downloadQuotedOrOwnMedia(state.sock, message, 'toimg-source');
+    if (!media) throw new Error('Kirim/reply dokumen PDF untuk memakai ,toimg.');
+    if (!isPdfFile(media.path, media.mimetype) && !isPdfFile(media.fileName, media.mimetype)) {
+      throw new Error('Untuk sekarang ,toimg hanya mendukung file PDF.');
+    }
+    await sendText(jid, 'Mengubah PDF menjadi image...');
+    images = await pdfToImages(media.path, state.tools);
+    if (!images.length) throw new Error('Tidak ada halaman PDF yang berhasil diubah menjadi image.');
+    for (const image of images) {
+      const buffer = await fs.readFile(image.path);
+      await state.sock.sendMessage(jid, {
+        image: buffer,
+        mimetype: image.mimetype,
+        caption: `Halaman ${image.page}`
+      });
+    }
+  } finally {
+    const cleanup = new Set([media?.path, ...images.flatMap((image) => image.cleanupPaths || [image.path])].filter(Boolean));
+    await cleanupFiles([...cleanup]);
   }
 }
 
@@ -831,7 +868,8 @@ async function handleTopdf(message, command, actorJid) {
     return;
   }
   const sizeText = session.maxSizeBytes ? ` Maksimal ukuran: ${formatBytes(session.maxSizeBytes)}.` : '';
-  const sent = await sendText(jid, `Sesi PDF "${session.fileName}" dimulai.${sizeText} Kirim/reply media atau dokumen. Caption/teks angka dipakai sebagai urutan halaman. Ketik ,end untuk selesai atau ,cancel untuk batal.`);
+  const splitText = session.split ? ' Mode split aktif: setiap media akan dikirim sebagai PDF terpisah.' : '';
+  const sent = await sendText(jid, `Sesi PDF "${session.fileName}" dimulai.${sizeText}${splitText} Kirim/reply media atau dokumen. Caption/teks angka dipakai sebagai urutan halaman. Ketik ,end untuk selesai atau ,cancel untuk batal.`);
   registerSessionPrompt(sent.key, jid, actorJid);
 }
 
@@ -846,12 +884,23 @@ async function handleEndPdfByJid(jid, actorJid) {
     return false;
   }
   try {
-    const pdf = await state.pdfSessions.build(session);
-    await state.sock.sendMessage(jid, {
-      document: pdf,
-      mimetype: 'application/pdf',
-      fileName: session.fileName || `${PDF_DEFAULT_FILE_NAME}-${Date.now()}.pdf`
-    });
+    if (session.split) {
+      const pdfs = await state.pdfSessions.buildSplit(session);
+      for (const file of pdfs) {
+        await state.sock.sendMessage(jid, {
+          document: file.buffer,
+          mimetype: 'application/pdf',
+          fileName: file.fileName
+        });
+      }
+    } else {
+      const pdf = await state.pdfSessions.build(session);
+      await state.sock.sendMessage(jid, {
+        document: pdf,
+        mimetype: 'application/pdf',
+        fileName: session.fileName || `${PDF_DEFAULT_FILE_NAME}-${Date.now()}.pdf`
+      });
+    }
   } finally {
     await state.pdfSessions.cleanup(session);
   }
@@ -1189,6 +1238,135 @@ async function handleBackup(jid) {
   await sendText(jid, `Backup terkirim ke Telegram:\n${files.join('\n')}`);
 }
 
+async function handleLog(jid, command) {
+  const lines = Number(command.args[0] || 30);
+  const limit = Number.isInteger(lines) && lines > 0 ? Math.min(lines, 80) : 30;
+  const entries = await fs.readdir(LOG_DIR).catch(() => []);
+  const files = entries
+    .filter((name) => /^bot-\d{4}-\d{2}-\d{2}\.log$/.test(name))
+    .sort()
+    .reverse();
+  if (!files.length) {
+    await sendText(jid, 'Belum ada file log.');
+    return;
+  }
+  const content = await fs.readFile(path.join(LOG_DIR, files[0]), 'utf8');
+  const tail = content.trim().split(/\r?\n/).slice(-limit).map(formatLogLine).join('\n');
+  await sendText(jid, tail || 'Log kosong.');
+}
+
+function formatLogLine(line) {
+  try {
+    const item = JSON.parse(line);
+    const meta = item.meta ? ` ${JSON.stringify(item.meta).slice(0, 300)}` : '';
+    return `[${item.time}] ${item.level}: ${item.message}${meta}`;
+  } catch {
+    return line;
+  }
+}
+
+async function handleNet(jid) {
+  const started = Date.now();
+  const [publicIp, trace, dnsInfo, latency, download] = await Promise.all([
+    fetchText('https://api.ipify.org?format=text', 5000).catch((error) => `gagal: ${error.message}`),
+    fetchText('https://www.cloudflare.com/cdn-cgi/trace', 5000).catch(() => ''),
+    getDnsInfo(),
+    measureHttpLatency('https://www.cloudflare.com/cdn-cgi/trace'),
+    measureDownloadSpeed('https://speed.cloudflare.com/__down?bytes=1048576')
+  ]);
+  const traceMap = parseCloudflareTrace(trace);
+  const nets = Object.values(os.networkInterfaces())
+    .flat()
+    .filter((item) => item && !item.internal)
+    .map((item) => `${item.family} ${item.address}`)
+    .slice(0, 8);
+  await sendText(jid, [
+    'Network info:',
+    `Public IP: ${publicIp}`,
+    traceMap.loc ? `Lokasi CF: ${traceMap.loc}` : null,
+    traceMap.colo ? `Cloudflare colo: ${traceMap.colo}` : null,
+    `DNS lookup: ${dnsInfo}`,
+    `HTTP latency: ${latency}`,
+    `Download test: ${download}`,
+    `Local IP: ${nets.join(', ') || 'unavailable'}`,
+    `Selesai dalam ${Date.now() - started}ms`
+  ].filter(Boolean).join('\n'));
+}
+
+async function fetchText(url, timeoutMs = 5000) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), cache: 'no-store' });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return (await response.text()).trim();
+}
+
+async function getDnsInfo() {
+  const start = Date.now();
+  try {
+    const addresses = await dns.resolve4('cloudflare.com');
+    return `${Date.now() - start}ms (${addresses.slice(0, 3).join(', ')})`;
+  } catch (error) {
+    return `gagal: ${error.message}`;
+  }
+}
+
+async function measureHttpLatency(url) {
+  const start = Date.now();
+  try {
+    const response = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(5000), cache: 'no-store' });
+    return `${Date.now() - start}ms (HTTP ${response.status})`;
+  } catch (error) {
+    return `gagal: ${error.message}`;
+  }
+}
+
+async function measureDownloadSpeed(url) {
+  const start = Date.now();
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(12000), cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const seconds = Math.max(0.001, (Date.now() - start) / 1000);
+    const mbps = (buffer.length * 8) / seconds / 1_000_000;
+    return `${formatBytes(buffer.length)} in ${seconds.toFixed(2)}s (${mbps.toFixed(2)} Mbps)`;
+  } catch (error) {
+    return `gagal: ${error.message}`;
+  }
+}
+
+function parseCloudflareTrace(text) {
+  const result = {};
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const [key, ...rest] = line.split('=');
+    if (key) result[key] = rest.join('=');
+  }
+  return result;
+}
+
+async function handleButton(message, command) {
+  const jid = message.key.remoteJid;
+  const text = command.rawArgs.trim();
+  if (!text) throw new Error('Format: ,button <pesan>');
+  const buttonId = text.startsWith(COMMAND_PREFIX) ? text : `${COMMAND_PREFIX}${text}`;
+  const content = proto.Message.fromObject({
+    buttonsMessage: {
+      contentText: text,
+      footerText: BOT_NAME,
+      buttons: [
+        {
+          buttonId,
+          buttonText: { displayText: text },
+          type: 1
+        }
+      ],
+      headerType: 1
+    }
+  });
+  const waMessage = generateWAMessageFromContent(jid, content, {
+    userJid: ownUserJid()
+  });
+  await state.sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
+}
+
 async function handleAllow(message, command) {
   const jid = message.key.remoteJid;
   const { scope, enabled } = parseAllowArgs(command.args);
@@ -1478,6 +1656,9 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'topdf':
       await handleTopdf(message, command, context.actorJid);
       break;
+    case 'toimg':
+      await handleToImg(message);
+      break;
     case 'won':
       if (!command.args.length) {
         await sendWolList(jid, context.actorJid);
@@ -1501,6 +1682,15 @@ async function handleCommand(message, command, context = commandContext(message)
       break;
     case 'backup':
       await handleBackup(jid);
+      break;
+    case 'log':
+      await handleLog(jid, command);
+      break;
+    case 'net':
+      await handleNet(jid);
+      break;
+    case 'button':
+      await handleButton(message, command);
       break;
     case 'restore':
       await handleRestoreStart(message, context.actorJid);
@@ -1769,7 +1959,9 @@ async function main() {
     ffmpeg: Boolean(state.tools.ffmpeg),
     ffprobe: Boolean(state.tools.ffprobe),
     office: Boolean(state.tools.office),
-    ytDlp: Boolean(state.tools.ytDlp)
+    ytDlp: Boolean(state.tools.ytDlp),
+    pdftoppm: Boolean(state.tools.pdftoppm),
+    magick: Boolean(state.tools.magick)
   });
   await connect();
 }

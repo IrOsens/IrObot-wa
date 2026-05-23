@@ -16,6 +16,7 @@ import { CommandAccessStore, parseAllowArgs } from '../src/commandAccess.js';
 import { ReactionActionStore, reactionIntent } from '../src/reactionActions.js';
 import { normalizePhoneNumber, normalizePhoneToJid } from '../src/phone.js';
 import { handleLinkCommand, handleNoteCommand } from '../src/notes.js';
+import { getMessageText } from '../src/text.js';
 import {
   isAnimatedMedia,
   makeSmemeOverlaySvg,
@@ -92,8 +93,10 @@ test('PDF start args support WIB default name, size limit, and unsupported skips
   assert.equal(parsePdfSizeLimit('1mb'), 1024 * 1024);
   assert.deepEqual(parsePdfStartArgs('Ini adalah nama pdf,1MB'), {
     fileName: 'Ini adalah nama pdf',
-    maxSizeBytes: 1024 * 1024
+    maxSizeBytes: 1024 * 1024,
+    split: false
   });
+  assert.deepEqual(parsePdfStartArgs('split'), { fileName: '', maxSizeBytes: null, split: true });
 
   const sessions = new PdfSessions({});
   const session = sessions.start('jid@test', '');
@@ -107,6 +110,29 @@ test('PDF start args support WIB default name, size limit, and unsupported skips
   assert.match(skipped.reason, /audio/);
   assert.equal(session.files.length, 0);
   sessions.end('jid@test');
+});
+
+test('PdfSessions split mode builds one PDF per media item', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'pdf-split-test-'));
+  const first = path.join(work, 'first.png');
+  const second = path.join(work, 'second.png');
+  try {
+    await sharp({ create: { width: 8, height: 8, channels: 3, background: '#ff0000' } }).png().toFile(first);
+    await sharp({ create: { width: 8, height: 8, channels: 3, background: '#0000ff' } }).png().toFile(second);
+    const sessions = new PdfSessions({});
+    const session = sessions.start('jid@test', { fileName: 'split', split: true });
+    sessions.pushMedia(session, { path: first, mimetype: 'image/png', fileName: 'first.png' });
+    sessions.pushMedia(session, { path: second, mimetype: 'image/png', fileName: 'second.png' });
+    const files = await sessions.buildSplit(session);
+    assert.equal(files.length, 2);
+    assert.match(files[0].fileName, /first/i);
+    assert.ok(files.every((file) => file.buffer.length > 0));
+    sessions.end('jid@test');
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
 });
 
 test('normalizeYoutubeCookies supports raw Cookie header and Netscape text', () => {
@@ -240,6 +266,25 @@ test('smeme text keeps emoji as colored emoji run', async () => {
   assert.match(overlay, /class="smeme-emoji"/);
   assert.match(overlay, /HALO/);
   assert.doesNotMatch(overlay, /01F42B|1F42B/);
+});
+
+test('smeme long text stays inside padded canvas', async () => {
+  const canvas = 512;
+  const overlay = (await makeSmemeOverlaySvg('ini teks sangat panjang sekali sampai harus mengecil dan tetap tidak keluar dari gambar kanan kiri', 'up', canvas)).toString('utf8');
+  const xs = [...overlay.matchAll(/<text class="smeme-text" x="([\d.]+)"/g)].map((match) => Number(match[1]));
+  assert.ok(xs.length > 0);
+  assert.ok(xs.every((x) => x >= 20 && x < canvas));
+});
+
+test('getMessageText reads button replies as commands', () => {
+  assert.equal(getMessageText({
+    message: {
+      buttonsResponseMessage: {
+        selectedButtonId: ',help',
+        selectedDisplayText: 'help'
+      }
+    }
+  }), ',help');
 });
 
 test('CommandAccessStore gates public commands', async () => {

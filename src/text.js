@@ -29,7 +29,21 @@ export function getMessageText(message) {
   if (content.imageMessage?.caption) return content.imageMessage.caption;
   if (content.videoMessage?.caption) return content.videoMessage.caption;
   if (content.documentMessage?.caption) return content.documentMessage.caption;
+  if (content.buttonsResponseMessage?.selectedButtonId) return content.buttonsResponseMessage.selectedButtonId;
+  if (content.templateButtonReplyMessage?.selectedId) return content.templateButtonReplyMessage.selectedId;
+  if (content.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson) {
+    return parseNativeFlowButtonText(content.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson);
+  }
   return '';
+}
+
+function parseNativeFlowButtonText(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed.id || parsed.button_id || parsed.buttonId || '';
+  } catch {
+    return '';
+  }
 }
 
 export function unwrapMessage(message) {
