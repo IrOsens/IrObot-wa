@@ -16,6 +16,8 @@ export const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 export const COMMAND_ACCESS_FILE = path.join(DATA_DIR, 'command-access.json');
 export const BOT_STATE_FILE = path.join(DATA_DIR, 'bot-state.json');
+export const CHANGED_MESSAGES_FILE = path.join(DATA_DIR, 'changed-messages.json');
+export const STATUS_SAVE_FILE = path.join(DATA_DIR, 'status-save.json');
 export const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
 export const LINKS_FILE = path.join(DATA_DIR, 'links.json');
 export const REMINDERS_FILE = path.join(DATA_DIR, 'reminders.json');
@@ -51,9 +53,24 @@ export const DEFAULT_APP_CONFIG = {
     restoreTimeoutMs: 30 * 60 * 1000
   },
   backup: {
-    telegramPartSizeMb: 45,
+    partSizeMb: 45,
     autoDaily: true,
     dailyTimeWib: '00:00'
+  },
+  destinations: {
+    logs: 'logs',
+    changedmsg: 'changedmsg',
+    saved: 'saved',
+    backup: 'backup'
+  },
+  changedmsg: {
+    enabled: true,
+    indexMaxItems: 1000,
+    maxMediaMb: 25
+  },
+  statussave: {
+    enabled: true,
+    maxMediaMb: 25
   },
   update: {
     restartMode: 'systemctl',
@@ -87,11 +104,9 @@ export const YOUTUBE_COOKIE_FILE = resolveRuntimePath(
 );
 export const YOUTUBE_EXTRACTOR_ARGS = process.env.YOUTUBE_EXTRACTOR_ARGS || APP_CONFIG.youtube?.extractorArgs || '';
 export const YOUTUBE_PO_TOKEN = process.env.YOUTUBE_PO_TOKEN || APP_CONFIG.youtube?.poToken || '';
-export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-export const TELEGRAM_CLIENT_ID = process.env.TELEGRAM_CLIENT_ID || '';
-export const TELEGRAM_PART_SIZE_BYTES = Math.max(
+export const BACKUP_PART_SIZE_BYTES = Math.max(
   1024 * 1024,
-  Math.floor(numberOr(process.env.TELEGRAM_PART_SIZE_MB, APP_CONFIG.backup?.telegramPartSizeMb || 45) * 1024 * 1024)
+  Math.floor(numberOr(process.env.BACKUP_PART_SIZE_MB, APP_CONFIG.backup?.partSizeMb || 45) * 1024 * 1024)
 );
 export const AUTO_DAILY_BACKUP = APP_CONFIG.backup?.autoDaily !== false;
 export const DAILY_BACKUP_TIME_WIB = APP_CONFIG.backup?.dailyTimeWib || '00:00';
@@ -119,6 +134,8 @@ export async function ensureRuntimeDirs() {
     ensureJsonFile(CONFIG_FILE, DEFAULT_APP_CONFIG),
     ensureJsonFile(COMMAND_ACCESS_FILE, { all: false, chats: {}, admins: [], nextAdminId: 1 }),
     ensureJsonFile(BOT_STATE_FILE, { enabled: true, updatedAt: null }),
+    ensureJsonFile(CHANGED_MESSAGES_FILE, { allowedChats: [], nextAllowedId: 1, index: [], updatedAt: null }),
+    ensureJsonFile(STATUS_SAVE_FILE, { nextId: 1, items: [], updatedAt: null }),
     ensureJsonFile(ANTICALL_FILE, { enabled: false, entries: [], updatedAt: null }),
     ensureJsonFile(TASKS_FILE, { nextId: 1, tasks: [] }),
     ensureJsonFile(SAVED_MESSAGES_FILE, { nextId: 1, items: [] }),
@@ -190,13 +207,11 @@ function defaultEnvText() {
 
 function requiredEnvLines() {
   return [
-    'TELEGRAM_BOT_TOKEN=',
-    'TELEGRAM_CLIENT_ID=',
     'YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt',
     'YOUTUBE_EXTRACTOR_ARGS=',
     'YOUTUBE_PO_TOKEN=',
     'LINUX_SUDO_PASSWORD=',
-    'TELEGRAM_PART_SIZE_MB=45'
+    'BACKUP_PART_SIZE_MB=45'
   ];
 }
 

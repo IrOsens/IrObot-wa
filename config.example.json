@@ -27,9 +27,24 @@
     "restoreTimeoutMs": 1800000
   },
   "backup": {
-    "telegramPartSizeMb": 45,
+    "partSizeMb": 45,
     "autoDaily": true,
     "dailyTimeWib": "00:00"
+  },
+  "destinations": {
+    "logs": "logs",
+    "changedmsg": "changedmsg",
+    "saved": "saved",
+    "backup": "backup"
+  },
+  "changedmsg": {
+    "enabled": true,
+    "indexMaxItems": 1000,
+    "maxMediaMb": 25
+  },
+  "statussave": {
+    "enabled": true,
+    "maxMediaMb": 25
   },
   "update": {
     "restartMode": "systemctl",

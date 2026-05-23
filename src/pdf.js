@@ -49,6 +49,10 @@ export class PdfSessions {
     return this.sessions.has(jid);
   }
 
+  get(jid) {
+    return this.sessions.get(jid) || null;
+  }
+
   count() {
     return this.sessions.size;
   }

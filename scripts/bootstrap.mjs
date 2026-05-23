@@ -15,6 +15,8 @@ const CONFIG_EXAMPLE_FILE = path.join(ROOT_DIR, 'config.example.json');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const COMMAND_ACCESS_FILE = path.join(DATA_DIR, 'command-access.json');
 const BOT_STATE_FILE = path.join(DATA_DIR, 'bot-state.json');
+const CHANGED_MESSAGES_FILE = path.join(DATA_DIR, 'changed-messages.json');
+const STATUS_SAVE_FILE = path.join(DATA_DIR, 'status-save.json');
 const TASK_MEDIA_DIR = path.join(DATA_DIR, 'task-media');
 const SAVED_MESSAGES_DIR = path.join(DATA_DIR, 'saved-messages');
 const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
@@ -29,13 +31,11 @@ const prepareOnly = args.has('--prepare-only');
 const withTools = args.has('--with-tools');
 const skipNpm = args.has('--skip-npm') || prepareOnly;
 const REQUIRED_ENV_LINES = [
-  'TELEGRAM_BOT_TOKEN=',
-  'TELEGRAM_CLIENT_ID=',
   'YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt',
   'YOUTUBE_EXTRACTOR_ARGS=',
   'YOUTUBE_PO_TOKEN=',
   'LINUX_SUDO_PASSWORD=',
-  'TELEGRAM_PART_SIZE_MB=45'
+  'BACKUP_PART_SIZE_MB=45'
 ];
 
 async function pathExists(target) {
@@ -133,7 +133,10 @@ async function readDefaultConfig() {
       youtube: { cookieFile: 'auth/youtube-cookies.txt' },
       wol: { broadcastAddress: '255.255.255.255', port: 9 },
       sessions: { restoreTimeoutMs: 1800000 },
-      backup: { telegramPartSizeMb: 45 }
+      backup: { partSizeMb: 45, autoDaily: true, dailyTimeWib: '00:00' },
+      destinations: { logs: 'logs', changedmsg: 'changedmsg', saved: 'saved', backup: 'backup' },
+      changedmsg: { enabled: true, indexMaxItems: 1000, maxMediaMb: 25 },
+      statussave: { enabled: true, maxMediaMb: 25 }
     };
   }
 }
@@ -162,6 +165,8 @@ async function main() {
   const createdConfig = await ensureJsonFile(CONFIG_FILE, await readDefaultConfig());
   const createdCommandAccess = await ensureJsonFile(COMMAND_ACCESS_FILE, { all: false, chats: {}, admins: [], nextAdminId: 1 });
   const createdBotState = await ensureJsonFile(BOT_STATE_FILE, { enabled: true, updatedAt: null });
+  const createdChangedMessages = await ensureJsonFile(CHANGED_MESSAGES_FILE, { allowedChats: [], nextAllowedId: 1, index: [], updatedAt: null });
+  const createdStatusSave = await ensureJsonFile(STATUS_SAVE_FILE, { nextId: 1, items: [], updatedAt: null });
   const createdTasks = await ensureJsonFile(TASKS_FILE, { nextId: 1, tasks: [] });
   const createdSaved = await ensureJsonFile(SAVED_MESSAGES_FILE, { nextId: 1, items: [] });
   const createdNotes = await ensureJsonFile(NOTES_FILE, { nextId: 1, items: [] });
@@ -171,17 +176,19 @@ async function main() {
   await maybeInstallSystemTools();
 
   log('Runtime directories siap.');
-  if (createdEnv) log('Membuat .env - isi credential Telegram sebelum memakai ,backup.');
+  if (createdEnv) log('Membuat .env.');
   if (createdConfig) log('Membuat data/config.json - cek target grup, sticker default, PDF, WOL, dan timeout.');
   if (createdCommandAccess) log('Membuat data/command-access.json');
   if (createdBotState) log('Membuat data/bot-state.json');
+  if (createdChangedMessages) log('Membuat data/changed-messages.json');
+  if (createdStatusSave) log('Membuat data/status-save.json');
   if (createdTasks) log('Membuat data/tasks.json');
   if (createdSaved) log('Membuat data/saved-messages.json');
   if (createdNotes) log('Membuat data/notes.json');
   if (createdLinks) log('Membuat data/links.json');
   if (createdReminders) log('Membuat data/reminders.json');
   if (createdWol) log('Membuat data/wol.json');
-  log('Peringatan: credential di .env wajib diisi untuk fitur Telegram backup. data/config.json bisa disesuaikan bila nama grup/setting berbeda.');
+  log('Peringatan: data/config.json bisa disesuaikan bila nama grup/setting berbeda. Backup dikirim ke destination WhatsApp.');
   log('Selesai.');
 }
 

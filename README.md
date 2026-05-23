@@ -7,7 +7,7 @@ Bot WhatsApp pribadi berbasis Baileys. Login memakai QR di terminal, command mem
 - Cocok dipindah ke Linux atau Windows lain.
 - Data runtime berada di `data/`, credential di `.env` dan `auth/`.
 - Tool sistem opsional dipakai untuk fitur media dan PDF.
-- Backup `data/` bisa dikirim ke Telegram Bot API.
+- Backup `data/` dikirim ke destination WhatsApp `backup`.
 
 ## Persiapan
 
@@ -35,12 +35,11 @@ Jika PowerShell Windows memblokir `npm` karena execution policy:
 npm.cmd run setup
 ```
 
-Setup dan startup bot akan membuat folder runtime, `.env`, `data/config.json`, dan file JSON awal seperti `bot-state`, `command-access`, `tasks`, `notes`, `links`, `reminders`, dan `wol` jika hilang.
+Setup dan startup bot akan membuat folder runtime, `.env`, `data/config.json`, dan file JSON awal seperti `bot-state`, `command-access`, `changed-messages`, `status-save`, `tasks`, `notes`, `links`, `reminders`, dan `wol` jika hilang.
 
 Penting:
 
-- Isi `.env` sebelum memakai `,backup`.
-- Cek `data/config.json` bila nama grup target bukan `IrOBot`.
+- Cek `data/config.json` atau pakai `,config` bila nama grup target/default bukan `IrOBot`, `logs`, `changedmsg`, `saved`, atau `backup`.
 - Isi `LINUX_SUDO_PASSWORD` di `.env` jika `,update` perlu restart service systemd lewat sudo.
 
 Untuk mencoba memasang tool sistem otomatis:
@@ -54,13 +53,14 @@ npm run setup:full
 `.env`:
 
 ```env
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CLIENT_ID=
+YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt
+YOUTUBE_EXTRACTOR_ARGS=
+YOUTUBE_PO_TOKEN=
 LINUX_SUDO_PASSWORD=
-TELEGRAM_PART_SIZE_MB=45
+BACKUP_PART_SIZE_MB=45
 ```
 
-`data/config.json` dibuat dari `config.example.json` dan berisi target grup, default sticker, nama PDF default, WOL broadcast/port, timeout sesi, backup otomatis, dan setting update/restart service.
+`data/config.json` dibuat dari `config.example.json` dan berisi target grup, default sticker, nama PDF default, WOL broadcast/port, timeout sesi, destination `logs/changedmsg/saved/backup`, backup otomatis, dan setting update/restart service. Owner bisa melihat/mengubah key aman dengan `,config`.
 
 ## Cek Kesiapan
 
@@ -86,7 +86,7 @@ Scan QR yang muncul di terminal. Session WhatsApp disimpan di `auth/`.
 - Reminder/task: `,task`, `,ltask`, `,ltask true|false|del <id>`, `,remindme <teks> <durasi>`
 - Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
 - Note/link: `,note`, `,note del <id|judul>`, `,note change <id|judul> <judul-baru>`, `,link`, `,link del <id|nama>`, `,link change <id|nama> <nama-baru>`
-- Utility: `,info`, `,status`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,log`, `,net`, `,button`
+- Utility: `,info`, `,status`, `,status bot`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
 - Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
@@ -105,10 +105,12 @@ Operasional:
 - `,allow here true|false` membuka/menutup akses publik di chat/grup tempat command dikirim.
 - `,allow all true|false` membuka/menutup akses publik di semua chat/grup.
 - Akses publik biasa berlaku untuk `,help`, `,s`, `,smeme`, dan `,rs`.
-- `,help` dinamis: publik hanya melihat command publik, admin tambahan melihat command yang boleh dia pakai, owner melihat semuanya.
+- `,help` dinamis: publik hanya melihat command publik, admin tambahan melihat command yang boleh dia pakai, owner melihat semuanya. `,help <command|prefix>` menampilkan detail atau kandidat command.
 - `,admin list|add|del <nomor|id>` mengelola admin tambahan. Hanya owner/session WhatsApp yang bisa menjalankannya.
 - Admin tambahan hanya aktif saat akses publik chat/all terbuka, dan tetap tidak bisa memakai command server/security seperti `,admin`, `,bot`, `,backup`, `,restore`, `,update`, dan `,restartbot`.
-- `,bot` mengecek status. `,bot off` mem-pause command, session, scheduler, backup otomatis, dan anticall; hanya owner bisa `,bot on`.
+- `,bot` mengecek status. `,bot off` mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall; hanya owner bisa `,bot on`.
+- `,status bot` menampilkan status fitur bot, destination, scheduler, dan warning jika nama grup duplikat atau destination tidak valid.
+- Semua destination grup disimpan sebagai JID + nama saat disimpan. Jika nama grup sama lebih dari satu, bot menolak auto-pilih dan meminta JID.
 
 PDF:
 
@@ -117,6 +119,7 @@ PDF:
 - Jika nama kosong, nama PDF default memakai format WIB seperti `23_5_2026_115700_IrOBot.pdf`.
 - Batas ukuran opsional bisa ditulis setelah koma, contoh `,topdf laporan,1MB`; `mb` dan `MB` sama-sama dibaca sebagai megabytes.
 - Kirim/reply beberapa media atau dokumen.
+- Saat media ditambahkan, bot mengedit satu pesan progress berisi item terbaru, total saat ini, daftar file, dan instruksi `,end`/`,cancel`.
 - Caption/teks angka dipakai sebagai urutan PDF.
 - Jika nomor sudah terisi, bot memberi warning dan media tidak ditambahkan.
 - Audio, video, GIF, dan animasi dilewati dengan pesan alasan.
@@ -148,9 +151,10 @@ Reminder:
 
 Backup/restore:
 
-- `,backup` membuat zip folder `data/` dan mengirimnya ke Telegram client id di `.env`.
+- `,backup` membuat zip folder `data/` dan mengirimnya ke destination WhatsApp `dest.backup`.
 - Backup otomatis berjalan setiap `00:00` WIB secara default dengan mekanisme yang sama seperti `,backup`.
 - Jika zip terlalu besar, bot mengirim part seperti `PART1-2026-05-15-18_12_49.zip`.
+- Tujuan backup bisa group atau nomor: `,config set dest.backup <nama-grup|jid|nomor>`.
 - `,restore` dimulai dari WhatsApp, lalu kirim file zip/part sebagai dokumen.
 - Setelah semua part terkirim, ketik `,end`, lalu `,confirm`; folder `data/` akan ditimpa dari isi zip.
 - Backup tidak mencakup `auth/`, `.env`, `logs/`, atau `temp/`.
@@ -162,6 +166,15 @@ Konfirmasi:
 - Konfirmasi dan prompt session juga menerima reaction `👍`, `❤️`, `✅` untuk lanjut/end/confirm dan `❌`, `👎`, `❎` untuk cancel.
 - Reaction hanya diterima dari user yang memicu command, dan kedaluwarsa setelah 1 menit.
 - List seperti `,load`, `,note`, `,link`, `,ltask`, `,won`, `,admin list`, dan `,anticall except list` dikirim per item. React `❌`, `👎`, atau `❎` pada item untuk memulai konfirmasi hapus.
+
+Changed message, logs, dan status:
+
+- Default destination: grup/target `logs`, `changedmsg`, dan `saved`. Bisa diganti ke grup atau nomor lewat `,config set dest.logs|dest.changedmsg|dest.saved <target>`.
+- `,changedmsg list|allow|del <id|nama-grup|jid>` mengatur grup yang dipantau untuk pesan terhapus/diedit. Direct message dipantau default.
+- Pesan dari chat terpantau dimirror ke `logs`; saat pesan dihapus atau diedit, laporan dikirim ke `changedmsg`.
+- Index changedmsg hanya menyimpan metadata/text kecil, bukan media bytes. Media diamankan lewat salinan WhatsApp di `logs`.
+- `,statussave list|add|del <nomor|id>` menyimpan status WhatsApp dari nomor tertentu ke `saved`.
+- `,config` menampilkan key aman yang bisa diubah; `,config get <key>` dan `,config set <key> <value>` untuk membaca/mengubah.
 
 Utility tambahan:
 

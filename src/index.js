@@ -12,6 +12,7 @@ import makeWASocket, {
   generateWAMessageFromContent,
   jidNormalizedUser,
   proto,
+  WAMessageStubType,
   useMultiFileAuthState
 } from 'baileys';
 import {
@@ -30,8 +31,6 @@ import {
   REMINDERS_FILE,
   ROOT_DIR,
   TASKS_FILE,
-  TELEGRAM_CLIENT_ID,
-  TELEGRAM_PART_SIZE_BYTES,
   LINUX_SUDO_PASSWORD,
   UPDATE_BRANCH,
   UPDATE_REMOTE,
@@ -76,16 +75,27 @@ import {
 import { handleLinkCommand, handleNoteCommand, listLinks, listNotes } from './notes.js';
 import { ReminderScheduler, createReminder, formatCountdown, listReminders } from './reminders.js';
 import { handleWolCommand, listWol } from './wol.js';
-import { DailyBackupScheduler, sendDataBackupToTelegram } from './backup.js';
+import { DailyBackupScheduler, sendDataBackupToWhatsApp } from './backup.js';
 import { RestoreSessions } from './restore.js';
 import { PendingConfirmStore, parseSecretMediaTriggerText } from './confirm.js';
 import { CommandAccessStore, PUBLIC_COMMANDS, parseAllowArgs } from './commandAccess.js';
 import { BotStateStore } from './botState.js';
 import { ReactionActionStore, reactionIntent } from './reactionActions.js';
+import { RuntimeConfigStore, configKeyList, formatConfigValue } from './runtimeConfig.js';
+import {
+  ChangedMessageStore,
+  messageIndexKey,
+  messageTypeName,
+  summarizeMessage,
+  timestampMs,
+  truncateText
+} from './changedMessages.js';
+import { StatusSaveStore } from './statusSave.js';
 import {
   displayPhoneFromJid,
   normalizePhoneToJid as normalizePhoneToWhatsAppJid,
   sameJid,
+  tryNormalizeJid,
   tryNormalizePhoneToJid as tryNormalizePhoneToWhatsAppJid
 } from './phone.js';
 import {
@@ -106,23 +116,88 @@ class ChatDirectory {
   remember(jid, name) {
     if (!jid) return;
     const cleanJid = String(jid).trim();
-    this.byJid.set(cleanJid, cleanJid);
+    const old = this.byJid.get(cleanJid);
+    const cleanName = String(name || old?.name || '').trim();
+    if (name && old?.name && normalizeLookupText(old.name) !== normalizeLookupText(name)) {
+      this.byName.get(normalizeLookupText(old.name))?.delete(cleanJid);
+    }
+    this.byJid.set(cleanJid, {
+      jid: cleanJid,
+      name: cleanName,
+      updatedAt: new Date().toISOString()
+    });
     if (!name) return;
-    const cleanName = normalizeLookupText(name);
-    if (cleanName) this.byName.set(cleanName, cleanJid);
+    const nameKey = normalizeLookupText(name);
+    if (!nameKey) return;
+    if (!this.byName.has(nameKey)) this.byName.set(nameKey, new Set());
+    this.byName.get(nameKey).add(cleanJid);
   }
 
   findByName(name) {
-    const query = String(name || '').trim();
-    if (!query) return null;
-    if (this.byJid.has(query)) return query;
-    const phoneJid = tryNormalizePhoneToJid(query);
-    if (phoneJid) return phoneJid;
+    return this.resolveOne(name)?.jid || null;
+  }
 
-    const normalized = normalizeLookupText(query);
-    if (this.byName.has(normalized)) return this.byName.get(normalized);
-    const matches = [...this.byName.entries()].filter(([key]) => key.includes(normalized));
-    return matches.length === 1 ? matches[0][1] : null;
+  resolveOne(query) {
+    const result = this.resolve(query);
+    return result.ok ? result.item : null;
+  }
+
+  resolve(query) {
+    const text = String(query || '').trim();
+    if (!text) return { ok: false, reason: 'empty', candidates: [] };
+    if (this.byJid.has(text)) return { ok: true, item: this.describe(text, text) };
+    const normalizedJid = tryNormalizeJid(text);
+    if (normalizedJid && this.byJid.has(normalizedJid)) return { ok: true, item: this.describe(normalizedJid, text) };
+    if (normalizedJid && (normalizedJid.endsWith('@g.us') || normalizedJid.endsWith('@s.whatsapp.net'))) {
+      return { ok: true, item: this.describe(normalizedJid, text) };
+    }
+    const phoneJid = tryNormalizePhoneToJid(text);
+    if (phoneJid) return { ok: true, item: this.describe(phoneJid, text) };
+
+    const normalized = normalizeLookupText(text);
+    const exact = [...(this.byName.get(normalized) || [])];
+    if (exact.length === 1) return { ok: true, item: this.describe(exact[0], text) };
+    if (exact.length > 1) return { ok: false, reason: 'ambiguous', candidates: exact.map((jid) => this.describe(jid, text)) };
+    const matches = [...this.byName.entries()]
+      .filter(([key]) => key.includes(normalized))
+      .flatMap(([, jids]) => [...jids]);
+    const unique = [...new Set(matches)];
+    if (unique.length === 1) return { ok: true, item: this.describe(unique[0], text) };
+    if (unique.length > 1) return { ok: false, reason: 'ambiguous', candidates: unique.map((jid) => this.describe(jid, text)) };
+    return { ok: false, reason: 'not_found', candidates: [] };
+  }
+
+  describe(jid, input = '') {
+    const cleanJid = String(jid || '').trim();
+    const item = this.byJid.get(cleanJid) || {};
+    return {
+      jid: cleanJid,
+      savedName: item.name || input || cleanJid,
+      currentName: item.name || '',
+      input,
+      type: cleanJid.endsWith('@g.us') ? 'group' : 'user'
+    };
+  }
+
+  nameFor(jid) {
+    return this.byJid.get(String(jid || '').trim())?.name || '';
+  }
+
+  groupDuplicates() {
+    return [...this.byName.entries()]
+      .map(([key, jids]) => ({
+        key,
+        jids: [...jids].filter((jid) => jid.endsWith('@g.us'))
+      }))
+      .filter((item) => item.jids.length > 1)
+      .map((item) => ({
+        name: this.byJid.get(item.jids[0])?.name || item.key,
+        jids: item.jids
+      }));
+  }
+
+  hasJid(jid) {
+    return this.byJid.has(String(jid || '').trim());
   }
 }
 
@@ -170,6 +245,9 @@ const state = {
   backupScheduler: null,
   confirmStore: new PendingConfirmStore(),
   reactionActions: new ReactionActionStore(),
+  runtimeConfig: null,
+  changedMessages: null,
+  statusSave: null,
   commandAccess: null,
   botState: null,
   anticall: null,
@@ -243,6 +321,11 @@ async function sendText(jid, text) {
   return sendBotMessage(jid, { text });
 }
 
+async function editText(jid, messageKey, text) {
+  if (!messageKey) return sendText(jid, text);
+  return sendBotMessage(jid, { text, edit: messageKey });
+}
+
 async function sendBotMessage(jid, content, options) {
   const sent = await state.sock.sendMessage(jid, content, options);
   rememberOwnOutput(sent);
@@ -305,12 +388,15 @@ const HELP_SECTIONS = [
     title: 'Utility',
     items: [
       { name: 'info', text: '- ,info <nomor> - cek info WhatsApp .' },
-      { name: 'status', text: '- ,status - status ringkas server .' },
+      { name: 'status', text: '- ,status | ,status bot - status server atau status fitur bot .' },
       { name: 'health', text: '- ,health - status teknis bot .' },
       { name: 'won', text: '- ,won | ,won <mac|id> | ,won save <mac> | ,won del <id|mac> - Wake-on-LAN .' },
-      { name: 'backup', text: '- ,backup - kirim zip data/ ke Telegram .' },
+      { name: 'backup', text: '- ,backup - kirim zip data/ ke destination backup WhatsApp .' },
       { name: 'restore', text: '- ,restore - mulai restore zip WhatsApp, finalnya perlu ,confirm .' },
       { name: 'anticall', text: '- ,anticall | ,anticall new|on|off | ,anticall except list|add|del <nomor|id> .' },
+      { name: 'changedmsg', text: '- ,changedmsg list|allow|del <group|id> - kelola grup yang dipantau delete/edit .' },
+      { name: 'statussave', text: '- ,statussave list|add|del <nomor|id> - auto-save status WhatsApp nomor tertentu .' },
+      { name: 'config', text: '- ,config | ,config get|set <key> <value> - lihat/ubah config aman .' },
       { name: 'clear', text: '- ,clear - hapus temp dengan konfirmasi .' },
       { name: 'update', text: '- ,update - git pull dan restart service dengan konfirmasi .' },
       { name: 'restartbot', text: '- ,restartbot - restart aman dengan konfirmasi .' },
@@ -332,7 +418,25 @@ const HELP_SECTIONS = [
   }
 ];
 
-async function handleHelp(jid, context) {
+const HELP_DETAILS = {
+  help: ['Format: ,help [command|prefix]', 'Contoh: ,help s, ,help status.'],
+  status: ['Format: ,status atau ,status bot', ',status menampilkan server ringkas. ,status bot menampilkan destination, scheduler, changedmsg, statussave, dan warning nama grup duplikat.'],
+  topdf: ['Format: ,topdf [split] [nama][,1MB]', 'Kirim/reply media setelah sesi dimulai, lalu ,end atau reaction ✅/👍/❤️. ,topdf split membuat satu PDF per media.'],
+  changedmsg: ['Format: ,changedmsg list|allow|del <id|nama-grup|jid>', 'DM dipantau default. Grup harus di-allow. Nama grup duplikat ditolak; pakai JID agar aman.'],
+  config: ['Format: ,config, ,config get <key>, ,config set <key> <value>', 'Destination key menerima nama grup, JID, atau nomor. Grup disimpan sebagai JID + nama.'],
+  statussave: ['Format: ,statussave list|add|del <nomor|id>', 'Nomor menerima 081..., +62 123-1234-1234, atau +6212312341234. Status teks dan media dikirim ke dest.saved.'],
+  backup: ['Format: ,backup', 'Backup data/ dikirim sebagai dokumen WhatsApp ke dest.backup. Ubah tujuan dengan ,config set dest.backup <group|nomor>.'],
+  bot: ['Format: ,bot, ,bot on, ,bot off', ',bot off mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall.']
+};
+
+async function handleHelp(jid, command, context) {
+  let query = command?.rawArgs?.trim() || '';
+  if (query.startsWith(COMMAND_PREFIX)) query = query.slice(COMMAND_PREFIX.length).trim();
+  query = query.toLowerCase();
+  if (query) {
+    await handleHelpDetail(jid, query, context);
+    return;
+  }
   const lines = [`${BOT_NAME} Help .`];
   for (const section of HELP_SECTIONS) {
     const items = section.items.filter((item) => canShowHelpItem(item.name, jid, context));
@@ -340,6 +444,32 @@ async function handleHelp(jid, context) {
     lines.push('', `${section.title} .`, ...items.map((item) => item.text));
   }
   await sendText(jid, lines.join('\n'));
+}
+
+async function handleHelpDetail(jid, query, context) {
+  const allNames = [...new Set(HELP_SECTIONS.flatMap((section) => section.items.map((item) => item.name)))];
+  const exact = allNames.find((name) => name === query);
+  if (exact) {
+    if (!canShowHelpItem(exact, jid, context)) {
+      await sendText(jid, `Command ${COMMAND_PREFIX}${exact} tidak tersedia untuk akses kamu.`);
+      return;
+    }
+    const brief = HELP_SECTIONS.flatMap((section) => section.items).filter((item) => item.name === exact).map((item) => item.text);
+    const detail = HELP_DETAILS[exact] || brief;
+    await sendText(jid, [`Help ${COMMAND_PREFIX}${exact}:`, ...brief, '', ...detail].join('\n'));
+    return;
+  }
+  const matches = allNames
+    .filter((name) => name.startsWith(query) && canShowHelpItem(name, jid, context))
+    .sort();
+  if (!matches.length) {
+    await sendText(jid, `Tidak ada help yang cocok untuk "${query}".`);
+    return;
+  }
+  await sendText(jid, [
+    `Help cocok untuk "${query}":`,
+    ...matches.map((name) => `- ${COMMAND_PREFIX}${name}`)
+  ].join('\n'));
 }
 
 function canShowHelpItem(commandName, jid, context) {
@@ -366,6 +496,73 @@ async function handleStatus(jid) {
     `Process RAM: RSS ${formatBytes(mem.rss)}, heap ${formatBytes(mem.heapUsed)}/${formatBytes(mem.heapTotal)}`,
     `Time: ${new Date().toLocaleString()}`
   ].join('\n'));
+}
+
+async function handleStatusBot(jid) {
+  const botState = state.botState?.snapshot() || { enabled: true };
+  const access = state.commandAccess?.snapshot() || { all: false, chatCount: 0, adminCount: 0 };
+  const changed = state.changedMessages?.snapshot() || { allowedCount: 0, indexCount: 0 };
+  const statusSave = state.statusSave?.snapshot() || { count: 0 };
+  const changedSettings = state.runtimeConfig?.changedmsgSettings?.() || { enabled: true };
+  const statusSettings = state.runtimeConfig?.statussaveSettings?.() || { enabled: true };
+  const warnings = await botStatusWarnings();
+  await sendText(jid, [
+    `${BOT_NAME} bot status:`,
+    `Bot: ${botState.enabled ? 'on' : 'off'}`,
+    `Public access: all=${Boolean(access.all)}, chats=${access.chatCount || 0}, admins=${access.adminCount || 0}`,
+    `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
+    `Dest logs: ${formatDestinationLine('logs')}`,
+    `Dest changedmsg: ${formatDestinationLine('changedmsg')}`,
+    `Dest saved: ${formatDestinationLine('saved')}`,
+    `Dest backup: ${formatDestinationLine('backup')}`,
+    `Changedmsg: ${changedSettings.enabled ? 'aktif' : 'nonaktif'}, group allowlist=${changed.allowedCount || 0}, index=${changed.indexCount || 0}`,
+    `Statussave: ${statusSettings.enabled ? 'aktif' : 'nonaktif'}, nomor=${statusSave.count || 0}`,
+    warnings.length ? '' : null,
+    warnings.length ? 'Warning:' : null,
+    ...warnings.map((warning) => `- ${warning}`)
+  ].filter((line) => line != null).join('\n'));
+}
+
+async function botStatusWarnings() {
+  const warnings = [];
+  for (const duplicate of state.chatDirectory.groupDuplicates()) {
+    warnings.push(`Nama grup "${duplicate.name}" duplikat: ${duplicate.jids.map(shortJid).join(', ')}`);
+  }
+
+  for (const name of ['logs', 'changedmsg', 'saved', 'backup']) {
+    try {
+      const destination = resolveConfiguredDestination(name);
+      if (destination.jid.endsWith('@g.us') && !state.chatDirectory.hasJid(destination.jid)) {
+        warnings.push(`Destination ${name} belum ada di cache grup: ${shortJid(destination.jid)}`);
+      }
+      const currentName = state.chatDirectory.nameFor(destination.jid);
+      if (currentName && destination.savedName && currentName !== destination.savedName) {
+        warnings.push(`Destination ${name} tersimpan sebagai "${destination.savedName}", nama sekarang "${currentName}".`);
+      }
+    } catch (error) {
+      warnings.push(`Destination ${name} belum valid: ${error.message}`);
+    }
+  }
+
+  const changedSettings = state.runtimeConfig?.changedmsgSettings?.() || { enabled: false };
+  const statusSettings = state.runtimeConfig?.statussaveSettings?.() || { enabled: false };
+  if (changedSettings.enabled) {
+    for (const name of ['logs', 'changedmsg']) {
+      try {
+        resolveConfiguredDestination(name);
+      } catch {
+        warnings.push(`Changedmsg aktif tapi dest.${name} belum valid.`);
+      }
+    }
+  }
+  if (statusSettings.enabled) {
+    try {
+      resolveConfiguredDestination('saved');
+    } catch {
+      warnings.push('Statussave aktif tapi dest.saved belum valid.');
+    }
+  }
+  return [...new Set(warnings)];
 }
 
 function activeSessionType(jid) {
@@ -477,6 +674,97 @@ async function sendReactionList(jid, actorJid, kind, items, options) {
   }
 }
 
+function resolveDestinationInput(input, actorJid = null, options = {}) {
+  const result = state.chatDirectory.resolve(input);
+  if (!result.ok) {
+    if (result.reason === 'ambiguous') {
+      throw new Error([
+        `Nama "${input}" cocok ke lebih dari satu chat. Pakai JID salah satu target:`,
+        ...result.candidates.map((item) => `- ${item.currentName || item.savedName} (${item.jid})`)
+      ].join('\n'));
+    }
+    throw new Error(`Target "${input}" tidak ditemukan di cache chat bot. Kirim pesan di chat target dulu atau pakai JID/nomor.`);
+  }
+  if (options.requireGroup && !result.item.jid.endsWith('@g.us')) {
+    throw new Error('Target harus grup. Pakai nama grup atau JID grup.');
+  }
+  return {
+    jid: result.item.jid,
+    savedName: result.item.currentName || result.item.savedName || input,
+    input: String(input || '').trim(),
+    type: result.item.type,
+    updatedAt: new Date().toISOString(),
+    updatedBy: actorJid || null,
+    addedBy: actorJid || null
+  };
+}
+
+function resolveConfiguredDestination(name) {
+  const value = state.runtimeConfig?.destination(name);
+  if (!value) throw new Error(`Destination ${name} belum diset. Gunakan ,config set dest.${name} <group|nomor>.`);
+  if (typeof value === 'object' && value.jid) return value;
+  return resolveDestinationInput(String(value || name), null);
+}
+
+function destinationJid(name) {
+  return resolveConfiguredDestination(name).jid;
+}
+
+function formatDestinationLine(name) {
+  try {
+    const destination = resolveConfiguredDestination(name);
+    const currentName = state.chatDirectory.nameFor(destination.jid);
+    const renameWarning = currentName && destination.savedName && currentName !== destination.savedName
+      ? `, sekarang "${currentName}"`
+      : '';
+    const knownText = destination.jid.endsWith('@g.us') && !state.chatDirectory.hasJid(destination.jid)
+      ? ', warning: JID belum ada di cache'
+      : '';
+    return `${name}: ${destination.savedName || currentName || destination.jid} (${shortJid(destination.jid)}${renameWarning}${knownText})`;
+  } catch (error) {
+    return `${name}: belum valid (${error.message})`;
+  }
+}
+
+function shortJid(jid) {
+  const text = String(jid || '');
+  if (text.length <= 24) return text;
+  return `${text.slice(0, 13)}...${text.slice(-8)}`;
+}
+
+function formatStoredChatItem(item) {
+  const currentName = state.chatDirectory.nameFor(item.jid);
+  const warnings = [];
+  if (currentName && item.savedName && currentName !== item.savedName) warnings.push(`nama sekarang "${currentName}"`);
+  const duplicate = state.chatDirectory.groupDuplicates()
+    .find((group) => group.jids.some((jid) => sameJid(jid, item.jid)));
+  if (duplicate) warnings.push('nama grup duplikat');
+  return `#${item.id} - ${item.savedName} (${shortJid(item.jid)})${warnings.length ? ` [warning: ${warnings.join(', ')}]` : ''}`;
+}
+
+async function hydrateConfiguredDestinations() {
+  if (!state.runtimeConfig) return;
+  for (const key of ['dest.logs', 'dest.changedmsg', 'dest.saved', 'dest.backup']) {
+    const current = state.runtimeConfig.get(key);
+    if (!current || typeof current !== 'string') continue;
+    const result = state.chatDirectory.resolve(current);
+    if (!result.ok) {
+      await logger.warn('Destination hydration skipped', {
+        key,
+        value: current,
+        reason: result.reason,
+        candidates: result.candidates?.map((item) => item.jid)
+      });
+      continue;
+    }
+    await state.runtimeConfig.setDestination(key, {
+      ...result.item,
+      input: current,
+      updatedBy: 'auto'
+    });
+  }
+}
+
 async function handleHealth(jid) {
   const mem = process.memoryUsage();
   const disk = await getDiskInfo(ROOT_DIR);
@@ -515,8 +803,7 @@ async function handleHealth(jid) {
     `Public command access: all=${Boolean(access.all)}, chats=${access.chatCount || 0}, admins=${access.adminCount || 0}`,
     `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
     `Target ${PRIMARY_TARGET_NAME}: ${targetJid || 'not found'}`,
-    `Telegram client id: ${TELEGRAM_CLIENT_ID ? 'configured' : 'missing'}`,
-    `Telegram part size: ${formatBytes(TELEGRAM_PART_SIZE_BYTES)}`,
+    `Backup part size: ${formatBytes(state.runtimeConfig?.backupPartSizeBytes?.() || 0)}`,
     `Runtime files: ${[TASKS_FILE, NOTES_FILE, LINKS_FILE, REMINDERS_FILE, WOL_FILE, ANTICALL_FILE, BOT_STATE_FILE].map((file) => path.basename(file)).join(', ')}`,
     `Time: ${new Date().toLocaleString()}`
   ].join('\n'));
@@ -666,21 +953,229 @@ async function sendDownloadedMedia(jid, media, options = {}) {
   const buffer = await fs.readFile(media.path);
   const caption = options.caption || media.node?.caption || undefined;
   if (media.type === 'imageMessage') {
-    await state.sock.sendMessage(jid, { image: buffer, mimetype: media.mimetype, caption });
+    return sendBotMessage(jid, { image: buffer, mimetype: media.mimetype, caption });
   } else if (media.type === 'videoMessage') {
-    await state.sock.sendMessage(jid, { video: buffer, mimetype: media.mimetype, caption });
+    return sendBotMessage(jid, { video: buffer, mimetype: media.mimetype, caption });
   } else if (media.type === 'audioMessage') {
-    await state.sock.sendMessage(jid, { audio: buffer, mimetype: media.mimetype });
+    return sendBotMessage(jid, { audio: buffer, mimetype: media.mimetype });
   } else if (media.type === 'stickerMessage') {
-    await state.sock.sendMessage(jid, { sticker: buffer, isAnimated: media.node?.isAnimated || undefined });
+    return sendBotMessage(jid, { sticker: buffer, isAnimated: media.node?.isAnimated || undefined });
   } else {
-    await state.sock.sendMessage(jid, {
+    return sendBotMessage(jid, {
       document: buffer,
       mimetype: media.mimetype || 'application/octet-stream',
       fileName: media.fileName || `view-once-${Date.now()}`,
       caption
     });
   }
+}
+
+async function maybeMirrorChangedMessage(message) {
+  if (!state.runtimeConfig?.changedmsgSettings?.().enabled) return false;
+  if (message.key?.fromMe) return false;
+  const jid = message.key?.remoteJid;
+  if (!state.changedMessages?.shouldWatchChat(jid)) return false;
+  if (isDestinationChat(jid)) return false;
+
+  const logsJid = safeDestinationJid('logs');
+  if (!logsJid) return false;
+  const summary = summarizeMessage(message);
+  const actorJid = messageActorJid(message);
+  const metaText = changedMessageMetaText('LOG', message, {
+    actorJid,
+    type: summary.type,
+    text: summary.text
+  });
+
+  let logContentMessage = null;
+  let media = null;
+  try {
+    await sendText(logsJid, metaText);
+    if (isViewOnceMediaMessage(message)) {
+      media = await downloadMessageMedia(state.sock, message, 'changed-viewonce');
+      if (media) {
+        const stat = await fs.stat(media.path).catch(() => null);
+        const maxBytes = state.runtimeConfig.changedmsgSettings().maxMediaBytes;
+        if (stat?.size && stat.size > maxBytes) {
+          await sendText(logsJid, `Media view-once dilewati karena ${formatBytes(stat.size)} melebihi batas ${formatBytes(maxBytes)}.`);
+        } else {
+          logContentMessage = await sendDownloadedMedia(logsJid, media, { caption: media.node?.caption });
+        }
+      }
+    } else {
+      logContentMessage = await sendBotMessage(logsJid, { forward: message, force: true });
+    }
+  } catch (error) {
+    await logger.warn('Changedmsg mirror failed', { jid, messageId: message.key?.id, error: error.message });
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
+
+  await state.changedMessages.upsertIndex({
+    key: messageIndexKey(message.key),
+    messageKey: message.key,
+    id: message.key?.id,
+    remoteJid: jid,
+    participant: message.key?.participant,
+    actorJid,
+    pushName: message.pushName || '',
+    chatName: state.chatDirectory.nameFor(jid) || (jid?.endsWith('@g.us') ? jid : displayPhoneFromJid(jid)),
+    type: summary.type,
+    text: summary.text,
+    latestText: summary.text,
+    logJid: logsJid,
+    logMessageId: logContentMessage?.key?.id || '',
+    timestamp: summary.timestamp
+  }, state.runtimeConfig.changedmsgSettings().indexMaxItems);
+  return true;
+}
+
+async function handleChangedDelete(messageKey) {
+  if (!state.runtimeConfig?.changedmsgSettings?.().enabled) return;
+  const existing = state.changedMessages.findByKey(messageKey);
+  if (!existing && !state.changedMessages.shouldWatchChat(messageKey?.remoteJid)) return;
+  if (existing?.deletedAt) return;
+  const item = existing ? await state.changedMessages.markDeleted(messageKey) : null;
+  const changedJid = safeDestinationJid('changedmsg');
+  if (!changedJid) return;
+  const lines = [
+    'Pesan dihapus:',
+    ...formatChangedIndexLines(item, messageKey),
+    item?.logMessageId ? `Referensi logs: ${shortJid(item.logJid)} / ${item.logMessageId}` : 'Referensi logs: tidak tersedia'
+  ];
+  await sendText(changedJid, lines.join('\n'));
+}
+
+async function handleChangedEdit(update) {
+  if (!state.runtimeConfig?.changedmsgSettings?.().enabled) return;
+  const edited = update?.update?.message?.editedMessage?.message;
+  if (!edited) return;
+  const fakeMessage = {
+    key: update.key,
+    message: edited,
+    messageTimestamp: update.update?.messageTimestamp
+  };
+  const summary = summarizeMessage(fakeMessage);
+  const old = state.changedMessages.findByKey(update.key);
+  if (!old && !state.changedMessages.shouldWatchChat(update.key?.remoteJid)) return;
+  const beforeText = old?.latestText || old?.text || '';
+  const item = await state.changedMessages.markEdited(update.key, {
+    latestText: summary.text,
+    type: summary.type
+  });
+  const changedJid = safeDestinationJid('changedmsg');
+  if (!changedJid) return;
+  const lines = [
+    'Pesan diedit:',
+    ...formatChangedIndexLines(item || old, update.key),
+    '',
+    'Sebelum:',
+    beforeText || '(tidak tersedia)',
+    '',
+    'Sesudah:',
+    summary.text || '(tidak tersedia)'
+  ];
+  await sendText(changedJid, lines.join('\n'));
+}
+
+function formatChangedIndexLines(item, messageKey) {
+  if (!item) {
+    return [
+      `Chat: ${messageKey?.remoteJid || '-'}`,
+      `Message ID: ${messageKey?.id || '-'}`,
+      'Detail lama: tidak ada di index, kemungkinan pesan terjadi sebelum fitur aktif/restart/index terotasi.'
+    ];
+  }
+  return [
+    `Chat: ${item.chatName || item.remoteJid || '-'}`,
+    `Chat JID: ${item.remoteJid || '-'}`,
+    `Pengirim: ${item.pushName || displayPhoneFromJid(item.actorJid) || '-'}`,
+    `Pengirim JID: ${item.actorJid || item.participant || '-'}`,
+    `Waktu: ${new Date(item.timestamp || Date.now()).toLocaleString()}`,
+    `Tipe: ${item.type || 'unknown'}`,
+    `Message ID: ${item.id || '-'}`
+  ];
+}
+
+function changedMessageMetaText(label, message, extra = {}) {
+  const jid = message.key?.remoteJid || '';
+  const actorJid = extra.actorJid || messageActorJid(message);
+  const lines = [
+    `[${label}] ${BOT_NAME}`,
+    `Chat: ${state.chatDirectory.nameFor(jid) || jid}`,
+    `Chat JID: ${jid}`,
+    `Pengirim: ${message.pushName || displayPhoneFromJid(actorJid) || '-'}`,
+    `Pengirim JID: ${actorJid}`,
+    `Waktu: ${new Date(timestampMs(message)).toLocaleString()}`,
+    `Tipe: ${extra.type || messageTypeName(message)}`,
+    `Message ID: ${message.key?.id || '-'}`
+  ];
+  if (extra.text) lines.push('', truncateText(extra.text, 700));
+  return lines.join('\n');
+}
+
+async function maybeSaveStatusMessage(message) {
+  if (message.key?.remoteJid !== 'status@broadcast') return false;
+  if (!state.runtimeConfig?.statussaveSettings?.().enabled) return true;
+  const actorJid = statusAuthorJid(message);
+  if (!state.statusSave?.isWatched(actorJid)) return true;
+  const savedJid = safeDestinationJid('saved');
+  if (!savedJid) return true;
+  const summary = summarizeMessage(message);
+  const caption = [
+    'Status WhatsApp tersimpan:',
+    `Nomor: ${displayPhoneFromJid(actorJid)}`,
+    `JID: ${actorJid}`,
+    `Waktu: ${new Date(summary.timestamp).toLocaleString()}`,
+    `Tipe: ${summary.type}`,
+    summary.text ? `Teks: ${summary.text}` : null
+  ].filter(Boolean).join('\n');
+
+  let media = null;
+  try {
+    if (mediaNode(message)) {
+      media = await downloadMessageMedia(state.sock, message, 'status-save');
+      const stat = await fs.stat(media.path).catch(() => null);
+      const maxBytes = state.runtimeConfig.statussaveSettings().maxMediaBytes;
+      if (stat?.size && stat.size > maxBytes) {
+        await sendText(savedJid, `${caption}\n\nMedia dilewati karena ${formatBytes(stat.size)} melebihi batas ${formatBytes(maxBytes)}.`);
+      } else {
+        await sendDownloadedMedia(savedJid, media, { caption });
+      }
+    } else {
+      await sendText(savedJid, caption);
+    }
+  } catch (error) {
+    await logger.warn('Status save failed', { actorJid, error: error.message });
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
+  return true;
+}
+
+function statusAuthorJid(message) {
+  const raw = message.key?.participant || message.participant || message.key?.remoteJid || '';
+  return raw ? jidNormalizedUser(raw) : '';
+}
+
+function safeDestinationJid(name) {
+  try {
+    return destinationJid(name);
+  } catch (error) {
+    logger.warn('Destination unavailable', { name, error: error.message });
+    return null;
+  }
+}
+
+function isDestinationChat(jid) {
+  for (const name of ['logs', 'changedmsg', 'saved', 'backup']) {
+    try {
+      if (sameJid(jid, destinationJid(name))) return true;
+    } catch {
+      // Destination may not be resolvable yet; ignore here.
+    }
+  }
+  return false;
 }
 
 async function handleYoutube(message, command, actorJid = messageActorJid(message)) {
@@ -861,16 +1356,57 @@ async function handleTopdf(message, command, actorJid) {
   const hasInitialMedia = mediaNode(message) || quotedMediaNode(message);
   if (hasInitialMedia) {
     const item = await state.pdfSessions.addAny(state.sock, message, null);
-    const sent = item?.skipped
-      ? await sendText(jid, `Sesi PDF "${session.fileName}" dimulai, tapi file pertama dilewati: ${item.fileName} - ${item.reason}\nKirim media lain lalu ketik ,end atau ,cancel.`)
-      : await sendText(jid, `Sesi PDF "${session.fileName}" dimulai dan file pertama ditambahkan: ${item.fileName} (#${item.order}). Kirim media lain lalu ketik ,end.`);
+    const sent = await updatePdfProgressMessage(jid, session, item);
     registerSessionPrompt(sent.key, jid, actorJid);
     return;
   }
-  const sizeText = session.maxSizeBytes ? ` Maksimal ukuran: ${formatBytes(session.maxSizeBytes)}.` : '';
-  const splitText = session.split ? ' Mode split aktif: setiap media akan dikirim sebagai PDF terpisah.' : '';
-  const sent = await sendText(jid, `Sesi PDF "${session.fileName}" dimulai.${sizeText}${splitText} Kirim/reply media atau dokumen. Caption/teks angka dipakai sebagai urutan halaman. Ketik ,end untuk selesai atau ,cancel untuk batal.`);
+  const sent = await updatePdfProgressMessage(jid, session, null);
   registerSessionPrompt(sent.key, jid, actorJid);
+}
+
+async function updatePdfProgressMessage(jid, session, latestItem = null) {
+  if (!session) return sendText(jid, 'Sesi PDF tidak ditemukan.');
+  if (latestItem?.skipped) {
+    session.skippedItems = [...(session.skippedItems || []), latestItem].slice(-10);
+  }
+  session.latestItem = latestItem || session.latestItem || null;
+  const text = formatPdfProgressMessage(session);
+  if (session.progressKey) {
+    await editText(jid, session.progressKey, text);
+    return { key: session.progressKey };
+  }
+  const sent = await sendText(jid, text);
+  session.progressKey = sent.key;
+  return sent;
+}
+
+function formatPdfProgressMessage(session) {
+  const lines = [
+    `Sesi PDF "${session.fileName}" ${session.split ? '(split)' : ''}`.trim()
+  ];
+  if (session.maxSizeBytes) lines.push(`Maksimal ukuran: ${formatBytes(session.maxSizeBytes)}.`);
+  if (session.split) lines.push('Mode split: setiap media akan dibuat menjadi PDF terpisah.');
+  if (session.latestItem) {
+    lines.push(
+      session.latestItem.skipped
+        ? `Terbaru dilewati: ${session.latestItem.fileName} - ${session.latestItem.reason}`
+        : `Terbaru ditambahkan: ${session.latestItem.fileName} (#${session.latestItem.order})`
+    );
+  }
+  lines.push(`Total ditambahkan: ${session.files.length}`);
+  if (session.files.length) {
+    lines.push('', 'File:');
+    for (const item of [...session.files].sort((a, b) => a.order - b.order || a.addedAt - b.addedAt)) {
+      lines.push(`${item.order}. ${item.fileName}`);
+    }
+  }
+  if (session.skippedItems?.length) {
+    lines.push('', 'Dilewati:');
+    for (const item of session.skippedItems) lines.push(`- ${item.fileName}: ${item.reason}`);
+  }
+  lines.push('', 'Kirim/reply media atau dokumen. Caption/teks angka dipakai sebagai urutan halaman.');
+  lines.push('Selesai: ,end atau reaction ✅/👍/❤️. Batal: ,cancel atau reaction ❌/👎/❎.');
+  return lines.join('\n');
 }
 
 async function handleEndPdf(message, actorJid = messageActorJid(message)) {
@@ -1213,11 +1749,7 @@ async function maybeCollectPdfItem(message, text) {
   if (!mediaNode(message) && !quotedMediaNode(message)) return false;
   const order = parsePdfOrderText(text);
   const item = await state.pdfSessions.addAny(state.sock, message, order);
-  if (item?.skipped) {
-    await sendText(message.key.remoteJid, `Dilewati untuk PDF: ${item.fileName} - ${item.reason}`);
-    return true;
-  }
-  if (item) await sendText(message.key.remoteJid, `Ditambahkan ke PDF: ${item.fileName} (#${item.order})`);
+  if (item) await updatePdfProgressMessage(message.key.remoteJid, state.pdfSessions.get(message.key.remoteJid), item);
   return Boolean(item);
 }
 
@@ -1233,9 +1765,12 @@ async function handleClear(jid) {
 }
 
 async function handleBackup(jid) {
-  await sendText(jid, 'Membuat backup data/ dan mengirim ke Telegram...');
-  const files = await sendDataBackupToTelegram();
-  await sendText(jid, `Backup terkirim ke Telegram:\n${files.join('\n')}`);
+  await sendText(jid, 'Membuat backup data/ dan mengirim ke destination backup WhatsApp...');
+  const destination = destinationJid('backup');
+  const files = await sendDataBackupToWhatsApp(botSender(), destination, {
+    partSizeBytes: state.runtimeConfig.backupPartSizeBytes()
+  });
+  await sendText(jid, `Backup terkirim ke ${formatDestinationLine('backup')}:\n${files.join('\n')}`);
 }
 
 async function handleLog(jid, command) {
@@ -1457,6 +1992,137 @@ async function sendAdminList(jid, actorJid) {
   });
 }
 
+async function handleConfigCommand(message, command, context) {
+  if (!context.isOwner) throw new Error('Command ,config hanya bisa dipakai nomor yang terhubung ke session bot.');
+  const jid = message.key.remoteJid;
+  const action = (command.args[0] || '').toLowerCase();
+  if (!action) {
+    const lines = ['Config yang bisa diubah:'];
+    for (const item of configKeyList()) {
+      lines.push(`- ${item.key}: ${item.label} = ${formatConfigValue(state.runtimeConfig.get(item.key))}`);
+    }
+    lines.push('', 'Format: ,config get <key> atau ,config set <key> <value>');
+    await sendText(jid, lines.join('\n'));
+    return;
+  }
+  if (action === 'get') {
+    const key = command.args[1];
+    if (!key) throw new Error('Format: ,config get <key>');
+    await sendText(jid, `${key} = ${formatConfigValue(state.runtimeConfig.get(key))}`);
+    return;
+  }
+  if (action === 'set') {
+    const key = command.args[1];
+    const value = command.args.slice(2).join(' ').trim();
+    if (!key || !value) throw new Error('Format: ,config set <key> <value>');
+    const def = configKeyList().find((item) => item.key === key);
+    if (!def) throw new Error(`Config "${key}" tidak bisa diubah. Ketik ,config untuk daftar key.`);
+    let saved;
+    if (def.type === 'destination') {
+      saved = await state.runtimeConfig.setDestination(key, resolveDestinationInput(value, context.actorJid));
+    } else {
+      saved = await state.runtimeConfig.set(key, value);
+    }
+    if (key.startsWith('backup.')) applyBotRuntimeState();
+    await sendText(jid, `Config ${key} disimpan: ${formatConfigValue(saved)}`);
+    return;
+  }
+  throw new Error('Format: ,config [get|set] <key> <value>');
+}
+
+async function handleChangedMsgCommand(message, command, context) {
+  if (!context.isOwner) throw new Error('Command ,changedmsg hanya bisa dipakai nomor yang terhubung ke session bot.');
+  const jid = message.key.remoteJid;
+  const action = (command.args[0] || 'list').toLowerCase();
+  if (action === 'list') {
+    await sendChangedMsgAllowList(jid, context.actorJid);
+    return;
+  }
+  if (action === 'allow' || action === 'add') {
+    const input = command.args.slice(1).join(' ').trim();
+    if (!input) throw new Error('Format: ,changedmsg allow <nama-grup|jid>');
+    const destination = resolveDestinationInput(input, context.actorJid, { requireGroup: true });
+    const item = await state.changedMessages.addAllowed(destination);
+    invalidateListKind('changedmsg-allow');
+    await sendText(jid, `Changedmsg allowlist #${item.id} ditambahkan: ${item.savedName} (${shortJid(item.jid)}).`);
+    return;
+  }
+  if (action === 'del' || action === 'delete') {
+    const query = command.args.slice(1).join(' ').trim();
+    if (!query) throw new Error('Format: ,changedmsg del <id|nama-grup|jid>');
+    await requestConfirmation(jid, context.actorJid, {
+      title: `Hapus allowlist changedmsg "${query}"`,
+      description: 'Grup ini tidak lagi dipantau untuk logs/changedmsg.',
+      execute: async () => {
+        const item = await state.changedMessages.deleteAllowed(query);
+        invalidateListKind('changedmsg-allow');
+        await sendText(jid, `Changedmsg allowlist #${item.id} ${item.savedName} dihapus.`);
+      }
+    });
+    return;
+  }
+  throw new Error('Format: ,changedmsg list|allow|del <group|id>');
+}
+
+async function sendChangedMsgAllowList(jid, actorJid) {
+  await sendReactionList(jid, actorJid, 'changedmsg-allow', state.changedMessages.listAllowed(), {
+    emptyText: 'Belum ada grup allowlist changedmsg. Direct message tetap dipantau default.',
+    formatItem: (item) => formatStoredChatItem(item),
+    deleteTitle: (item) => `Hapus changedmsg allowlist #${item.id}`,
+    deleteDescription: 'Grup ini tidak lagi dipantau untuk logs/changedmsg.',
+    deleteItem: async (item) => {
+      const deleted = await state.changedMessages.deleteAllowed(item.id);
+      return `Changedmsg allowlist #${deleted.id} ${deleted.savedName} dihapus.`;
+    }
+  });
+}
+
+async function handleStatusSaveCommand(message, command, context) {
+  if (!context.isOwner) throw new Error('Command ,statussave hanya bisa dipakai nomor yang terhubung ke session bot.');
+  const jid = message.key.remoteJid;
+  const action = (command.args[0] || 'list').toLowerCase();
+  if (action === 'list') {
+    await sendStatusSaveList(jid, context.actorJid);
+    return;
+  }
+  if (action === 'add') {
+    const input = command.args.slice(1).join(' ').trim();
+    if (!input) throw new Error('Format: ,statussave add <nomor>');
+    const item = await state.statusSave.add(input, context.actorJid);
+    invalidateListKind('statussave');
+    await sendText(jid, `Statussave #${item.id} ${item.title} ditambahkan.`);
+    return;
+  }
+  if (action === 'del' || action === 'delete') {
+    const query = command.args.slice(1).join(' ').trim();
+    if (!query) throw new Error('Format: ,statussave del <nomor|id>');
+    await requestConfirmation(jid, context.actorJid, {
+      title: `Hapus statussave "${query}"`,
+      description: 'Status WhatsApp dari nomor ini tidak lagi disimpan otomatis.',
+      execute: async () => {
+        const item = await state.statusSave.delete(query);
+        invalidateListKind('statussave');
+        await sendText(jid, `Statussave #${item.id} ${item.title} dihapus.`);
+      }
+    });
+    return;
+  }
+  throw new Error('Format: ,statussave list|add|del <nomor|id>');
+}
+
+async function sendStatusSaveList(jid, actorJid) {
+  await sendReactionList(jid, actorJid, 'statussave', state.statusSave.list(), {
+    emptyText: 'Belum ada nomor statussave.',
+    formatItem: (item) => `#${item.id} - ${item.title} (${shortJid(item.jid)})`,
+    deleteTitle: (item) => `Hapus statussave #${item.id}`,
+    deleteDescription: 'Status WhatsApp dari nomor ini tidak lagi disimpan otomatis.',
+    deleteItem: async (item) => {
+      const deleted = await state.statusSave.delete(item.id);
+      return `Statussave #${deleted.id} ${deleted.title} dihapus.`;
+    }
+  });
+}
+
 async function handleRestoreStart(message, actorJid) {
   const jid = message.key.remoteJid;
   assertNoActiveSession(jid);
@@ -1567,10 +2233,11 @@ async function handleCommand(message, command, context = commandContext(message)
   const jid = message.key.remoteJid;
   switch (command.name) {
     case 'help':
-      await handleHelp(jid, context);
+      await handleHelp(jid, command, context);
       break;
     case 'status':
-      await handleStatus(jid);
+      if ((command.args[0] || '').toLowerCase() === 'bot') await handleStatusBot(jid);
+      else await handleStatus(jid);
       break;
     case 'health':
       await handleHealth(jid);
@@ -1692,6 +2359,15 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'button':
       await handleButton(message, command);
       break;
+    case 'config':
+      await handleConfigCommand(message, command, context);
+      break;
+    case 'changedmsg':
+      await handleChangedMsgCommand(message, command, context);
+      break;
+    case 'statussave':
+      await handleStatusSaveCommand(message, command, context);
+      break;
     case 'restore':
       await handleRestoreStart(message, context.actorJid);
       break;
@@ -1736,7 +2412,11 @@ async function handleCommand(message, command, context = commandContext(message)
 
 async function onMessageUpsert(event) {
   for (const message of event.messages || []) {
-    if (!message.message || !message.key?.remoteJid || message.key.remoteJid === 'status@broadcast') continue;
+    if (!message.message || !message.key?.remoteJid) continue;
+    if (message.key.remoteJid === 'status@broadcast') {
+      if (isBotEnabled()) await maybeSaveStatusMessage(message);
+      continue;
+    }
     const jid = message.key.remoteJid;
     const isOwner = Boolean(message.key?.fromMe);
     if (isOwner && isIgnoredOwnOutput(message)) continue;
@@ -1751,6 +2431,7 @@ async function onMessageUpsert(event) {
 
       rememberMessageDirectory(message);
       state.viewOnceCache.remember(message);
+      if (!message.message?.protocolMessage) await maybeMirrorChangedMessage(message);
 
       const sessionActive = activeSessionType(jid);
       const sessionActorMatches = activeSessionActorMatches(jid, context.actorJid);
@@ -1787,6 +2468,40 @@ async function onMessageUpsert(event) {
       await logger.error('Command error', { jid, error: error.message, text });
       await sendText(jid, `Error: ${error.message}`);
     }
+  }
+}
+
+async function onMessagesUpdate(updates) {
+  if (!isBotEnabled()) return;
+  for (const update of updates || []) {
+    try {
+      if (update?.update?.message?.editedMessage?.message) {
+        await handleChangedEdit(update);
+        continue;
+      }
+      if (update?.update?.messageStubType === WAMessageStubType.REVOKE || update?.update?.message === null) {
+        await handleChangedDelete(update.key);
+      }
+    } catch (error) {
+      await logger.error('Changed message update error', {
+        jid: update?.key?.remoteJid,
+        id: update?.key?.id,
+        error: error.message
+      });
+    }
+  }
+}
+
+async function onMessagesDelete(update) {
+  if (!isBotEnabled()) return;
+  try {
+    if (update?.all) {
+      await logger.info('Messages delete all event ignored', { jid: update.jid });
+      return;
+    }
+    for (const key of update?.keys || []) await handleChangedDelete(key);
+  } catch (error) {
+    await logger.error('Messages delete error', { error: error.message });
   }
 }
 
@@ -1899,6 +2614,8 @@ async function connect() {
 
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('messages.upsert', onMessageUpsert);
+  sock.ev.on('messages.update', onMessagesUpdate);
+  sock.ev.on('messages.delete', onMessagesDelete);
   sock.ev.on('messages.reaction', onMessagesReaction);
   sock.ev.on('call', onCallUpdate);
   sock.ev.on('chats.upsert', (chats) => {
@@ -1919,11 +2636,13 @@ async function connect() {
       console.log('WhatsApp connected.');
       await logger.info('WhatsApp connected');
       await loadGroups(sock);
+      await hydrateConfiguredDestinations();
       applyBotRuntimeState();
     }
     if (connection === 'close') {
       state.scheduler?.stop();
       state.reminderScheduler?.stop();
+      state.backupScheduler?.stop();
       await logger.warn('Connection closed', { error: lastDisconnect?.error?.message });
       if (shouldReconnect(lastDisconnect) && !state.reconnecting) {
         state.reconnecting = true;
@@ -1946,13 +2665,28 @@ async function main() {
   await state.commandAccess.load();
   state.botState = new BotStateStore();
   await state.botState.load();
+  state.runtimeConfig = new RuntimeConfigStore();
+  await state.runtimeConfig.load();
+  state.changedMessages = new ChangedMessageStore();
+  await state.changedMessages.load();
+  state.statusSave = new StatusSaveStore();
+  await state.statusSave.load();
   state.tools = await detectTools();
   state.pdfSessions = new PdfSessions(state.tools);
   state.restoreSessions = new RestoreSessions();
   state.saveRecorder = new SaveRecorder();
   state.anticall = new AnticallStore();
   await state.anticall.load();
-  state.backupScheduler = new DailyBackupScheduler(logger);
+  state.backupScheduler = new DailyBackupScheduler(
+    logger,
+    async () => sendDataBackupToWhatsApp(botSender(), destinationJid('backup'), {
+      partSizeBytes: state.runtimeConfig.backupPartSizeBytes()
+    }),
+    {
+      shouldRun: () => state.runtimeConfig.isBackupAutoDaily(),
+      dailyTimeWib: () => state.runtimeConfig.dailyBackupTimeWib()
+    }
+  );
   if (isBotEnabled()) state.backupScheduler.start();
   await logger.info('Detected tools', state.tools);
   console.log('Tool check:', {

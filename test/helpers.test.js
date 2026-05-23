@@ -29,6 +29,9 @@ import {
 } from '../src/sticker.js';
 import { detectTools } from '../src/tools.js';
 import { AnticallStore, formatAnticallStatus } from '../src/anticall.js';
+import { RuntimeConfigStore } from '../src/runtimeConfig.js';
+import { ChangedMessageStore, messageIndexKey } from '../src/changedMessages.js';
+import { StatusSaveStore } from '../src/statusSave.js';
 
 test('parseDurationMs supports compact countdown formats', () => {
   assert.equal(parseDurationMs('10s'), 10_000);
@@ -318,6 +321,90 @@ test('CommandAccessStore gates public commands', async () => {
     await store.setAll(false);
     assert.equal(store.canUse('s', 'chat-a'), false);
     assert.equal(store.snapshot().chatCount, 0);
+  } finally {
+    await fs.rm(file, { force: true });
+  }
+});
+
+test('RuntimeConfigStore validates safe keys and destination objects', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const file = path.join(tempRoot, `runtime-config-${Date.now()}.json`);
+  const store = new RuntimeConfigStore(file);
+  try {
+    await store.load();
+    await store.set('backup.autoDaily', 'off');
+    assert.equal(store.get('backup.autoDaily'), false);
+    await store.set('backup.dailyTimeWib', '7:05');
+    assert.equal(store.get('backup.dailyTimeWib'), '07:05');
+    const destination = await store.setDestination('dest.changedmsg', {
+      jid: '120363123456@g.us',
+      savedName: 'changedmsg',
+      input: 'changedmsg'
+    });
+    assert.equal(destination.jid, '120363123456@g.us');
+    assert.match(String(store.backupPartSizeBytes()), /^\d+$/);
+    await assert.rejects(() => store.set('update.branch', 'dev'), /tidak bisa diubah/);
+  } finally {
+    await fs.rm(file, { force: true });
+  }
+});
+
+test('ChangedMessageStore stores group JID allowlist and reloads small index', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const file = path.join(tempRoot, `changed-${Date.now()}.json`);
+  const store = new ChangedMessageStore(file);
+  try {
+    await store.load();
+    const allowed = await store.addAllowed({
+      jid: '120363123456@g.us',
+      savedName: 'logs dev',
+      addedBy: '6281@s.whatsapp.net'
+    });
+    assert.equal(allowed.jid, '120363123456@g.us');
+    assert.equal(store.isAllowedGroup('120363123456@g.us'), true);
+    const key = { remoteJid: '6282@s.whatsapp.net', id: 'ABC' };
+    await store.upsertIndex({
+      key: messageIndexKey(key),
+      messageKey: key,
+      id: 'ABC',
+      remoteJid: key.remoteJid,
+      actorJid: key.remoteJid,
+      type: 'conversation',
+      text: 'lama',
+      latestText: 'lama',
+      logJid: '120363logs@g.us',
+      logMessageId: 'LOG1'
+    }, 10);
+
+    const reloaded = new ChangedMessageStore(file);
+    await reloaded.load();
+    assert.equal(reloaded.findByKey(key).latestText, 'lama');
+    await reloaded.markEdited(key, { latestText: 'baru' });
+    assert.equal(reloaded.findByKey(key).latestText, 'baru');
+    await reloaded.markDeleted(key);
+    assert.ok(reloaded.findByKey(key).deletedAt);
+    assert.equal(JSON.stringify(reloaded.snapshot()).includes('buffer'), false);
+  } finally {
+    await fs.rm(file, { force: true });
+  }
+});
+
+test('StatusSaveStore normalizes watched status numbers and renumbers delete', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const file = path.join(tempRoot, `status-save-${Date.now()}.json`);
+  const store = new StatusSaveStore(file);
+  try {
+    await store.load();
+    const first = await store.add('08123431212');
+    assert.equal(first.jid, '628123431212@s.whatsapp.net');
+    await store.add('+62 123-1234-1234');
+    assert.equal(store.isWatched('6212312341234@s.whatsapp.net'), true);
+    const deleted = await store.delete('1');
+    assert.equal(deleted.id, 1);
+    assert.deepEqual(store.list().map((item) => [item.id, item.title]), [[1, '6212312341234']]);
   } finally {
     await fs.rm(file, { force: true });
   }

@@ -1,46 +1,53 @@
 import {
   AUTO_DAILY_BACKUP,
+  BACKUP_PART_SIZE_BYTES,
   DAILY_BACKUP_TIME_WIB,
-  DATA_DIR,
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CLIENT_ID,
-  TELEGRAM_PART_SIZE_BYTES
+  DATA_DIR
 } from './config.js';
 import { splitBuffer, zipDirectory } from './zip.js';
 
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000;
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
-export async function sendDataBackupToTelegram() {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CLIENT_ID) {
-    throw new Error('Backup butuh TELEGRAM_BOT_TOKEN dan TELEGRAM_CLIENT_ID di .env.');
-  }
-
+export async function createDataBackupFiles(partSizeBytes = BACKUP_PART_SIZE_BYTES) {
   const stamp = backupStamp();
   const zipBuffer = await zipDirectory(DATA_DIR);
-  const parts = splitBuffer(zipBuffer, TELEGRAM_PART_SIZE_BYTES);
-  const files = parts.map((part, index) => ({
+  const safePartSize = Math.max(1024 * 1024, Math.floor(Number(partSizeBytes) || BACKUP_PART_SIZE_BYTES));
+  const parts = splitBuffer(zipBuffer, safePartSize);
+  return parts.map((part, index) => ({
     buffer: part,
     fileName: parts.length === 1 ? `BACKUP-${stamp}.zip` : `PART${index + 1}-${stamp}.zip`
   }));
+}
 
+export async function sendDataBackupToWhatsApp(sender, destinationJid, options = {}) {
+  if (!sender?.sendMessage) throw new Error('Socket WhatsApp belum siap untuk backup.');
+  if (!destinationJid) throw new Error('Destination backup belum diset. Gunakan ,config set dest.backup <group|nomor>.');
+  const files = await createDataBackupFiles(options.partSizeBytes);
   for (const file of files) {
-    await sendTelegramDocument(file.buffer, file.fileName);
+    await sender.sendMessage(destinationJid, {
+      document: file.buffer,
+      mimetype: 'application/zip',
+      fileName: file.fileName,
+      caption: `IrOBot data backup: ${file.fileName}`
+    });
   }
-
   return files.map((file) => file.fileName);
 }
 
 export class DailyBackupScheduler {
-  constructor(appLogger) {
+  constructor(appLogger, runBackup = null, options = {}) {
     this.logger = appLogger;
+    this.runBackup = runBackup;
+    this.shouldRun = options.shouldRun || (() => AUTO_DAILY_BACKUP);
+    this.dailyTimeWib = options.dailyTimeWib || (() => DAILY_BACKUP_TIME_WIB);
     this.timer = null;
     this.running = false;
   }
 
   start() {
     this.stop();
-    if (!AUTO_DAILY_BACKUP) return;
+    if (!this.shouldRun()) return;
     this.scheduleNext();
   }
 
@@ -54,7 +61,7 @@ export class DailyBackupScheduler {
   }
 
   scheduleNext(now = new Date()) {
-    const next = nextDailyBackupAt(DAILY_BACKUP_TIME_WIB, now);
+    const next = nextDailyBackupAt(this.dailyTimeWib(), now);
     const delay = Math.min(Math.max(1000, next.getTime() - now.getTime()), MAX_TIMEOUT_MS);
     this.timer = setTimeout(() => this.run().catch((error) => {
       this.logger?.error?.('Daily backup scheduler error', { error: error.message });
@@ -66,7 +73,8 @@ export class DailyBackupScheduler {
     if (this.running) return;
     this.running = true;
     try {
-      const files = await sendDataBackupToTelegram();
+      if (!this.runBackup) throw new Error('Backup runner belum diset.');
+      const files = await this.runBackup();
       await this.logger?.info?.('Daily backup sent', { files });
     } catch (error) {
       await this.logger?.error?.('Daily backup failed', { error: error.message });
@@ -87,22 +95,6 @@ export function nextDailyBackupAt(timeWib = '00:00', now = new Date()) {
   let next = wibDateToUtc(parts.year, parts.month, parts.day, safeHour, safeMinute, 0);
   if (next <= now) next = wibDateToUtc(parts.year, parts.month, parts.day + 1, safeHour, safeMinute, 0);
   return next;
-}
-
-async function sendTelegramDocument(buffer, fileName) {
-  const form = new FormData();
-  form.append('chat_id', TELEGRAM_CLIENT_ID);
-  form.append('document', new Blob([buffer], { type: 'application/zip' }), fileName);
-  form.append('caption', `IrOBot data backup: ${fileName}`);
-
-  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`, {
-    method: 'POST',
-    body: form
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`Telegram backup gagal: HTTP ${response.status}${body ? ` - ${body.slice(0, 300)}` : ''}`);
-  }
 }
 
 function backupStamp(date = new Date()) {
