@@ -6,7 +6,19 @@ import { renumberCollection } from './namedStore.js';
 
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000;
 const TIME_NUMBER = /^\d{1,2}$/;
+const HH_MM = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/;
 const FULL_DATE = /^\d{1,2}\/\d{1,2}\/\d{4}$/;
+const TASK_FORMAT = [
+  'Format task:',
+  ',task list',
+  ',task add <teks> at <HH:MM>',
+  ',task add <teks> at <HH:MM> <DD/MM/YYYY>',
+  ',task loop <teks> at <HH:MM>',
+  ',task repeat <jumlah> <teks> at <HH:MM>',
+  ',task pause <id>',
+  ',task resume <id>',
+  ',task del <id>'
+].join('\n');
 
 function emptyStore() {
   return { nextId: 1, tasks: [] };
@@ -100,8 +112,51 @@ export function formatWib(iso) {
 }
 
 export function parseTaskArgs(args) {
+  const first = String(args[0] || '').toLowerCase();
+  if (['add', 'loop', 'repeat'].includes(first)) return parseNaturalTaskArgs(args);
+  return parseLegacyTaskArgs(args);
+}
+
+function parseNaturalTaskArgs(args) {
+  const action = String(args[0] || '').toLowerCase();
+  let loop = action === 'loop';
+  let count = 1;
+  let startIndex = 1;
+
+  if (action === 'repeat') {
+    count = Number(args[1]);
+    if (!Number.isInteger(count) || count < 1) throw new Error(TASK_FORMAT);
+    startIndex = 2;
+  }
+
+  const atIndex = args.findIndex((arg, index) => index >= startIndex && String(arg).toLowerCase() === 'at');
+  if (atIndex < 0) throw new Error(TASK_FORMAT);
+
+  const text = args.slice(startIndex, atIndex).join(' ').trim();
+  const timeToken = args[atIndex + 1];
+  const dateToken = args[atIndex + 2] || null;
+  if (!text || !timeToken || args.length > atIndex + 3) throw new Error(TASK_FORMAT);
+  if (dateToken && !FULL_DATE.test(dateToken)) throw new Error('Tanggal harus DD/MM/YYYY. Contoh: 12/12/2026.');
+
+  const time = parseClockToken(timeToken);
+  return { loop, count: loop ? null : count, text, ...time, dateToken };
+}
+
+function parseClockToken(token) {
+  const match = String(token || '').match(HH_MM);
+  if (!match) throw new Error('Format jam harus HH:MM. Contoh: ,task add "cek bot" at 20:30');
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const second = match[3] == null ? 0 : Number(match[3]);
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) throw new Error('Jam harus 00-23.');
+  if (!Number.isInteger(minute) || minute < 0 || minute > 59) throw new Error('Menit harus 00-59.');
+  if (!Number.isInteger(second) || second < 0 || second > 59) throw new Error('Detik harus 00-59.');
+  return { hour, minute, second };
+}
+
+function parseLegacyTaskArgs(args) {
   if (args.length < 2) {
-    throw new Error('Format: ,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal]');
+    throw new Error(TASK_FORMAT);
   }
   let startIndex = 0;
   let loop = false;
@@ -130,11 +185,11 @@ export function parseTaskArgs(args) {
   }
   if (!dateToken && numbers.length >= 4) dateToken = String(numbers.pop());
   if (numbers.length < 1 || numbers.length > 3) {
-    throw new Error('Format waktu: <jam> [menit] [detik]. Contoh: ,task "test" 12 49 02 07/12/2026');
+    throw new Error(`${TASK_FORMAT}\n\nLegacy: ,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal]`);
   }
 
   const [hour, minute = 0, second = 0] = numbers;
-  if (!Number.isInteger(hour) || hour < 1 || hour > 24) throw new Error('Jam harus 1-24.');
+  if (!Number.isInteger(hour) || hour < 0 || hour > 24) throw new Error('Jam harus 00-23, atau 24 untuk format legacy.');
   if (!Number.isInteger(minute) || minute < 0 || minute > 59) throw new Error('Menit harus 0-59.');
   if (!Number.isInteger(second) || second < 0 || second > 59) throw new Error('Detik harus 0-59.');
 
@@ -197,9 +252,9 @@ export async function updateTaskState(action, id) {
     if (task.media?.path) await cleanupFiles([task.media.path]);
     return { deleted: true, task };
   }
-  if (action === 'true') task.paused = false;
-  else if (action === 'false') task.paused = true;
-  else throw new Error('Aksi ltask harus true, false, atau del.');
+  if (action === 'resume' || action === 'true') task.paused = false;
+  else if (action === 'pause' || action === 'false') task.paused = true;
+  else throw new Error('Format: ,task pause|resume|del <id>. Legacy ,ltask true|false|del <id> tetap didukung.');
   await writeStore(store);
   return { deleted: false, task };
 }

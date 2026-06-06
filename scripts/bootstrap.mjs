@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import readline from 'node:readline/promises';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -30,10 +31,11 @@ const args = new Set(process.argv.slice(2));
 const prepareOnly = args.has('--prepare-only');
 const withTools = args.has('--with-tools');
 const skipNpm = args.has('--skip-npm') || prepareOnly;
+const skipService = args.has('--no-service') || prepareOnly || Boolean(process.env.CI);
+const serviceFlag = args.has('--service');
+const userServiceFlag = args.has('--user-service');
+const systemServiceFlag = args.has('--system-service');
 const REQUIRED_ENV_LINES = [
-  'YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt',
-  'YOUTUBE_EXTRACTOR_ARGS=',
-  'YOUTUBE_PO_TOKEN=',
   'LINUX_SUDO_PASSWORD=',
   'BACKUP_PART_SIZE_MB=45'
 ];
@@ -130,7 +132,6 @@ async function readDefaultConfig() {
       targets: { primaryGroup: 'IrOBot', taskChats: ['dev', 'IrOBot'], reminderChat: 'IrOBot' },
       sticker: { defaultAuthor: 'IrO', defaultTitle: ':3' },
       pdf: { defaultFileName: 'IrOBot', sessionTimeoutMs: 1800000 },
-      youtube: { cookieFile: 'auth/youtube-cookies.txt' },
       wol: { broadcastAddress: '255.255.255.255', port: 9 },
       sessions: { restoreTimeoutMs: 1800000 },
       backup: { partSizeMb: 45, autoDaily: true, dailyTimeWib: '00:00' },
@@ -157,6 +158,33 @@ async function maybeInstallSystemTools() {
   await run('node', ['scripts/install-system-tools.mjs']);
 }
 
+async function maybeInstallSystemdService() {
+  if (process.platform !== 'linux') {
+    if (serviceFlag || userServiceFlag || systemServiceFlag) log('Systemd service hanya tersedia di Linux. Lewati.');
+    return;
+  }
+
+  if (serviceFlag || userServiceFlag || systemServiceFlag) {
+    const serviceArgs = ['scripts/install-systemd.mjs', 'install'];
+    if (userServiceFlag) serviceArgs.push('--user');
+    if (systemServiceFlag) serviceArgs.push('--system');
+    await run('node', serviceArgs);
+    return;
+  }
+
+  if (skipService || !process.stdin.isTTY) return;
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question('Install systemd service agar bot auto-start setelah reboot/crash? (y/N) ')).trim().toLowerCase();
+    if (!['y', 'yes', 'ya'].includes(answer)) return;
+  } finally {
+    rl.close();
+  }
+
+  await run('node', ['scripts/install-systemd.mjs', 'install']);
+}
+
 async function main() {
   checkNodeVersion();
   await installNodeDependencies();
@@ -174,6 +202,7 @@ async function main() {
   const createdReminders = await ensureJsonFile(REMINDERS_FILE, { nextId: 1, items: [] });
   const createdWol = await ensureJsonFile(WOL_FILE, { nextId: 1, items: [] });
   await maybeInstallSystemTools();
+  await maybeInstallSystemdService();
 
   log('Runtime directories siap.');
   if (createdEnv) log('Membuat .env.');

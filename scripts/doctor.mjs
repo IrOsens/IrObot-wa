@@ -1,5 +1,5 @@
 import { detectTools } from '../src/tools.js';
-import { APP_CONFIG, BACKUP_PART_SIZE_BYTES, YOUTUBE_COOKIE_FILE } from '../src/config.js';
+import { APP_CONFIG, BACKUP_PART_SIZE_BYTES } from '../src/config.js';
 import { formatBytes } from '../src/tools.js';
 
 function yesNo(value) {
@@ -17,19 +17,16 @@ async function main() {
   line('Node', process.version);
   line('ffmpeg', tools.ffmpeg || 'missing');
   line('ffprobe', tools.ffprobe || 'missing');
-  line('yt-dlp', tools.ytDlp || 'missing');
   line('LibreOffice/soffice', tools.office || 'missing');
   line('Target primary group', APP_CONFIG.targets?.primaryGroup || 'missing');
-  line('YouTube cookie file', YOUTUBE_COOKIE_FILE);
   line('Backup destination default', APP_CONFIG.destinations?.backup || 'backup');
   line('Backup part size', formatBytes(BACKUP_PART_SIZE_BYTES));
   console.log('');
   line('Full sticker/media support', yesNo(Boolean(tools.ffmpeg)));
-  line('Full YouTube support', yesNo(Boolean(tools.ffmpeg && tools.ytDlp)));
   line('Office to PDF support', yesNo(Boolean(tools.office)));
   console.log('');
 
-  if (!tools.ffmpeg || !tools.ffprobe || !tools.ytDlp || !tools.office) {
+  if (!tools.ffmpeg || !tools.ffprobe || !tools.office) {
     console.log('Ada tool opsional yang belum tersedia. Jalankan `npm run setup:full` untuk mencoba install otomatis.');
     process.exitCode = 1;
     return;

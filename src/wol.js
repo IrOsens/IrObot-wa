@@ -35,10 +35,11 @@ export async function sendWakeOnLan(mac, options = {}) {
 }
 
 export async function handleWolCommand(command) {
-  if (!command.args.length) return formatWolList((await readCollection(WOL_FILE)).items);
+  if (!command.args.length || command.args[0].toLowerCase() === 'list') return formatWolList((await readCollection(WOL_FILE)).items);
 
   const action = command.args[0].toLowerCase();
-  if (action === 'save') {
+  if (action === 'add' || action === 'save') {
+    if (!command.args[1]) throw new Error(wolFormat());
     const mac = normalizeMac(command.args[1]);
     const store = await readCollection(WOL_FILE);
     const exists = store.items.find((item) => item.mac === mac);
@@ -56,7 +57,7 @@ export async function handleWolCommand(command) {
 
   if (action === 'del') {
     const query = command.args[1];
-    if (!query) throw new Error('Format: ,won del <id|mac>');
+    if (!query) throw new Error(wolFormat());
     const store = await readCollection(WOL_FILE);
     const item = findWol(store.items, query);
     if (!item) throw new Error(`WOL "${query}" tidak ditemukan.`);
@@ -64,6 +65,16 @@ export async function handleWolCommand(command) {
     renumberCollection(store);
     await writeCollection(WOL_FILE, store);
     return `WOL #${item.id} ${item.mac} dihapus.`;
+  }
+
+  if (action === 'wake') {
+    const query = command.args[1];
+    if (!query) throw new Error(wolFormat());
+    const store = await readCollection(WOL_FILE);
+    const saved = findWol(store.items, query);
+    const mac = saved?.mac || normalizeMac(query);
+    await sendWakeOnLan(mac);
+    return `Magic packet terkirim ke ${mac}.`;
   }
 
   const store = await readCollection(WOL_FILE);
@@ -93,4 +104,14 @@ function findWol(items, query) {
 function formatWolList(items) {
   if (!items.length) return 'Belum ada MAC WOL tersimpan.';
   return items.map((item) => `#${item.id} - ${item.mac}`).join('\n');
+}
+
+function wolFormat() {
+  return [
+    'Format WOL:',
+    ',wol list',
+    ',wol add <mac>',
+    ',wol wake <id|mac>',
+    ',wol del <id|mac>'
+  ].join('\n');
 }

@@ -37,14 +37,11 @@ import {
   UPDATE_RESTART_MODE,
   UPDATE_SYSTEMD_SERVICE,
   WOL_FILE,
-  YOUTUBE_EXTRACTOR_ARGS,
-  YOUTUBE_COOKIE_FILE,
-  YOUTUBE_PO_TOKEN,
   cleanupStartupTemp,
   ensureRuntimeDirs
 } from './config.js';
 import { cleanupOldLogs, logger } from './logger.js';
-import { detectTools, formatBytes, formatDuration, getDiskInfo, getLoadAverageText, runTool, runToolWithInput } from './tools.js';
+import { detectTools, fileExists, formatBytes, formatDuration, getDiskInfo, getLoadAverageText, runTool, runToolWithInput } from './tools.js';
 import { getMessageText, parseCommand } from './text.js';
 import {
   cleanupFiles,
@@ -60,7 +57,6 @@ import { makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerMeta, revers
 import { TaskScheduler, createTask, formatTaskList, formatWib, listTasks, updateTaskState } from './tasks.js';
 import { PdfSessions, parsePdfOrderText, parsePdfStartArgs } from './pdf.js';
 import { pdfToImages } from './pdfImages.js';
-import { downloadYoutube } from './youtube.js';
 import {
   SaveRecorder,
   assertSavedTitleAvailable,
@@ -98,13 +94,6 @@ import {
   tryNormalizeJid,
   tryNormalizePhoneToJid as tryNormalizePhoneToWhatsAppJid
 } from './phone.js';
-import {
-  hasYoutubeCookies,
-  isYoutubeCookieNeededError,
-  saveYoutubeCookies,
-  youtubeCookieWarnings,
-  youtubeCookiePrompt
-} from './youtubeCookies.js';
 import { AnticallStore, formatAnticallStatus } from './anticall.js';
 
 class ChatDirectory {
@@ -252,7 +241,6 @@ const state = {
   botState: null,
   anticall: null,
   rejectedCallIds: new Set(),
-  youtubeCookieSessions: new Map(),
   ignoredOwnMessageIds: new Set(),
   reconnecting: false
 };
@@ -356,77 +344,109 @@ const HELP_SECTIONS = [
   {
     title: 'Media',
     items: [
-      { name: 'help', text: '- ,help - tampilkan command yang bisa kamu pakai .' },
-      { name: 's', text: '- ,s [title][,author] - buat sticker dari attach, reply, atau URL media .' },
-      { name: 'smeme', text: '- ,smeme up/down <teks> [1-99] - buat sticker meme dari reply media .' },
-      { name: 'rs', text: '- ,rs - kirim ulang media atau view-once reply ke chat ini .' },
-      { name: 'topdf', text: '- ,topdf [split] [nama][,1MB] - mulai sesi PDF, lalu tutup dengan ,end .' },
-      { name: 'toimg', text: '- ,toimg - ubah PDF reply/dokumen menjadi image per halaman .' }
+      { name: 's', text: ',s        Buat stiker dari gambar/video' },
+      { name: 'smeme', text: ',smeme    Buat stiker meme dari gambar' },
+      { name: 'resend', text: ',resend   Kirim ulang media/view-once' },
+      { name: 'topdf', text: ',topdf    Gabung gambar/dokumen jadi PDF' },
+      { name: 'toimg', text: ',toimg    Ubah PDF jadi gambar' }
     ]
   },
   {
-    title: 'Reminder dan task',
+    title: 'Catatan',
     items: [
-      { name: 'task', text: '- ,task [count|loop] "<teks>" <jam> [menit] [detik] [tanggal] - buat task terjadwal .' },
-      { name: 'ltask', text: '- ,ltask - lihat semua task .' },
-      { name: 'ltask', text: '- ,ltask true|false|del <id> - aktifkan, pause, atau hapus task .' },
-      { name: 'remindme', text: '- ,remindme <teks> <durasi> - reminder cepat, contoh 10m atau 1h30m .' }
+      { name: 'note', text: ',note     Kelola note' },
+      { name: 'link', text: ',link     Kelola link' },
+      { name: 'save', text: ',save     Simpan pesan/media' },
+      { name: 'load', text: ',load     Kirim ulang save' }
     ]
   },
   {
-    title: 'Save, note, dan link',
+    title: 'Reminder',
     items: [
-      { name: 'save', text: '- ,save <judul> [teks awal] - mulai rekam save .' },
-      { name: 'load', text: '- ,load [id|judul] - list atau kirim ulang save .' },
-      { name: 'load', text: '- ,load del <id|judul> - hapus save dengan konfirmasi .' },
-      { name: 'load', text: '- ,load change <id|judul> <judul-baru> - ganti judul save .' },
-      { name: 'note', text: '- ,note | ,note <judul> <teks> | ,note <id|judul> | ,note del <id|judul> | ,note change <id|judul> <judul-baru> .' },
-      { name: 'link', text: '- ,link | ,link <nama> <https://link> | ,link <id|nama> | ,link del <id|nama> | ,link change <id|nama> <nama-baru> .' }
+      { name: 'remindme', text: ',remindme Reminder cepat' },
+      { name: 'task', text: ',task     Kelola task terjadwal' }
     ]
   },
   {
-    title: 'Utility',
+    title: 'Server',
     items: [
-      { name: 'info', text: '- ,info <nomor> - cek info WhatsApp .' },
-      { name: 'status', text: '- ,status | ,status bot - status server atau status fitur bot .' },
-      { name: 'health', text: '- ,health - status teknis bot .' },
-      { name: 'won', text: '- ,won | ,won <mac|id> | ,won save <mac> | ,won del <id|mac> - Wake-on-LAN .' },
-      { name: 'backup', text: '- ,backup - kirim zip data/ ke destination backup WhatsApp .' },
-      { name: 'restore', text: '- ,restore - mulai restore zip WhatsApp, finalnya perlu ,confirm .' },
-      { name: 'anticall', text: '- ,anticall | ,anticall new|on|off | ,anticall except list|add|del <nomor|id> .' },
-      { name: 'changedmsg', text: '- ,changedmsg list|allow|del <group|id> - kelola grup yang dipantau delete/edit .' },
-      { name: 'statussave', text: '- ,statussave list|add|del <nomor|id> - auto-save status WhatsApp nomor tertentu .' },
-      { name: 'config', text: '- ,config | ,config get|set <key> <value> - lihat/ubah config aman .' },
-      { name: 'clear', text: '- ,clear - hapus temp dengan konfirmasi .' },
-      { name: 'update', text: '- ,update - git pull dan restart service dengan konfirmasi .' },
-      { name: 'restartbot', text: '- ,restartbot - restart aman dengan konfirmasi .' },
-      { name: 'allow', text: '- ,allow here|all true|false - buka/tutup akses publik .' },
-      { name: 'admin', text: '- ,admin list|add|del <nomor|id> - kelola admin tambahan .' },
-      { name: 'bot', text: '- ,bot | ,bot on|off - cek atau ubah status layanan bot .' },
-      { name: 'log', text: '- ,log [baris] - lihat log server terbaru .' },
-      { name: 'net', text: '- ,net - cek IP, DNS, latency, dan estimasi download .' },
-      { name: 'button', text: '- ,button <pesan> - tes pesan dengan tombol interaktif .' }
+      { name: 'status', text: ',status   Status server' },
+      { name: 'net', text: ',net      Cek koneksi' },
+      { name: 'log', text: ',log      Lihat log terbaru' },
+      { name: 'wol', text: ',wol      Wake-on-LAN' },
+      { name: 'health', text: ',health   Status teknis bot' },
+      { name: 'info', text: ',info     Cek info WhatsApp' }
     ]
   },
   {
-    title: 'Session dan konfirmasi',
+    title: 'Admin',
     items: [
-      { name: 'end', text: '- ,end - selesai save, PDF, atau restore .' },
-      { name: 'cancel', text: '- ,cancel - batalkan sesi aktif atau pending confirm .' },
-      { name: 'confirm', text: '- ,confirm - jalankan aksi yang sedang menunggu konfirmasi .' }
+      { name: 'bot', text: ',bot      On/off bot' },
+      { name: 'allow', text: ',allow    Atur akses chat' },
+      { name: 'admin', text: ',admin    Atur admin' },
+      { name: 'config', text: ',config   Atur config' },
+      { name: 'backup', text: ',backup   Backup data' },
+      { name: 'restore', text: ',restore  Restore data' },
+      { name: 'update', text: ',update   Update bot' },
+      { name: 'restartbot', text: ',restartbot Restart bot' },
+      { name: 'anticall', text: ',anticall Kelola anti-call' },
+      { name: 'changedmsg', text: ',changedmsg Pantau pesan edit/hapus' },
+      { name: 'statussave', text: ',statussave Simpan status WA' },
+      { name: 'clear', text: ',clear    Bersihkan temp' },
+      { name: 'button', text: ',button   Tes tombol command' }
+    ]
+  },
+  {
+    title: 'Session',
+    items: [
+      { name: 'end', text: ',end      Selesai sesi aktif' },
+      { name: 'cancel', text: ',cancel   Batalkan sesi' },
+      { name: 'confirm', text: ',confirm  Konfirmasi aksi' }
     ]
   }
 ];
 
+const HELP_ALIASES = {
+  rs: 'resend',
+  won: 'wol',
+  ltask: 'task'
+};
+
 const HELP_DETAILS = {
-  help: ['Format: ,help [command|prefix]', 'Contoh: ,help s, ,help status.'],
+  help: ['Format: ,help <command>', 'Contoh: ,help s, ,help task.'],
+  s: ['Format: ,s', 'Format: ,s <title>', 'Format: ,s <title>,<author>', 'Kirim/reply media atau sertakan URL media.'],
+  smeme: ['Format: ,smeme up <teks>', 'Format: ,smeme down <teks>', 'Advanced: tambah kualitas 1-99 di akhir.'],
+  resend: ['Format: ,resend', 'Legacy: ,rs', 'Reply media/view-once. Sticker statis dikirim sebagai PNG, sticker bergerak sebagai GIF.'],
   status: ['Format: ,status atau ,status bot', ',status menampilkan server ringkas. ,status bot menampilkan destination, scheduler, changedmsg, statussave, dan warning nama grup duplikat.'],
-  topdf: ['Format: ,topdf [split] [nama][,1MB]', 'Kirim/reply media setelah sesi dimulai, lalu ,end atau reaction ✅/👍/❤️. ,topdf split membuat satu PDF per media.'],
+  topdf: ['Format: ,topdf', 'Format: ,topdf <nama>', 'Format: ,topdf split <nama>', 'Format: ,topdf <nama> max <size>', 'Format: ,topdf split <nama> max <size>', 'Legacy: ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
+  toimg: ['Format: ,toimg', 'Reply/kirim dokumen PDF, lalu bot mengirim tiap halaman sebagai gambar.'],
+  note: ['Format: ,note list', 'Format: ,note add <judul> <teks>', 'Format: ,note get <id|judul>', 'Format: ,note del <id|judul>', 'Format: ,note rename <id|judul> <judul-baru>', 'Legacy: ,note <judul> <teks> dan ,note change tetap didukung.'],
+  link: ['Format: ,link list', 'Format: ,link add <nama> <https://link>', 'Format: ,link get <id|nama>', 'Format: ,link del <id|nama>', 'Format: ,link rename <id|nama> <nama-baru>', 'Legacy: ,link <nama> <url> dan ,link change tetap didukung.'],
+  save: ['Format: ,save <judul> [teks awal]', 'Mulai rekam teks/media sampai ,end atau ,cancel.'],
+  load: ['Format: ,load', 'Format: ,load <id|judul>', 'Format: ,load del <id|judul>', 'Format: ,load change <id|judul> <judul-baru>'],
+  remindme: ['Format: ,remindme <teks> <durasi>', 'Unit: s = detik, m = menit, h = jam, d = hari.', 'Contoh: ,remindme cek server 1h30m'],
+  task: ['Format: ,task list', 'Format: ,task add <teks> at <HH:MM>', 'Format: ,task add <teks> at <HH:MM> <DD/MM/YYYY>', 'Format: ,task loop <teks> at <HH:MM>', 'Format: ,task repeat <jumlah> <teks> at <HH:MM>', 'Format: ,task pause <id>', 'Format: ,task resume <id>', 'Format: ,task del <id>', 'Legacy: ,ltask true|false|del <id> tetap didukung.'],
+  wol: ['Format: ,wol list', 'Format: ,wol add <mac>', 'Format: ,wol wake <id|mac>', 'Format: ,wol del <id|mac>', 'Legacy: ,won, ,won save <mac>, ,won <id|mac>, dan ,won del <id|mac> tetap didukung.'],
+  log: ['Format: ,log [baris]', 'Default 30 baris, maksimal 80 baris.'],
+  net: ['Format: ,net', 'Cek IP publik, DNS, HTTP latency, IP lokal, dan estimasi download kecil.'],
+  health: ['Format: ,health', 'Status teknis proses, tool, data count, scheduler, dan runtime file.'],
+  info: ['Format: ,info <nomor>', 'Contoh: ,info 08123431212'],
   changedmsg: ['Format: ,changedmsg list|allow|del <id|nama-grup|jid>', 'DM dipantau default. Grup harus di-allow. Nama grup duplikat ditolak; pakai JID agar aman.'],
   config: ['Format: ,config, ,config get <key>, ,config set <key> <value>', 'Destination key menerima nama grup, JID, atau nomor. Grup disimpan sebagai JID + nama.'],
   statussave: ['Format: ,statussave list|add|del <nomor|id>', 'Nomor menerima 081..., +62 123-1234-1234, atau +6212312341234. Status teks dan media dikirim ke dest.saved.'],
   backup: ['Format: ,backup', 'Backup data/ dikirim sebagai dokumen WhatsApp ke dest.backup. Ubah tujuan dengan ,config set dest.backup <group|nomor>.'],
-  bot: ['Format: ,bot, ,bot on, ,bot off', ',bot off mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall.']
+  restore: ['Format: ,restore', 'Mulai sesi restore ZIP lewat WhatsApp. Kirim part ZIP, lalu ,end dan ,confirm.'],
+  anticall: ['Format: ,anticall', 'Format: ,anticall new|on|off', 'Format: ,anticall except list|add|del <nomor|id>'],
+  allow: ['Format: ,allow here on|off', 'Format: ,allow all on|off', 'Legacy true|false tetap didukung.'],
+  admin: ['Format: ,admin list', 'Format: ,admin add <nomor>', 'Format: ,admin del <nomor|id>'],
+  bot: ['Format: ,bot, ,bot on, ,bot off', ',bot off mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall.'],
+  update: ['Format: ,update', 'Menjalankan git pull dan restart service dengan konfirmasi.'],
+  restartbot: ['Format: ,restartbot', 'Keluar dari proses bot dengan konfirmasi agar supervisor bisa menyalakan ulang.'],
+  clear: ['Format: ,clear', 'Membersihkan temp/ dengan konfirmasi.'],
+  button: ['Format: ,button <pesan>', 'Tes tombol interaktif.'],
+  end: ['Format: ,end', 'Selesaikan sesi aktif seperti save, PDF, anticall, atau restore.'],
+  cancel: ['Format: ,cancel', 'Batalkan sesi aktif atau konfirmasi pending.'],
+  confirm: ['Format: ,confirm', 'Jalankan aksi yang sedang menunggu konfirmasi.']
 };
 
 async function handleHelp(jid, command, context) {
@@ -437,18 +457,31 @@ async function handleHelp(jid, command, context) {
     await handleHelpDetail(jid, query, context);
     return;
   }
-  const lines = [`${BOT_NAME} Help .`];
+  const lines = [
+    `${BOT_NAME} Help`,
+    '',
+    'Pakai:',
+    `${COMMAND_PREFIX}help <command>`,
+    `Contoh: ${COMMAND_PREFIX}help s`
+  ];
   for (const section of HELP_SECTIONS) {
     const items = section.items.filter((item) => canShowHelpItem(item.name, jid, context));
     if (!items.length) continue;
-    lines.push('', `${section.title} .`, ...items.map((item) => item.text));
+    lines.push('', `${section.title}:`, ...items.map((item) => item.text));
   }
+  const detailExamples = ['note', 'task', 'topdf'].filter((name) => canShowHelpItem(name, jid, context));
+  if (detailExamples.length) lines.push('', 'Detail:', ...detailExamples.map((name) => `${COMMAND_PREFIX}help ${name}`));
   await sendText(jid, lines.join('\n'));
 }
 
 async function handleHelpDetail(jid, query, context) {
-  const allNames = [...new Set(HELP_SECTIONS.flatMap((section) => section.items.map((item) => item.name)))];
-  const exact = allNames.find((name) => name === query);
+  const allNames = [...new Set([
+    ...HELP_SECTIONS.flatMap((section) => section.items.map((item) => item.name)),
+    ...Object.keys(HELP_DETAILS),
+    ...Object.keys(HELP_ALIASES)
+  ])];
+  const normalizedQuery = HELP_ALIASES[query] || query;
+  const exact = allNames.map((name) => HELP_ALIASES[name] || name).find((name) => name === normalizedQuery);
   if (exact) {
     if (!canShowHelpItem(exact, jid, context)) {
       await sendText(jid, `Command ${COMMAND_PREFIX}${exact} tidak tersedia untuk akses kamu.`);
@@ -460,7 +493,9 @@ async function handleHelpDetail(jid, query, context) {
     return;
   }
   const matches = allNames
-    .filter((name) => name.startsWith(query) && canShowHelpItem(name, jid, context))
+    .map((name) => HELP_ALIASES[name] || name)
+    .filter((name) => name.startsWith(normalizedQuery) && canShowHelpItem(name, jid, context))
+    .filter((name, index, names) => names.indexOf(name) === index)
     .sort();
   if (!matches.length) {
     await sendText(jid, `Tidak ada help yang cocok untuk "${query}".`);
@@ -570,7 +605,6 @@ function activeSessionType(jid) {
   if (state.anticall?.has(jid)) return 'anticall';
   if (state.pdfSessions?.has(jid)) return 'PDF';
   if (state.restoreSessions?.has(jid)) return 'restore';
-  if (state.youtubeCookieSessions.has(jid)) return 'YouTube cookies';
   return null;
 }
 
@@ -579,8 +613,6 @@ function activeSessionActorMatches(jid, actorJid) {
   if (state.anticall?.has(jid)) return state.anticall.isActor(jid, actorJid);
   if (state.pdfSessions?.has(jid)) return state.pdfSessions.isActor(jid, actorJid);
   if (state.restoreSessions?.has(jid)) return state.restoreSessions.isActor(jid, actorJid);
-  const cookieSession = state.youtubeCookieSessions.get(jid);
-  if (cookieSession) return sameActor(cookieSession.actorJid, actorJid);
   return true;
 }
 
@@ -595,7 +627,6 @@ function hasAnyTempSession() {
     || state.anticall?.sessions?.size
     || state.pdfSessions?.count()
     || state.restoreSessions?.count()
-    || state.youtubeCookieSessions.size
   );
 }
 
@@ -796,9 +827,9 @@ async function handleHealth(jid) {
     `Memory heap: ${formatBytes(mem.heapUsed)} / ${formatBytes(mem.heapTotal)}`,
     `External: ${formatBytes(mem.external)}`,
     `Disk: ${diskText}`,
-    `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, yt-dlp=${Boolean(state.tools.ytDlp)}, office=${Boolean(state.tools.office)}, pdftoppm=${Boolean(state.tools.pdftoppm)}, magick=${Boolean(state.tools.magick)}`,
+    `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, office=${Boolean(state.tools.office)}, pdftoppm=${Boolean(state.tools.pdftoppm)}, magick=${Boolean(state.tools.magick)}`,
     `Data counts: save=${saved.length}, note=${notes.length}, link=${links.length}, task=${tasks.length}, remind=${reminders.length}, wol=${wolItems.length}`,
-    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, ytCookies=${state.youtubeCookieSessions.size}, confirm=${state.confirmStore.count()}`,
+    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, confirm=${state.confirmStore.count()}`,
     `Anticall: ${anticall.enabled ? 'aktif' : 'nonaktif'}, pesan=${anticall.hasMessage ? `${anticall.entryCount} item` : 'belum ada'}, exception=${anticall.exceptionCount || 0}`,
     `Public command access: all=${Boolean(access.all)}, chats=${access.chatCount || 0}, admins=${access.adminCount || 0}`,
     `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
@@ -855,9 +886,9 @@ async function handleReverseSticker(message, command) {
   const jid = message.key.remoteJid;
   let media = null;
   try {
-    if (command.rawArgs.trim()) throw new Error('Format baru: reply media/view-once lalu ketik ,rs tanpa parameter.');
+    if (command.rawArgs.trim()) throw new Error('Format: reply media/view-once lalu ketik ,resend tanpa parameter. Legacy ,rs tetap didukung.');
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'reverse-source');
-    if (!media) throw new Error('Reply media/view-once untuk memakai ,rs.');
+    if (!media) throw new Error('Reply media/view-once untuk memakai ,resend. Legacy ,rs tetap didukung.');
     if (media.type === 'stickerMessage') {
       await sendReversedSticker(jid, media);
       return;
@@ -1178,97 +1209,6 @@ function isDestinationChat(jid) {
   return false;
 }
 
-async function handleYoutube(message, command, actorJid = messageActorJid(message)) {
-  const jid = message.key.remoteJid;
-  try {
-    await sendText(jid, 'Mulai download YouTube...');
-    await sendYoutubeResult(jid, command.args);
-  } catch (error) {
-    if (!isYoutubeCookieNeededError(error)) throw error;
-    startYoutubeCookieSession(jid, command.args, actorJid);
-    await sendText(jid, `${error.message}\n\n${youtubeCookiePrompt()}`);
-  }
-}
-
-async function sendYoutubeResult(jid, args) {
-  let result = null;
-  try {
-    const cookieFile = await hasYoutubeCookies(YOUTUBE_COOKIE_FILE) ? YOUTUBE_COOKIE_FILE : null;
-    result = await downloadYoutube(args, state.tools, {
-      cookieFile,
-      extractorArgs: YOUTUBE_EXTRACTOR_ARGS,
-      poToken: YOUTUBE_PO_TOKEN
-    });
-    const buffer = await fs.readFile(result.path);
-    if (result.type === 'mp3') {
-      await state.sock.sendMessage(jid, {
-        audio: buffer,
-        mimetype: result.mimetype,
-        fileName: result.fileName
-      });
-    } else {
-      await state.sock.sendMessage(jid, {
-        video: buffer,
-        mimetype: result.mimetype,
-        fileName: result.fileName,
-        caption: `YouTube ${result.quality}p`
-      });
-    }
-  } finally {
-    await cleanupFiles([result?.path]);
-  }
-}
-
-function startYoutubeCookieSession(jid, args, actorJid = jid) {
-  const active = activeSessionType(jid);
-  if (active && active !== 'YouTube cookies') {
-    throw new Error(`Tidak bisa meminta cookies saat sesi ${active} aktif. Selesaikan dengan ,end atau batalkan dengan ,cancel.`);
-  }
-  const old = state.youtubeCookieSessions.get(jid);
-  if (old?.timer) clearTimeout(old.timer);
-  state.youtubeCookieSessions.set(jid, {
-    jid,
-    actorJid,
-    args: [...args],
-    startedAt: Date.now()
-  });
-}
-
-async function finishYoutubeCookieInput(message, text) {
-  const jid = message.key.remoteJid;
-  const session = state.youtubeCookieSessions.get(jid);
-  if (!session) return false;
-  if (!activeSessionActorMatches(jid, messageActorJid(message))) return false;
-  if (session.timer) clearTimeout(session.timer);
-  state.youtubeCookieSessions.delete(jid);
-  const cookieText = await readYoutubeCookieInput(message, text);
-  await saveYoutubeCookies(cookieText, YOUTUBE_COOKIE_FILE);
-  const warnings = youtubeCookieWarnings(cookieText);
-  await sendText(jid, [
-    'Cookies YouTube tersimpan. Mencoba download ulang...',
-    ...warnings.map((warning) => `Warning: ${warning}`)
-  ].join('\n'));
-  await sendYoutubeResult(jid, session.args);
-  return true;
-}
-
-async function readYoutubeCookieInput(message, text) {
-  const trimmed = String(text || '').trim();
-  if (trimmed) return trimmed;
-  let media = null;
-  try {
-    media = await downloadMessageMedia(state.sock, message, 'youtube-cookies');
-    if (!media) throw new Error('Kirim cookies sebagai teks atau dokumen .json/.txt.');
-    const ext = path.extname(media.fileName || media.path).toLowerCase();
-    if (media.type !== 'documentMessage' || !['.json', '.txt', '.cookies'].includes(ext)) {
-      throw new Error('Dokumen cookies harus file .json, .txt, atau .cookies.');
-    }
-    return await fs.readFile(media.path, 'utf8');
-  } finally {
-    await cleanupFiles([media?.path]);
-  }
-}
-
 function normalizePhoneToJid(input) {
   try {
     return normalizePhoneToWhatsAppJid(input);
@@ -1304,9 +1244,19 @@ async function handleInfo(message, command) {
   }
 }
 
-async function handleTask(message, command) {
+async function handleTask(message, command, actorJid = messageActorJid(message)) {
+  const jid = message.key.remoteJid;
+  const action = (command.args[0] || 'list').toLowerCase();
+  if (!command.args.length || action === 'list') {
+    await sendTaskList(jid, actorJid);
+    return;
+  }
+  if (isTaskStateAction(action)) {
+    await handleTaskStateChange(jid, actorJid, action, command.args[1], ',task pause|resume|del <id>');
+    return;
+  }
   const task = await createTask(state.sock, message, command.args);
-  await sendText(message.key.remoteJid, `Task #${task.id} dibuat.\nBerikutnya: ${formatWib(task.nextRunAt)}`);
+  await sendText(jid, `Task #${task.id} dibuat.\nBerikutnya: ${formatWib(task.nextRunAt)}`);
 }
 
 async function handleListTask(jid, command, actorJid) {
@@ -1315,9 +1265,26 @@ async function handleListTask(jid, command, actorJid) {
     return;
   }
   const [action, idRaw] = command.args;
+  await handleTaskStateChange(jid, actorJid, action, idRaw, ',task pause|resume|del <id>. Legacy: ,ltask true|false|del <id>');
+}
+
+function isTaskStateAction(action) {
+  return ['pause', 'resume', 'del', 'true', 'false'].includes(String(action || '').toLowerCase());
+}
+
+function normalizeTaskStateAction(action) {
+  const text = String(action || '').toLowerCase();
+  if (text === 'pause' || text === 'false') return 'pause';
+  if (text === 'resume' || text === 'true') return 'resume';
+  if (text === 'del') return 'del';
+  return null;
+}
+
+async function handleTaskStateChange(jid, actorJid, actionRaw, idRaw, formatHint) {
+  const action = normalizeTaskStateAction(actionRaw);
   const id = Number(idRaw);
-  if (!Number.isInteger(id)) throw new Error('Format: ,ltask true|false|del <id>');
-  if (action.toLowerCase() === 'del') {
+  if (!action || !Number.isInteger(id)) throw new Error(`Format: ${formatHint}`);
+  if (action === 'del') {
     await requestConfirmation(jid, actorJid, {
       title: `Hapus task #${id}`,
       description: `Task #${id} akan dihapus permanen.`,
@@ -1330,7 +1297,7 @@ async function handleListTask(jid, command, actorJid) {
     });
     return;
   }
-  const result = await updateTaskState(action.toLowerCase(), id);
+  const result = await updateTaskState(action, id);
   await sendText(jid, result.deleted ? `Task #${id} dihapus.` : `Task #${id} ${result.task.paused ? 'dipause' : 'aktif'}.`);
 }
 
@@ -1675,14 +1642,6 @@ async function cancelActiveSessionByJid(jid, actorJid) {
     return true;
   }
 
-  const cookieSession = state.youtubeCookieSessions.get(jid);
-  if (cookieSession && sameActor(cookieSession.actorJid, actorJid)) {
-    if (cookieSession.timer) clearTimeout(cookieSession.timer);
-    state.youtubeCookieSessions.delete(jid);
-    await sendText(jid, 'Input cookies YouTube dibatalkan.');
-    return true;
-  }
-
   return false;
 }
 
@@ -1759,7 +1718,7 @@ async function handleReminder(message, command) {
 }
 
 async function handleClear(jid) {
-  if (hasAnyTempSession()) throw new Error('Tidak bisa clear temp saat ada sesi save/anticall/PDF/restore/cookies aktif.');
+  if (hasAnyTempSession()) throw new Error('Tidak bisa clear temp saat ada sesi save/anticall/PDF/restore aktif.');
   await cleanupStartupTemp();
   await sendText(jid, 'Temp dibersihkan.');
 }
@@ -1905,7 +1864,10 @@ async function handleButton(message, command) {
 async function handleAllow(message, command) {
   const jid = message.key.remoteJid;
   const { scope, enabled } = parseAllowArgs(command.args);
-  const commands = [...PUBLIC_COMMANDS].map((name) => `${COMMAND_PREFIX}${name}`).join(', ');
+  const commands = ['help', 's', 'smeme', 'resend']
+    .filter((name) => PUBLIC_COMMANDS.has(name))
+    .map((name) => `${COMMAND_PREFIX}${name}`)
+    .join(', ');
   if (scope === 'all') {
     const snapshot = await state.commandAccess.setAll(enabled);
     await sendText(jid, [
@@ -2229,6 +2191,13 @@ function formatCommandOutput(result) {
   return lines.slice(-12).join('\n').slice(0, 1500);
 }
 
+function isNamedMutation(command) {
+  const action = command.args[0]?.toLowerCase();
+  if (['add', 'rename', 'change'].includes(action)) return true;
+  if (['get', 'list'].includes(action)) return false;
+  return command.args.length > 1;
+}
+
 async function handleCommand(message, command, context = commandContext(message)) {
   const jid = message.key.remoteJid;
   switch (command.name) {
@@ -2255,11 +2224,11 @@ async function handleCommand(message, command, context = commandContext(message)
       await handleAnticall(message, command, context.actorJid);
       break;
     case 'note':
-      if (!command.args.length) {
+      if (!command.args.length || command.args[0]?.toLowerCase() === 'list') {
         await sendNoteList(jid, context.actorJid);
       } else if (command.args[0]?.toLowerCase() === 'del') {
         const query = command.args.slice(1).join(' ').trim();
-        if (!query) throw new Error('Format: ,note del <id|judul>');
+        if (!query) throw new Error(HELP_DETAILS.note.join('\n'));
         await requestConfirmation(jid, context.actorJid, {
           title: `Hapus note "${query}"`,
           description: 'Note ini akan dihapus permanen.',
@@ -2271,16 +2240,16 @@ async function handleCommand(message, command, context = commandContext(message)
         });
       } else {
         const text = await handleNoteCommand(command);
-        invalidateListKind('notes');
+        if (isNamedMutation(command)) invalidateListKind('notes');
         await sendText(jid, text);
       }
       break;
     case 'link':
-      if (!command.args.length) {
+      if (!command.args.length || command.args[0]?.toLowerCase() === 'list') {
         await sendLinkList(jid, context.actorJid);
       } else if (command.args[0]?.toLowerCase() === 'del') {
         const query = command.args.slice(1).join(' ').trim();
-        if (!query) throw new Error('Format: ,link del <id|nama>');
+        if (!query) throw new Error(HELP_DETAILS.link.join('\n'));
         await requestConfirmation(jid, context.actorJid, {
           title: `Hapus link "${query}"`,
           description: 'Link ini akan dihapus permanen.',
@@ -2292,7 +2261,7 @@ async function handleCommand(message, command, context = commandContext(message)
         });
       } else {
         const text = await handleLinkCommand(command);
-        invalidateListKind('links');
+        if (isNamedMutation(command)) invalidateListKind('links');
         await sendText(jid, text);
       }
       break;
@@ -2309,10 +2278,11 @@ async function handleCommand(message, command, context = commandContext(message)
       await handleSmeme(message, command);
       break;
     case 'rs':
+    case 'resend':
       await handleReverseSticker(message, command);
       break;
     case 'task':
-      await handleTask(message, command);
+      await handleTask(message, command, context.actorJid);
       break;
     case 'ltask':
       await handleListTask(jid, command, context.actorJid);
@@ -2326,12 +2296,13 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'toimg':
       await handleToImg(message);
       break;
+    case 'wol':
     case 'won':
-      if (!command.args.length) {
+      if (!command.args.length || command.args[0]?.toLowerCase() === 'list') {
         await sendWolList(jid, context.actorJid);
       } else if (command.args[0]?.toLowerCase() === 'del') {
         const query = command.args.slice(1).join(' ').trim();
-        if (!query) throw new Error('Format: ,won del <id|mac>');
+        if (!query) throw new Error(HELP_DETAILS.wol.join('\n'));
         await requestConfirmation(jid, context.actorJid, {
           title: `Hapus WOL "${query}"`,
           description: 'Entry Wake-on-LAN ini akan dihapus permanen.',
@@ -2343,7 +2314,7 @@ async function handleCommand(message, command, context = commandContext(message)
         });
       } else {
         const text = await handleWolCommand(command);
-        if (command.args[0]?.toLowerCase() === 'save') invalidateListKind('wol');
+        if (['add', 'save'].includes(command.args[0]?.toLowerCase())) invalidateListKind('wol');
         await sendText(jid, text);
       }
       break;
@@ -2449,10 +2420,6 @@ async function onMessageUpsert(event) {
       }
       if (sessionActorMatches && state.restoreSessions.has(jid) && (!command || !['end', 'cancel', 'confirm'].includes(command.name))) {
         await maybeCollectRestorePart(message);
-        continue;
-      }
-      if (sessionActorMatches && state.youtubeCookieSessions.has(jid) && !command) {
-        await finishYoutubeCookieInput(message, text);
         continue;
       }
       if (!command && !state.pdfSessions.has(jid) && context.isOwner && await maybeHandleSecretMediaTrigger(message, text)) {
@@ -2657,10 +2624,24 @@ async function connect() {
   });
 }
 
+async function maybeLogSystemdTip() {
+  if (process.platform !== 'linux' || process.env.INVOCATION_ID) return;
+  const hasSystemctl = await fileExists('/bin/systemctl') || await fileExists('/usr/bin/systemctl');
+  if (!hasSystemctl) return;
+  const serviceName = UPDATE_SYSTEMD_SERVICE.endsWith('.service') ? UPDATE_SYSTEMD_SERVICE : `${UPDATE_SYSTEMD_SERVICE}.service`;
+  const systemService = path.join('/etc/systemd/system', serviceName);
+  const userService = path.join(os.homedir(), '.config', 'systemd', 'user', serviceName);
+  if (await fileExists(systemService) || await fileExists(userService)) return;
+  const tip = 'Tip: run npm run service:install agar bot auto-start setelah reboot/crash.';
+  console.log(tip);
+  await logger.info(tip);
+}
+
 async function main() {
   await ensureRuntimeDirs();
   await cleanupStartupTemp();
   await cleanupOldLogs();
+  await maybeLogSystemdTip();
   state.commandAccess = new CommandAccessStore();
   await state.commandAccess.load();
   state.botState = new BotStateStore();
@@ -2693,7 +2674,6 @@ async function main() {
     ffmpeg: Boolean(state.tools.ffmpeg),
     ffprobe: Boolean(state.tools.ffprobe),
     office: Boolean(state.tools.office),
-    ytDlp: Boolean(state.tools.ytDlp),
     pdftoppm: Boolean(state.tools.pdftoppm),
     magick: Boolean(state.tools.magick)
   });

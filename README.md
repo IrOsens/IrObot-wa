@@ -48,14 +48,20 @@ Untuk mencoba memasang tool sistem otomatis:
 npm run setup:full
 ```
 
+Di Linux/Armbian, setup akan menawarkan pemasangan systemd service agar bot auto-start setelah reboot/crash. Untuk non-interactive:
+
+```bash
+npm run setup -- --no-service
+npm run setup -- --service
+npm run setup -- --user-service
+sudo npm run setup -- --system-service
+```
+
 ## Konfigurasi
 
 `.env`:
 
 ```env
-YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt
-YOUTUBE_EXTRACTOR_ARGS=
-YOUTUBE_PO_TOKEN=
 LINUX_SUDO_PASSWORD=
 BACKUP_PART_SIZE_MB=45
 ```
@@ -80,31 +86,65 @@ npm start
 
 Scan QR yang muncul di terminal. Session WhatsApp disimpan di `auth/`.
 
+### Systemd Service
+
+Linux/Armbian:
+
+```bash
+npm run service:install
+npm run service:status
+npm run service:logs
+npm run service:restart
+npm run service:disable
+```
+
+System service manual:
+
+```bash
+sudo systemctl status irobot-wa --no-pager
+sudo journalctl -u irobot-wa -f
+sudo systemctl restart irobot-wa
+sudo systemctl disable --now irobot-wa
+```
+
+User service:
+
+```bash
+systemctl --user status irobot-wa --no-pager
+journalctl --user -u irobot-wa -f
+systemctl --user restart irobot-wa
+systemctl --user disable --now irobot-wa
+```
+
+`Restart=always` menjaga bot hidup lagi setelah crash. Jika internet mati lalu hidup lagi, reconnect tetap mengandalkan logic Baileys di bot; service hanya memastikan prosesnya menyala.
+
 ## Command
 
-- Media: `,s [title][,author]`, `,smeme up/down <teks> [1-99]`, `,rs`, `,topdf [split] [nama][,1MB]`, `,toimg`
-- Reminder/task: `,task`, `,ltask`, `,ltask true|false|del <id>`, `,remindme <teks> <durasi>`
+- Media: `,s`, `,smeme`, `,resend`, `,topdf`, `,toimg`
+- Reminder/task: `,task list|add|loop|repeat|pause|resume|del`, `,remindme <teks> <durasi>`
 - Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
-- Note/link: `,note`, `,note del <id|judul>`, `,note change <id|judul> <judul-baru>`, `,link`, `,link del <id|nama>`, `,link change <id|nama> <nama-baru>`
-- Utility: `,info`, `,status`, `,status bot`, `,health`, `,won`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
+- Note/link: `,note list|add|get|del|rename`, `,link list|add|get|del|rename`
+- Utility: `,info`, `,status`, `,status bot`, `,health`, `,wol`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
 - Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
 
 View-once/media:
 
-- Reply media atau view-once lalu ketik `,rs`.
+- Reply media atau view-once lalu ketik `,resend`.
 - Bot mengirim media itu kembali ke chat tempat command dijalankan.
-- Jika `,rs` dipakai pada sticker, sticker statis dikirim sebagai PNG dan sticker bergerak dikirim sebagai GIF.
+- Jika `,resend` dipakai pada sticker, sticker statis dikirim sebagai PNG dan sticker bergerak dikirim sebagai GIF.
+- Legacy `,rs` tetap didukung.
 - Reply media lalu kirim teks yang berakhir spasi titik, contoh `halo .`, untuk mengirim media ke grup target `IrOBot`.
 - Teks sebelum ` .` dipakai sebagai caption baru jika media mendukung caption.
 
 Operasional:
 
 - Owner adalah akun WhatsApp yang sedang login.
-- `,allow here true|false` membuka/menutup akses publik di chat/grup tempat command dikirim.
-- `,allow all true|false` membuka/menutup akses publik di semua chat/grup.
-- Akses publik biasa berlaku untuk `,help`, `,s`, `,smeme`, dan `,rs`.
+- `,allow here on|off` membuka/menutup akses publik di chat/grup tempat command dikirim.
+- `,allow all on|off` membuka/menutup akses publik di semua chat/grup.
+- Legacy `true|false` tetap didukung untuk `,allow`.
+- Akses publik biasa berlaku untuk `,help`, `,s`, `,smeme`, `,resend`, dan legacy `,rs`.
 - `,help` dinamis: publik hanya melihat command publik, admin tambahan melihat command yang boleh dia pakai, owner melihat semuanya. `,help <command|prefix>` menampilkan detail atau kandidat command.
 - `,admin list|add|del <nomor|id>` mengelola admin tambahan. Hanya owner/session WhatsApp yang bisa menjalankannya.
 - Admin tambahan hanya aktif saat akses publik chat/all terbuka, dan tetap tidak bisa memakai command server/security seperti `,admin`, `,bot`, `,backup`, `,restore`, `,update`, dan `,restartbot`.
@@ -115,9 +155,10 @@ Operasional:
 PDF:
 
 - Ketik `,topdf` atau `,topdf laporan`.
-- Ketik `,topdf split` untuk membuat setiap media dalam sesi menjadi PDF terpisah saat `,end`.
+- Ketik `,topdf split laporan` untuk membuat setiap media dalam sesi menjadi PDF terpisah saat `,end`.
 - Jika nama kosong, nama PDF default memakai format WIB seperti `23_5_2026_115700_IrOBot.pdf`.
-- Batas ukuran opsional bisa ditulis setelah koma, contoh `,topdf laporan,1MB`; `mb` dan `MB` sama-sama dibaca sebagai megabytes.
+- Batas ukuran opsional: `,topdf laporan max 1MB` atau `,topdf split scan max 1MB`.
+- Legacy `,topdf laporan,1MB` tetap didukung.
 - Kirim/reply beberapa media atau dokumen.
 - Saat media ditambahkan, bot mengedit satu pesan progress berisi item terbaru, total saat ini, daftar file, dan instruksi `,end`/`,cancel`.
 - Caption/teks angka dipakai sebagai urutan PDF.
@@ -142,12 +183,16 @@ Save/load:
 
 - Judul `,save`, `,note`, dan `,link` wajib unik.
 - Judul dengan spasi bisa memakai quote, contoh: `,save "judul panjang"`.
+- Note: `,note add <judul> <teks>`, `,note get <id|judul>`, `,note del <id|judul>`, `,note rename <id|judul> <judul-baru>`.
+- Link: `,link add <nama> <https://link>`, `,link get <id|nama>`, `,link del <id|nama>`, `,link rename <id|nama> <nama-baru>`.
 
 Reminder:
 
 - `,remindme minum 10m`
 - Durasi mendukung `10s`, `5m`, `2h`, `1d`, dan `1h30m`.
 - Reminder dikirim ke grup target `IrOBot`.
+- Task: `,task add "backup server" at 23:00`, `,task loop "cek koneksi" at 08:00`, `,task repeat 3 "ingatkan minum" at 21:00`, `,task pause 2`, `,task resume 2`, `,task del 2`.
+- Legacy `,ltask`, `,ltask true|false|del <id>` tetap didukung.
 
 Backup/restore:
 
@@ -165,7 +210,8 @@ Konfirmasi:
 - Ketik `,cancel` untuk membatalkan konfirmasi pending atau sesi aktif.
 - Konfirmasi dan prompt session juga menerima reaction `👍`, `❤️`, `✅` untuk lanjut/end/confirm dan `❌`, `👎`, `❎` untuk cancel.
 - Reaction hanya diterima dari user yang memicu command, dan kedaluwarsa setelah 1 menit.
-- List seperti `,load`, `,note`, `,link`, `,ltask`, `,won`, `,admin list`, dan `,anticall except list` dikirim per item. React `❌`, `👎`, atau `❎` pada item untuk memulai konfirmasi hapus.
+- List seperti `,load`, `,note`, `,link`, `,task list`, `,wol`, `,admin list`, dan `,anticall except list` dikirim per item. React `❌`, `👎`, atau `❎` pada item untuk memulai konfirmasi hapus.
+- Legacy `,ltask` dan `,won` tetap didukung.
 
 Changed message, logs, dan status:
 
@@ -178,6 +224,7 @@ Changed message, logs, dan status:
 
 Utility tambahan:
 
+- `,wol list`, `,wol add <mac>`, `,wol wake <id|mac>`, dan `,wol del <id|mac>` untuk Wake-on-LAN. Legacy `,won` tetap didukung.
 - `,log [baris]` menampilkan log server terbaru, default 30 baris dan maksimal 80 baris.
 - `,net` mengecek public IP, DNS, HTTP latency, local IP, dan estimasi download kecil.
 - `,button <pesan>` mengirim pesan test dengan satu tombol. Jika tombol ditekan, reply tombol dibaca sebagai command `,<pesan>`.
@@ -188,7 +235,7 @@ Update/restart:
 - `,update` menjalankan `git pull origin main`, lalu restart service systemd.
 - Jika restart systemd butuh authentication, bot mencoba `sudo -S systemctl` memakai `LINUX_SUDO_PASSWORD` dari `.env`.
 - Default service systemd adalah `irobot-wa.service`; ubah di `data/config.json` bagian `update.systemdService`.
-- Agar bot benar-benar hidup lagi, jalankan lewat supervisor seperti PM2, systemd, nodemon, atau service manager lain.
+- Agar bot benar-benar hidup lagi setelah reboot/crash, pakai `npm run service:install` di Linux/Armbian.
 
 ## Fitur yang Bergantung Tool Sistem
 

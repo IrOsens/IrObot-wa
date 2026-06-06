@@ -27,37 +27,36 @@ function run(command, args) {
 
 async function installWindows() {
   if (!(await commandExists('winget'))) {
-    throw new Error('winget tidak ditemukan. Install manual: FFmpeg, yt-dlp, dan LibreOffice.');
+    throw new Error('winget tidak ditemukan. Install manual: FFmpeg dan LibreOffice.');
   }
 
   await run('winget', ['install', '--accept-package-agreements', '--accept-source-agreements', '-e', '--id', 'Gyan.FFmpeg']);
-  await run('winget', ['install', '--accept-package-agreements', '--accept-source-agreements', '-e', '--id', 'yt-dlp.yt-dlp']);
   await run('winget', ['install', '--accept-package-agreements', '--accept-source-agreements', '-e', '--id', 'TheDocumentFoundation.LibreOffice']);
 }
 
 async function installLinux() {
   if (await commandExists('apt-get')) {
     await run('sudo', ['apt-get', 'update']);
-    await run('sudo', ['apt-get', 'install', '-y', 'ffmpeg', 'yt-dlp', 'libreoffice']);
+    await run('sudo', ['apt-get', 'install', '-y', 'ffmpeg', 'libreoffice']);
     return;
   }
 
   if (await commandExists('dnf')) {
-    await run('sudo', ['dnf', 'install', '-y', 'ffmpeg', 'yt-dlp', 'libreoffice']);
+    await run('sudo', ['dnf', 'install', '-y', 'ffmpeg', 'libreoffice']);
     return;
   }
 
   if (await commandExists('pacman')) {
-    await run('sudo', ['pacman', '-Sy', '--noconfirm', 'ffmpeg', 'yt-dlp', 'libreoffice-fresh']);
+    await run('sudo', ['pacman', '-Sy', '--noconfirm', 'ffmpeg', 'libreoffice-fresh']);
     return;
   }
 
   if (await commandExists('zypper')) {
-    await run('sudo', ['zypper', 'install', '-y', 'ffmpeg', 'yt-dlp', 'libreoffice']);
+    await run('sudo', ['zypper', 'install', '-y', 'ffmpeg', 'libreoffice']);
     return;
   }
 
-  throw new Error('Package manager Linux belum dikenali. Install manual: ffmpeg, ffprobe, yt-dlp, libreoffice/soffice.');
+  throw new Error('Package manager Linux belum dikenali. Install manual: ffmpeg, ffprobe, libreoffice/soffice.');
 }
 
 async function main() {

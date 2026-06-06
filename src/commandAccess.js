@@ -3,16 +3,15 @@ import path from 'node:path';
 import { COMMAND_ACCESS_FILE } from './config.js';
 import { displayPhoneFromJid, normalizePhoneToJid, sameJid, tryNormalizeJid } from './phone.js';
 
-export const PUBLIC_COMMANDS = new Set(['help', 's', 'smeme', 'rs']);
+export const PUBLIC_COMMANDS = new Set(['help', 's', 'smeme', 'rs', 'resend']);
 export const ADMIN_RESTRICTED_COMMANDS = new Set([
   'allow',
   'admin',
+  'anticall',
   'bot',
   'changedmsg',
   'config',
-  'status',
   'statussave',
-  'health',
   'backup',
   'restore',
   'clear',
@@ -131,12 +130,12 @@ export class CommandAccessStore {
 export function parseAllowArgs(args) {
   const [scopeRaw, enabledRaw] = args;
   const scope = String(scopeRaw || '').toLowerCase();
-  if (!['here', 'all'].includes(scope)) throw new Error('Format: ,allow here|all true|false');
+  if (!['here', 'all'].includes(scope)) throw new Error('Format: ,allow here|all on|off');
   const enabledText = String(enabledRaw || '').toLowerCase();
-  if (!['true', 'false'].includes(enabledText)) throw new Error('Format: ,allow here|all true|false');
+  if (!['on', 'off', 'true', 'false'].includes(enabledText)) throw new Error('Format: ,allow here|all on|off');
   return {
     scope,
-    enabled: enabledText === 'true'
+    enabled: ['on', 'true'].includes(enabledText)
   };
 }
 
