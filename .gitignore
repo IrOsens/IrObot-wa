@@ -2,7 +2,6 @@ node_modules/
 npm-debug.log*
 
 auth/
-auth/youtube-cookies.txt
 data/config.json
 data/links.json
 data/notes.json

@@ -236,13 +236,19 @@ export function parsePdfStartArgs(rawArgs) {
   const raw = String(rawArgs || '').trim();
   if (!raw) return { fileName: '', maxSizeBytes: null, split: false };
   const split = /^split(?:\s+|$)/i.test(raw);
-  const body = split ? raw.replace(/^split\s*/i, '').trim() : raw;
-  if (!body) return { fileName: '', maxSizeBytes: null, split };
+  let body = split ? raw.replace(/^split\s*/i, '').trim() : raw;
+  let maxSizeBytes = null;
+  const maxMatch = body.match(/(?:^|\s)max\s+(\d+(?:\.\d+)?\s*[kmgt]?b)\s*$/i);
+  if (maxMatch) {
+    maxSizeBytes = parsePdfSizeLimit(maxMatch[1]);
+    body = body.slice(0, maxMatch.index).trim();
+  }
+  if (!body) return { fileName: '', maxSizeBytes, split };
   const match = body.match(PDF_SIZE_RE);
-  if (!match) return { fileName: body, maxSizeBytes: null, split };
+  if (!match) return { fileName: body, maxSizeBytes, split };
   return {
     fileName: match[1].trim(),
-    maxSizeBytes: parsePdfSizeLimit(`${match[2]}${match[3]}`),
+    maxSizeBytes: maxSizeBytes || parsePdfSizeLimit(`${match[2]}${match[3]}`),
     split
   };
 }

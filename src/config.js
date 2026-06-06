@@ -40,11 +40,6 @@ export const DEFAULT_APP_CONFIG = {
     defaultFileName: 'IrOBot',
     sessionTimeoutMs: 30 * 60 * 1000
   },
-  youtube: {
-    cookieFile: path.join('auth', 'youtube-cookies.txt'),
-    extractorArgs: '',
-    poToken: ''
-  },
   wol: {
     broadcastAddress: '255.255.255.255',
     port: 9
@@ -99,11 +94,6 @@ export const DEFAULT_STICKER_TITLE = APP_CONFIG.sticker?.defaultTitle || ':3';
 export const PDF_DEFAULT_FILE_NAME = APP_CONFIG.pdf?.defaultFileName || BOT_NAME;
 export const PDF_SESSION_TIMEOUT_MS = numberOr(APP_CONFIG.pdf?.sessionTimeoutMs, 30 * 60 * 1000);
 export const RESTORE_SESSION_TIMEOUT_MS = numberOr(APP_CONFIG.sessions?.restoreTimeoutMs, 30 * 60 * 1000);
-export const YOUTUBE_COOKIE_FILE = resolveRuntimePath(
-  process.env.YOUTUBE_COOKIE_FILE || APP_CONFIG.youtube?.cookieFile || path.join('auth', 'youtube-cookies.txt')
-);
-export const YOUTUBE_EXTRACTOR_ARGS = process.env.YOUTUBE_EXTRACTOR_ARGS || APP_CONFIG.youtube?.extractorArgs || '';
-export const YOUTUBE_PO_TOKEN = process.env.YOUTUBE_PO_TOKEN || APP_CONFIG.youtube?.poToken || '';
 export const BACKUP_PART_SIZE_BYTES = Math.max(
   1024 * 1024,
   Math.floor(numberOr(process.env.BACKUP_PART_SIZE_MB, APP_CONFIG.backup?.partSizeMb || 45) * 1024 * 1024)
@@ -126,8 +116,7 @@ export async function ensureRuntimeDirs() {
     fs.mkdir(SAVED_MESSAGES_DIR, { recursive: true }),
     fs.mkdir(ANTICALL_MEDIA_DIR, { recursive: true }),
     fs.mkdir(LOG_DIR, { recursive: true }),
-    fs.mkdir(TEMP_DIR, { recursive: true }),
-    fs.mkdir(path.dirname(YOUTUBE_COOKIE_FILE), { recursive: true })
+    fs.mkdir(TEMP_DIR, { recursive: true })
   ]);
   await Promise.all([
     ensureEnvFile(ENV_FILE),
@@ -207,9 +196,6 @@ function defaultEnvText() {
 
 function requiredEnvLines() {
   return [
-    'YOUTUBE_COOKIE_FILE=auth/youtube-cookies.txt',
-    'YOUTUBE_EXTRACTOR_ARGS=',
-    'YOUTUBE_PO_TOKEN=',
     'LINUX_SUDO_PASSWORD=',
     'BACKUP_PART_SIZE_MB=45'
   ];
@@ -283,12 +269,6 @@ function asStringArray(value, fallback = []) {
 
 function uniqueStrings(values) {
   return [...new Set(asStringArray(values))];
-}
-
-function resolveRuntimePath(value) {
-  const raw = String(value || '').trim();
-  if (!raw) return path.join(AUTH_DIR, 'youtube-cookies.txt');
-  return path.isAbsolute(raw) ? raw : path.join(ROOT_DIR, raw);
 }
 
 async function ensureJsonFile(target, value) {

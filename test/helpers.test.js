@@ -8,8 +8,7 @@ import { addNamedItem, assertUniqueTitle, deleteNamedItem, readCollection } from
 import { defaultPdfBaseName, parsePdfSizeLimit, parsePdfStartArgs, PdfSessions, parsePdfOrderText } from '../src/pdf.js';
 import { parseDurationMs } from '../src/reminders.js';
 import { normalizeMac } from '../src/wol.js';
-import { normalizeYoutubeCookies, youtubeCookieWarnings } from '../src/youtubeCookies.js';
-import { parseYoutubeArgs } from '../src/youtube.js';
+import { parseTaskArgs } from '../src/tasks.js';
 import { extractZipBuffer, zipDirectory } from '../src/zip.js';
 import { PendingConfirmStore, parseSecretMediaTriggerText } from '../src/confirm.js';
 import { CommandAccessStore, parseAllowArgs } from '../src/commandAccess.js';
@@ -99,6 +98,16 @@ test('PDF start args support WIB default name, size limit, and unsupported skips
     maxSizeBytes: 1024 * 1024,
     split: false
   });
+  assert.deepEqual(parsePdfStartArgs('tugas max 1MB'), {
+    fileName: 'tugas',
+    maxSizeBytes: 1024 * 1024,
+    split: false
+  });
+  assert.deepEqual(parsePdfStartArgs('split scan max 1MB'), {
+    fileName: 'scan',
+    maxSizeBytes: 1024 * 1024,
+    split: true
+  });
   assert.deepEqual(parsePdfStartArgs('split'), { fileName: '', maxSizeBytes: null, split: true });
 
   const sessions = new PdfSessions({});
@@ -113,6 +122,38 @@ test('PDF start args support WIB default name, size limit, and unsupported skips
   assert.match(skipped.reason, /audio/);
   assert.equal(session.files.length, 0);
   sessions.end('jid@test');
+});
+
+test('parseTaskArgs supports explicit task actions and legacy schedule syntax', () => {
+  assert.deepEqual(parseTaskArgs(['add', 'backup server', 'at', '23:00']), {
+    loop: false,
+    count: 1,
+    text: 'backup server',
+    hour: 23,
+    minute: 0,
+    second: 0,
+    dateToken: null
+  });
+  assert.deepEqual(parseTaskArgs(['loop', 'cek koneksi', 'at', '08:05']), {
+    loop: true,
+    count: null,
+    text: 'cek koneksi',
+    hour: 8,
+    minute: 5,
+    second: 0,
+    dateToken: null
+  });
+  assert.deepEqual(parseTaskArgs(['repeat', '3', 'ingatkan minum', 'at', '21:00', '12/12/2026']), {
+    loop: false,
+    count: 3,
+    text: 'ingatkan minum',
+    hour: 21,
+    minute: 0,
+    second: 0,
+    dateToken: '12/12/2026'
+  });
+  assert.equal(parseTaskArgs(['2', 'legacy', '22', '30']).text, 'legacy');
+  assert.throws(() => parseTaskArgs(['add', 'tanpa', 'jam']), /Format task/);
 });
 
 test('PdfSessions split mode builds one PDF per media item', async () => {
@@ -136,59 +177,6 @@ test('PdfSessions split mode builds one PDF per media item', async () => {
   } finally {
     await fs.rm(work, { recursive: true, force: true });
   }
-});
-
-test('normalizeYoutubeCookies supports raw Cookie header and Netscape text', () => {
-  const fromHeader = normalizeYoutubeCookies('Cookie: VISITOR_INFO1_LIVE=abc; SID=def');
-  assert.match(fromHeader, /Netscape HTTP Cookie File/);
-  assert.match(fromHeader, /\.youtube\.com\tTRUE\t\/\tTRUE\t2147483647\tSID\tdef/);
-
-  const netscape = normalizeYoutubeCookies('.youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\tdef');
-  assert.match(netscape, /Netscape HTTP Cookie File/);
-  assert.match(netscape, /SID\tdef/);
-
-  const httpOnly = normalizeYoutubeCookies('#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\tdef');
-  assert.match(httpOnly, /#HttpOnly_\.youtube\.com/);
-});
-
-test('normalizeYoutubeCookies supports browser JSON export', () => {
-  const normalized = normalizeYoutubeCookies(JSON.stringify({
-    cookies: [
-      {
-        domain: '.youtube.com',
-        hostOnly: false,
-        httpOnly: true,
-        name: 'SID',
-        path: '/',
-        secure: true,
-        expirationDate: 1813386668.9,
-        value: 'secret'
-      }
-    ]
-  }));
-  assert.match(normalized, /Netscape HTTP Cookie File/);
-  assert.match(normalized, /#HttpOnly_\.youtube\.com\tTRUE\t\/\tTRUE\t1813386668\tSID\tsecret/);
-});
-
-test('normalizeYoutubeCookies repairs damaged YouTube secure cookie names', () => {
-  const fromJson = normalizeYoutubeCookies(JSON.stringify({
-    cookies: [
-      { domain: '.youtube.com', name: '_Secure-3PSID', value: 'a', path: '/', secure: true, httpOnly: true },
-      { domain: '.youtube.com', name: 'Secure-1PSID', value: 'b', path: '/', secure: true, httpOnly: true }
-    ]
-  }));
-  assert.match(fromJson, /__Secure-3PSID\ta/);
-  assert.match(fromJson, /__Secure-1PSID\tb/);
-
-  const fromHeader = normalizeYoutubeCookies('Cookie: Secure-3PSID=a; _Secure-1PSID=b');
-  assert.match(fromHeader, /__Secure-3PSID\ta/);
-  assert.match(fromHeader, /__Secure-1PSID\tb/);
-});
-
-test('youtubeCookieWarnings reports missing important cookies', () => {
-  const warnings = youtubeCookieWarnings('Cookie: PREF=abc');
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /SID/);
 });
 
 test('parseSecretMediaTriggerText detects text ending with space dot', () => {
@@ -298,12 +286,14 @@ test('CommandAccessStore gates public commands', async () => {
   try {
     await store.load();
     assert.equal(store.canUse('s', 'chat-a'), false);
-    assert.deepEqual(parseAllowArgs(['here', 'true']), { scope: 'here', enabled: true });
+    assert.deepEqual(parseAllowArgs(['here', 'on']), { scope: 'here', enabled: true });
+    assert.deepEqual(parseAllowArgs(['all', 'false']), { scope: 'all', enabled: false });
 
     await store.setHere('chat-a', true);
     assert.equal(store.canUse('s', 'chat-a'), true);
     assert.equal(store.canUse('smeme', 'chat-a'), true);
     assert.equal(store.canUse('help', 'chat-a'), true);
+    assert.equal(store.canUse('resend', 'chat-a'), true);
     assert.equal(store.canUseAs('save', 'chat-a', '628111@s.whatsapp.net'), false);
     assert.equal(store.canUse('s', 'chat-b'), false);
 
@@ -312,8 +302,11 @@ test('CommandAccessStore gates public commands', async () => {
     const admin = await store.addAdmin('08123431212');
     assert.equal(admin.jid, '628123431212@s.whatsapp.net');
     assert.equal(store.canUseAs('save', 'chat-b', admin.jid), true);
+    assert.equal(store.canUseAs('status', 'chat-b', admin.jid), true);
+    assert.equal(store.canUseAs('wol', 'chat-b', admin.jid), true);
     assert.equal(store.canUseAs('backup', 'chat-b', admin.jid), false);
     assert.equal(store.canUseAs('bot', 'chat-b', admin.jid), false);
+    assert.equal(store.canUseAs('anticall', 'chat-b', admin.jid), false);
     const deleted = await store.deleteAdmin('08123431212');
     assert.equal(deleted.id, 1);
     assert.equal(store.snapshot().adminCount, 0);
@@ -410,7 +403,7 @@ test('StatusSaveStore normalizes watched status numbers and renumbers delete', a
   }
 });
 
-test('note and link commands support change rename syntax', async () => {
+test('note and link commands support explicit actions and legacy rename syntax', async () => {
   const tempRoot = path.join(process.cwd(), 'temp');
   await fs.mkdir(tempRoot, { recursive: true });
   const work = await fs.mkdtemp(path.join(tempRoot, 'rename-test-'));
@@ -419,12 +412,14 @@ test('note and link commands support change rename syntax', async () => {
   try {
     await fs.writeFile(notesFile, JSON.stringify({ nextId: 1, items: [] }, null, 2));
     await fs.writeFile(linksFile, JSON.stringify({ nextId: 1, items: [] }, null, 2));
-    assert.match(await handleNoteCommand({ args: ['lama', 'isi'], rawArgs: 'lama isi' }, notesFile), /tersimpan/);
-    assert.match(await handleNoteCommand({ args: ['change', 'lama', 'baru'], rawArgs: 'change lama baru' }, notesFile), /baru/);
+    assert.match(await handleNoteCommand({ args: ['add', 'lama', 'isi'], rawArgs: 'add lama isi' }, notesFile), /tersimpan/);
+    assert.match(await handleNoteCommand({ args: ['get', 'lama'], rawArgs: 'get lama' }, notesFile), /isi/);
+    assert.match(await handleNoteCommand({ args: ['rename', 'lama', 'baru'], rawArgs: 'rename lama baru' }, notesFile), /baru/);
     await handleNoteCommand({ args: ['lain', 'isi'], rawArgs: 'lain isi' }, notesFile);
     await assert.rejects(() => handleNoteCommand({ args: ['change', 'lain', 'baru'], rawArgs: 'change lain baru' }, notesFile), /sudah ada/);
-    assert.match(await handleLinkCommand({ args: ['old', 'https://example.com'], rawArgs: 'old https://example.com' }, linksFile), /tersimpan/);
-    assert.match(await handleLinkCommand({ args: ['change', 'old', 'new'], rawArgs: 'change old new' }, linksFile), /new/);
+    assert.match(await handleLinkCommand({ args: ['add', 'old', 'https://example.com'], rawArgs: 'add old https://example.com' }, linksFile), /tersimpan/);
+    assert.match(await handleLinkCommand({ args: ['get', 'old'], rawArgs: 'get old' }, linksFile), /example/);
+    assert.match(await handleLinkCommand({ args: ['rename', 'old', 'new'], rawArgs: 'rename old new' }, linksFile), /new/);
     await assert.rejects(() => handleNoteCommand({ args: ['baru2'], rawArgs: 'baru2' }, notesFile), /tidak ditemukan/);
   } finally {
     await fs.rm(work, { recursive: true, force: true });
@@ -568,23 +563,6 @@ async function writeTinyAnimatedWebp(filePath) {
     loops: 0
   });
 }
-
-test('parseYoutubeArgs supports optional time range', () => {
-  assert.deepEqual(parseYoutubeArgs(['https://www.youtube.com/watch?v=abc', 'mp4', '720', '00:00-01:00']), {
-    url: 'https://www.youtube.com/watch?v=abc',
-    type: 'mp4',
-    quality: '720',
-    range: '00:00-01:00'
-  });
-  assert.deepEqual(parseYoutubeArgs(['https://youtu.be/abc', 'mp4', '00:00-01:00']), {
-    url: 'https://youtu.be/abc',
-    type: 'mp4',
-    quality: '720',
-    range: '00:00-01:00'
-  });
-  assert.deepEqual(parseYoutubeArgs(['https://youtu.be/abc', 'mp3', '1:02:03-1:03:04']).range, '1:02:03-1:03:04');
-  assert.throws(() => parseYoutubeArgs(['https://youtu.be/abc', 'mp4', '999']), /Format:/);
-});
 
 test('zipDirectory and extractZipBuffer round trip nested data', async () => {
   const tempRoot = path.join(process.cwd(), 'temp');
