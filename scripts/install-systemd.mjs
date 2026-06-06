@@ -96,8 +96,10 @@ async function resolveNpmPath() {
   return result.stdout.trim() || '/usr/bin/npm';
 }
 
-function quoteSystemdValue(value) {
-  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+function escapeSystemdValue(value) {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/\s/g, (char) => `\\x${char.charCodeAt(0).toString(16).padStart(2, '0')}`);
 }
 
 async function serviceContent(mode) {
@@ -110,8 +112,8 @@ async function serviceContent(mode) {
       '',
       '[Service]',
       'Type=simple',
-      `WorkingDirectory=${quoteSystemdValue(ROOT_DIR)}`,
-      `ExecStart=${quoteSystemdValue(npmPath)} start`,
+      `WorkingDirectory=${escapeSystemdValue(ROOT_DIR)}`,
+      `ExecStart=${escapeSystemdValue(npmPath)} start`,
       'Restart=always',
       'RestartSec=10',
       'StartLimitIntervalSec=0',
@@ -131,8 +133,8 @@ async function serviceContent(mode) {
     '',
     '[Service]',
     'Type=simple',
-    `WorkingDirectory=${quoteSystemdValue(ROOT_DIR)}`,
-    `ExecStart=${quoteSystemdValue(npmPath)} start`,
+    `WorkingDirectory=${escapeSystemdValue(ROOT_DIR)}`,
+    `ExecStart=${escapeSystemdValue(npmPath)} start`,
     'Restart=always',
     'RestartSec=10',
     'StartLimitIntervalSec=0',
