@@ -17,7 +17,8 @@ const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const COMMAND_ACCESS_FILE = path.join(DATA_DIR, 'command-access.json');
 const BOT_STATE_FILE = path.join(DATA_DIR, 'bot-state.json');
 const CHANGED_MESSAGES_FILE = path.join(DATA_DIR, 'changed-messages.json');
-const STATUS_SAVE_FILE = path.join(DATA_DIR, 'status-save.json');
+const MULTI_ACCOUNT_FILE = path.join(DATA_DIR, 'multi-account.json');
+const WORKER_LOG_DIR = path.join(DATA_DIR, 'worker-logs');
 const TASK_MEDIA_DIR = path.join(DATA_DIR, 'task-media');
 const SAVED_MESSAGES_DIR = path.join(DATA_DIR, 'saved-messages');
 const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
@@ -88,6 +89,7 @@ async function ensureRuntimeDirs() {
     fs.mkdir(DATA_DIR, { recursive: true }),
     fs.mkdir(TASK_MEDIA_DIR, { recursive: true }),
     fs.mkdir(SAVED_MESSAGES_DIR, { recursive: true }),
+    fs.mkdir(WORKER_LOG_DIR, { recursive: true }),
     fs.mkdir(LOG_DIR, { recursive: true }),
     fs.mkdir(TEMP_DIR, { recursive: true })
   ]);
@@ -135,11 +137,58 @@ async function readDefaultConfig() {
       wol: { broadcastAddress: '255.255.255.255', port: 9 },
       sessions: { restoreTimeoutMs: 1800000 },
       backup: { partSizeMb: 45, autoDaily: true, dailyTimeWib: '00:00' },
-      destinations: { logs: 'logs', changedmsg: 'changedmsg', saved: 'saved', backup: 'backup' },
+      destinations: { logs: 'logs', changedmsg: 'changedmsg', saved: 'saved', backup: 'backup', workerDev: 'dev', workerLogs: 'worker-logs' },
       changedmsg: { enabled: true, indexMaxItems: 1000, maxMediaMb: 25 },
-      statussave: { enabled: true, maxMediaMb: 25 }
+      workerLogs: { maxMediaMb: 25, defaultMode: 'dm' },
+      workerControl: { timeoutMs: 600000 }
     };
   }
+}
+
+async function initialMultiAccountData() {
+  if (await pathExists(MULTI_ACCOUNT_FILE)) return null;
+  if (prepareOnly) return null;
+  if (!process.stdin.isTTY) return defaultMultiAccountData('single');
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const modeAnswer = (await rl.question('Gunakan mode single akun atau multi akun? (single/multi) ')).trim().toLowerCase();
+    const mode = ['multi', 'm'].includes(modeAnswer) ? 'multi' : 'single';
+    if (mode === 'single') return defaultMultiAccountData('single');
+
+    let superAdminJid = '';
+    while (!superAdminJid) {
+      const phone = (await rl.question('Nomor super admin (contoh 08123431212 / +62 8123xxxx): ')).trim();
+      try {
+        superAdminJid = normalizePhoneToJid(phone);
+      } catch (error) {
+        log(error.message);
+      }
+    }
+    return defaultMultiAccountData('multi', superAdminJid);
+  } finally {
+    rl.close();
+  }
+}
+
+function defaultMultiAccountData(mode, superAdminJid = null) {
+  return {
+    mode,
+    superAdminJid,
+    nextId: 2,
+    accounts: [
+      { id: 1, role: 'primary', authDir: 'auth', status: 'disconnected', createdAt: null }
+    ]
+  };
+}
+
+function normalizePhoneToJid(input) {
+  const digits = String(input || '').replace(/[^\d]/g, '');
+  let phone = digits;
+  if (phone.startsWith('0')) phone = `62${phone.slice(1)}`;
+  else if (phone.startsWith('8')) phone = `62${phone}`;
+  if (!/^\d{8,15}$/.test(phone)) throw new Error('Nomor telepon super admin tidak valid.');
+  return `${phone}@s.whatsapp.net`;
 }
 
 async function installNodeDependencies() {
@@ -194,7 +243,8 @@ async function main() {
   const createdCommandAccess = await ensureJsonFile(COMMAND_ACCESS_FILE, { all: false, chats: {}, admins: [], nextAdminId: 1 });
   const createdBotState = await ensureJsonFile(BOT_STATE_FILE, { enabled: true, updatedAt: null });
   const createdChangedMessages = await ensureJsonFile(CHANGED_MESSAGES_FILE, { allowedChats: [], nextAllowedId: 1, index: [], updatedAt: null });
-  const createdStatusSave = await ensureJsonFile(STATUS_SAVE_FILE, { nextId: 1, items: [], updatedAt: null });
+  const multiAccountData = await initialMultiAccountData();
+  const createdMultiAccount = multiAccountData ? await ensureJsonFile(MULTI_ACCOUNT_FILE, multiAccountData) : false;
   const createdTasks = await ensureJsonFile(TASKS_FILE, { nextId: 1, tasks: [] });
   const createdSaved = await ensureJsonFile(SAVED_MESSAGES_FILE, { nextId: 1, items: [] });
   const createdNotes = await ensureJsonFile(NOTES_FILE, { nextId: 1, items: [] });
@@ -210,7 +260,7 @@ async function main() {
   if (createdCommandAccess) log('Membuat data/command-access.json');
   if (createdBotState) log('Membuat data/bot-state.json');
   if (createdChangedMessages) log('Membuat data/changed-messages.json');
-  if (createdStatusSave) log('Membuat data/status-save.json');
+  if (createdMultiAccount) log('Membuat data/multi-account.json');
   if (createdTasks) log('Membuat data/tasks.json');
   if (createdSaved) log('Membuat data/saved-messages.json');
   if (createdNotes) log('Membuat data/notes.json');

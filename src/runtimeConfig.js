@@ -7,21 +7,26 @@ export const CONFIG_KEY_DEFS = {
   'dest.changedmsg': { type: 'destination', label: 'Tujuan pesan terhapus/diedit' },
   'dest.saved': { type: 'destination', label: 'Tujuan save status WhatsApp' },
   'dest.backup': { type: 'destination', label: 'Tujuan backup data' },
+  'dest.workerDev': { type: 'destination', label: 'Tujuan worker dev/community' },
+  'dest.workerLogs': { type: 'destination', label: 'Tujuan worker logs' },
   'backup.autoDaily': { type: 'boolean', label: 'Backup otomatis harian' },
   'backup.dailyTimeWib': { type: 'time', label: 'Jam backup otomatis WIB' },
   'backup.partSizeMb': { type: 'positiveNumber', label: 'Ukuran part backup MB' },
   'changedmsg.enabled': { type: 'boolean', label: 'Changed-message logging' },
   'changedmsg.indexMaxItems': { type: 'positiveInteger', label: 'Jumlah index changedmsg' },
   'changedmsg.maxMediaMb': { type: 'positiveNumber', label: 'Batas media changedmsg MB' },
-  'statussave.enabled': { type: 'boolean', label: 'Auto-save status WhatsApp' },
-  'statussave.maxMediaMb': { type: 'positiveNumber', label: 'Batas media statussave MB' }
+  'workerLogs.maxMediaMb': { type: 'positiveNumber', label: 'Batas media worker logs MB' },
+  'workerLogs.defaultMode': { type: 'workerLogMode', label: 'Mode default worker logs' },
+  'workerControl.timeoutMs': { type: 'positiveInteger', label: 'Timeout sesi control worker ms' }
 };
 
 const DESTINATION_ALIASES = {
   'dest.logs': ['destinations', 'logs'],
   'dest.changedmsg': ['destinations', 'changedmsg'],
   'dest.saved': ['destinations', 'saved'],
-  'dest.backup': ['destinations', 'backup']
+  'dest.backup': ['destinations', 'backup'],
+  'dest.workerDev': ['destinations', 'workerDev'],
+  'dest.workerLogs': ['destinations', 'workerLogs']
 };
 
 export class RuntimeConfigStore {
@@ -91,11 +96,17 @@ export class RuntimeConfigStore {
     };
   }
 
-  statussaveSettings() {
+  workerLogsSettings() {
     return {
-      enabled: this.data.statussave?.enabled !== false,
-      maxMediaBytes: Math.max(1, Math.floor(numberOr(this.data.statussave?.maxMediaMb, 25) * 1024 * 1024))
+      maxMediaBytes: Math.max(1, Math.floor(numberOr(this.data.workerLogs?.maxMediaMb, 25) * 1024 * 1024)),
+      defaultMode: ['off', 'dm', 'all', 'selected'].includes(this.data.workerLogs?.defaultMode)
+        ? this.data.workerLogs.defaultMode
+        : 'dm'
     };
+  }
+
+  workerControlTimeoutMs() {
+    return Math.max(60_000, Math.floor(numberOr(this.data.workerControl?.timeoutMs, 10 * 60 * 1000)));
   }
 
   async save() {
@@ -154,6 +165,7 @@ function normalizeConfigValue(def, rawValue) {
   if (def.type === 'time') return parseTime(rawValue);
   if (def.type === 'positiveInteger') return parsePositiveInteger(rawValue);
   if (def.type === 'positiveNumber') return parsePositiveNumber(rawValue);
+  if (def.type === 'workerLogMode') return parseWorkerLogMode(rawValue);
   return rawValue;
 }
 
@@ -184,6 +196,12 @@ function parsePositiveNumber(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) throw new Error('Nilai harus angka positif.');
   return number;
+}
+
+function parseWorkerLogMode(value) {
+  const text = String(value ?? '').trim().toLowerCase();
+  if (['off', 'dm', 'all', 'selected'].includes(text)) return text;
+  throw new Error('Mode worker logs harus off, dm, all, atau selected.');
 }
 
 function numberOr(value, fallback) {

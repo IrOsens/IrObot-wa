@@ -6,6 +6,7 @@ Bot WhatsApp pribadi berbasis Baileys. Login memakai QR di terminal, command mem
 
 - Cocok dipindah ke Linux atau Windows lain.
 - Data runtime berada di `data/`, credential di `.env` dan `auth/`.
+- Mode multi akun menyimpan akun tambahan di `auth/accounts/<ID>/`.
 - Tool sistem opsional dipakai untuk fitur media dan PDF.
 - Backup `data/` dikirim ke destination WhatsApp `backup`.
 
@@ -35,7 +36,9 @@ Jika PowerShell Windows memblokir `npm` karena execution policy:
 npm.cmd run setup
 ```
 
-Setup dan startup bot akan membuat folder runtime, `.env`, `data/config.json`, dan file JSON awal seperti `bot-state`, `command-access`, `changed-messages`, `status-save`, `tasks`, `notes`, `links`, `reminders`, dan `wol` jika hilang.
+Setup dan startup bot akan membuat folder runtime, `.env`, `data/config.json`, dan file JSON awal seperti `bot-state`, `command-access`, `multi-account`, `changed-messages`, `tasks`, `notes`, `links`, `reminders`, dan `wol` jika hilang.
+
+Saat `npm run setup` pertama kali dijalankan, setup menawarkan mode `single` atau `multi`. Mode `multi` wajib mengisi nomor super admin, dan nomor itu disimpan permanen di `data/multi-account.json`.
 
 Penting:
 
@@ -124,7 +127,7 @@ systemctl --user disable --now irobot-wa
 - Reminder/task: `,task list|add|loop|repeat|pause|resume|del`, `,remindme <teks> <durasi>`
 - Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
 - Note/link: `,note list|add|get|del|rename`, `,link list|add|get|del|rename`
-- Utility: `,info`, `,status`, `,status bot`, `,health`, `,wol`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
+- Utility: `,info`, `,status`, `,status bot`, `,health`, `,wol`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,changedmsg`, `,jadibot`, `,config`, `,log`, `,net`, `,button`
 - Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
@@ -140,15 +143,15 @@ View-once/media:
 
 Operasional:
 
-- Owner adalah akun WhatsApp yang sedang login.
+- Mode single: owner adalah akun WhatsApp yang sedang login. Mode multi: owner absolut adalah nomor super admin di `data/multi-account.json`.
 - `,allow here on|off` membuka/menutup akses publik di chat/grup tempat command dikirim.
 - `,allow all on|off` membuka/menutup akses publik di semua chat/grup.
 - Legacy `true|false` tetap didukung untuk `,allow`.
 - Akses publik biasa berlaku untuk `,help`, `,s`, `,smeme`, `,resend`, dan legacy `,rs`.
-- `,help` dinamis: publik hanya melihat command publik, admin tambahan melihat command yang boleh dia pakai, owner melihat semuanya. `,help <command|prefix>` menampilkan detail atau kandidat command.
+- `,help` dinamis dan berbasis halaman: publik hanya melihat command publik, admin tambahan melihat command yang boleh dia pakai, owner melihat semuanya. `,help 1`, `,help 2`, atau reaction accept/negative berpindah halaman; `,help <command|prefix>` menampilkan detail atau kandidat command.
 - `,admin list|add|del <nomor|id>` mengelola admin tambahan. Hanya owner/session WhatsApp yang bisa menjalankannya.
 - Admin tambahan hanya aktif saat akses publik chat/all terbuka, dan tetap tidak bisa memakai command server/security seperti `,admin`, `,bot`, `,backup`, `,restore`, `,update`, dan `,restartbot`.
-- `,bot` mengecek status. `,bot off` mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall; hanya owner bisa `,bot on`.
+- `,bot` mengecek status. `,bot off` mem-pause command, session, scheduler, backup otomatis, changedmsg, worker log, dan anticall; hanya owner bisa `,bot on`.
 - `,status bot` menampilkan status fitur bot, destination, scheduler, dan warning jika nama grup duplikat atau destination tidak valid.
 - Semua destination grup disimpan sebagai JID + nama saat disimpan. Jika nama grup sama lebih dari satu, bot menolak auto-pilih dan meminta JID.
 
@@ -213,14 +216,21 @@ Konfirmasi:
 - List seperti `,load`, `,note`, `,link`, `,task list`, `,wol`, `,admin list`, dan `,anticall except list` dikirim per item. React `❌`, `👎`, atau `❎` pada item untuk memulai konfirmasi hapus.
 - Legacy `,ltask` dan `,won` tetap didukung.
 
-Changed message, logs, dan status:
+Changed message dan logs:
 
-- Default destination: grup/target `logs`, `changedmsg`, dan `saved`. Bisa diganti ke grup atau nomor lewat `,config set dest.logs|dest.changedmsg|dest.saved <target>`.
+- Default destination: grup/target `logs`, `changedmsg`, `saved`, `dev`, dan `worker-logs`. Bisa diganti ke grup atau nomor lewat `,config set dest.logs|dest.changedmsg|dest.saved|dest.workerDev|dest.workerLogs <target>`.
 - `,changedmsg list|allow|del <id|nama-grup|jid>` mengatur grup yang dipantau untuk pesan terhapus/diedit. Direct message dipantau default.
 - Pesan dari chat terpantau dimirror ke `logs`; saat pesan dihapus atau diedit, laporan dikirim ke `changedmsg`.
 - Index changedmsg hanya menyimpan metadata/text kecil, bukan media bytes. Media diamankan lewat salinan WhatsApp di `logs`.
-- `,statussave list|add|del <nomor|id>` menyimpan status WhatsApp dari nomor tertentu ke `saved`.
 - `,config` menampilkan key aman yang bisa diubah; `,config get <key>` dan `,config set <key> <value>` untuk membaca/mengubah.
+
+Multi akun:
+
+- `,jadibot` menampilkan akun primary, trust, dan worker beserta status koneksinya.
+- `,jadibot new` membuat worker baru dan mengirim QR ke WhatsApp. QR dikirim ulang saat Baileys menghasilkan QR baru, maksimal 5 kali; jika gagal tersambung atau super admin mengirim input lain, sesi QR dihentikan.
+- `,jadibot set <ID> trust|worker` mengubah role dengan konfirmasi. Trust hanya satu akun dan dipakai sebagai pengirim output command normal dari super admin.
+- `,jadibot control <ID>` masuk sesi worker. Di sesi itu tersedia `,contacts`, `,groups`, `,logs`, `,extract`, `,send`, dan `,exit`.
+- Worker pasif mencatat pesan sesuai mode logs dan mengirim header + media/forward ke destination `dev` dan `worker-logs`.
 
 Utility tambahan:
 

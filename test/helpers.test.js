@@ -30,7 +30,8 @@ import { detectTools } from '../src/tools.js';
 import { AnticallStore, formatAnticallStatus } from '../src/anticall.js';
 import { RuntimeConfigStore } from '../src/runtimeConfig.js';
 import { ChangedMessageStore, messageIndexKey } from '../src/changedMessages.js';
-import { StatusSaveStore } from '../src/statusSave.js';
+import { MultiAccountStore } from '../src/multiAccount.js';
+import { WorkerLogStore, createWorkerLogEntry, shouldLogMessage, waLink } from '../src/workerLogs.js';
 
 test('parseDurationMs supports compact countdown formats', () => {
   assert.equal(parseDurationMs('10s'), 10_000);
@@ -330,6 +331,10 @@ test('RuntimeConfigStore validates safe keys and destination objects', async () 
     assert.equal(store.get('backup.autoDaily'), false);
     await store.set('backup.dailyTimeWib', '7:05');
     assert.equal(store.get('backup.dailyTimeWib'), '07:05');
+    await store.set('workerLogs.defaultMode', 'all');
+    assert.equal(store.workerLogsSettings().defaultMode, 'all');
+    await store.set('workerControl.timeoutMs', '120000');
+    assert.equal(store.workerControlTimeoutMs(), 120000);
     const destination = await store.setDestination('dest.changedmsg', {
       jid: '120363123456@g.us',
       savedName: 'changedmsg',
@@ -384,22 +389,75 @@ test('ChangedMessageStore stores group JID allowlist and reloads small index', a
   }
 });
 
-test('StatusSaveStore normalizes watched status numbers and renumbers delete', async () => {
+test('MultiAccountStore locks super admin, roles one trust, and deletes secondary', async () => {
   const tempRoot = path.join(process.cwd(), 'temp');
   await fs.mkdir(tempRoot, { recursive: true });
-  const file = path.join(tempRoot, `status-save-${Date.now()}.json`);
-  const store = new StatusSaveStore(file);
+  const file = path.join(tempRoot, `multi-account-${Date.now()}.json`);
+  const store = new MultiAccountStore(file, path.join(tempRoot, 'auth'));
   try {
     await store.load();
-    const first = await store.add('08123431212');
-    assert.equal(first.jid, '628123431212@s.whatsapp.net');
-    await store.add('+62 123-1234-1234');
-    assert.equal(store.isWatched('6212312341234@s.whatsapp.net'), true);
-    const deleted = await store.delete('1');
-    assert.equal(deleted.id, 1);
-    assert.deepEqual(store.list().map((item) => [item.id, item.title]), [[1, '6212312341234']]);
+    assert.equal(store.isSingle(), true);
+    await store.configureInitialMode('multi', '08123431212');
+    assert.equal(store.isMulti(), true);
+    assert.equal(store.superAdminJid(), '628123431212@s.whatsapp.net');
+    assert.equal(store.isSuperAdmin('+628123431212@s.whatsapp.net'), true);
+    await assert.rejects(() => store.configureInitialMode('multi', '08111111111'), /permanen/);
+
+    const first = await store.addWorker();
+    const second = await store.addWorker();
+    assert.equal(first.id, 2);
+    assert.equal(second.id, 3);
+    await store.setRole(first.id, 'trust');
+    await store.setRole(second.id, 'trust');
+    assert.equal(store.getAccount(first.id).role, 'worker');
+    assert.equal(store.getAccount(second.id).role, 'trust');
+    await store.deleteAccount(second.id);
+    assert.equal(store.getAccount(second.id), null);
+    await assert.rejects(() => store.deleteAccount(1), /primary/);
   } finally {
     await fs.rm(file, { force: true });
+  }
+});
+
+test('WorkerLogStore modes, selected targets, wa links, and extract text', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const root = await fs.mkdtemp(path.join(tempRoot, 'worker-logs-test-'));
+  const store = new WorkerLogStore(root);
+  try {
+    const dmMessage = {
+      key: { remoteJid: '628111@s.whatsapp.net', id: 'A' },
+      message: { conversation: 'halo' },
+      messageTimestamp: 1
+    };
+    const groupMessage = {
+      key: { remoteJid: '120363@g.us', participant: '628222@s.whatsapp.net', id: 'B' },
+      message: { conversation: 'group' },
+      messageTimestamp: 2
+    };
+    assert.equal(shouldLogMessage({ mode: 'dm' }, dmMessage), true);
+    assert.equal(shouldLogMessage({ mode: 'dm' }, groupMessage), false);
+    assert.equal(shouldLogMessage({ mode: 'all' }, groupMessage), true);
+
+    const target = await store.addTarget(2, { jid: '120363@g.us', title: 'Worker Group', type: 'group' });
+    assert.equal(target.id, 1);
+    const selected = await store.loadConfig(2);
+    assert.equal(selected.mode, 'selected');
+    assert.equal(shouldLogMessage(selected, groupMessage), true);
+    assert.equal(waLink('628111@s.whatsapp.net'), 'wa.me/628111');
+
+    const entry = createWorkerLogEntry({ id: 2, jid: '628999@s.whatsapp.net' }, dmMessage, { actorJid: '628111@s.whatsapp.net' });
+    await store.append(2, entry);
+    const filePath = await store.exportText(2, '628111@s.whatsapp.net', { title: 'Test User' });
+    const content = await fs.readFile(filePath, 'utf8');
+    assert.match(content, /Extract worker #2/);
+    assert.match(content, /halo/);
+    await fs.rm(filePath, { force: true });
+
+    const deleted = await store.deleteTarget(2, '1');
+    assert.equal(deleted.title, 'Worker Group');
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
   }
 });
 

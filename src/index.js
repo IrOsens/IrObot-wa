@@ -36,6 +36,7 @@ import {
   UPDATE_REMOTE,
   UPDATE_RESTART_MODE,
   UPDATE_SYSTEMD_SERVICE,
+  WORKER_LOG_DIR,
   WOL_FILE,
   cleanupStartupTemp,
   ensureRuntimeDirs
@@ -86,7 +87,6 @@ import {
   timestampMs,
   truncateText
 } from './changedMessages.js';
-import { StatusSaveStore } from './statusSave.js';
 import {
   displayPhoneFromJid,
   normalizePhoneToJid as normalizePhoneToWhatsAppJid,
@@ -95,6 +95,14 @@ import {
   tryNormalizePhoneToJid as tryNormalizePhoneToWhatsAppJid
 } from './phone.js';
 import { AnticallStore, formatAnticallStatus } from './anticall.js';
+import { MultiAccountStore, accountAuthPath, accountWaLink } from './multiAccount.js';
+import {
+  WorkerLogStore,
+  createWorkerLogEntry,
+  formatWorkerConfig,
+  formatWorkerLogHeader,
+  waLink as workerWaLink
+} from './workerLogs.js';
 
 class ChatDirectory {
   constructor() {
@@ -236,7 +244,12 @@ const state = {
   reactionActions: new ReactionActionStore(),
   runtimeConfig: null,
   changedMessages: null,
-  statusSave: null,
+  multiAccount: null,
+  workerLogs: null,
+  accountRuntimes: new Map(),
+  controlSessions: new Map(),
+  activePairing: null,
+  commandOutputMode: null,
   commandAccess: null,
   botState: null,
   anticall: null,
@@ -254,19 +267,21 @@ function shouldReconnect(lastDisconnect) {
   return statusCode !== DisconnectReason.loggedOut;
 }
 
-function ownUserJid() {
-  const raw = state.sock?.user?.id || state.sock?.authState?.creds?.me?.id || '';
+function ownUserJid(runtime = primaryRuntime()) {
+  const sock = runtime?.sock || state.sock;
+  const raw = sock?.user?.id || sock?.authState?.creds?.me?.id || runtime?.account?.jid || '';
   return raw ? jidNormalizedUser(raw) : 'me';
 }
 
 function messageActorJid(message) {
-  if (message?.key?.fromMe) return ownUserJid();
-  const raw = getKeyAuthor(message?.key, ownUserJid());
+  const runtime = messageRuntime(message);
+  if (message?.key?.fromMe) return ownUserJid(runtime);
+  const raw = getKeyAuthor(message?.key, ownUserJid(runtime));
   return raw ? jidNormalizedUser(raw) : '';
 }
 
-function reactionActorJid(update) {
-  const raw = getKeyAuthor(update?.reaction?.key, ownUserJid());
+function reactionActorJid(update, runtime = primaryRuntime()) {
+  const raw = getKeyAuthor(update?.reaction?.key, ownUserJid(runtime));
   return raw ? jidNormalizedUser(raw) : '';
 }
 
@@ -277,7 +292,7 @@ function sameActor(left, right) {
 
 function commandContext(message) {
   const actorJid = messageActorJid(message);
-  const isOwner = Boolean(message.key?.fromMe);
+  const isOwner = isSuperAdminContext(message, actorJid);
   const isAdmin = !isOwner && state.commandAccess?.isAdmin(actorJid);
   return {
     actorJid,
@@ -285,6 +300,41 @@ function commandContext(message) {
     isAdmin,
     publicOpen: state.commandAccess?.isOpen(message.key.remoteJid) || false
   };
+}
+
+function isSuperAdminContext(message, actorJid = messageActorJid(message)) {
+  if (state.multiAccount?.isMulti?.()) return state.multiAccount.isSuperAdmin(actorJid);
+  return Boolean(message?.key?.fromMe);
+}
+
+function primaryRuntime() {
+  return state.accountRuntimes.get(1) || null;
+}
+
+function trustRuntime() {
+  const trust = state.multiAccount?.getTrust?.();
+  if (!trust) return null;
+  const runtime = state.accountRuntimes.get(trust.id);
+  return runtime?.status === 'connected' && runtime.sock ? runtime : null;
+}
+
+function messageRuntime(message) {
+  return message?.__runtime || primaryRuntime();
+}
+
+function messageSock(message) {
+  return messageRuntime(message)?.sock || state.sock;
+}
+
+function attachRuntime(message, runtime) {
+  if (message && runtime) {
+    Object.defineProperty(message, '__runtime', {
+      value: runtime,
+      enumerable: false,
+      configurable: true
+    });
+  }
+  return message;
 }
 
 function isBotEnabled() {
@@ -315,16 +365,27 @@ async function editText(jid, messageKey, text) {
 }
 
 async function sendBotMessage(jid, content, options) {
-  const sent = await state.sock.sendMessage(jid, content, options);
-  rememberOwnOutput(sent);
+  const runtime = selectOutputRuntime(content, options);
+  const sent = await runtime.sock.sendMessage(jid, content, options);
+  rememberOwnOutput(sent, runtime);
   return sent;
 }
 
-function rememberOwnOutput(message) {
+function selectOutputRuntime(content = {}, options = {}) {
+  if (options?.forcePrimary || content?.edit) return primaryRuntime() || { sock: state.sock, ignoredOwnMessageIds: state.ignoredOwnMessageIds };
+  if (state.commandOutputMode === 'trust') {
+    const trust = trustRuntime();
+    if (trust) return trust;
+  }
+  return primaryRuntime() || { sock: state.sock, ignoredOwnMessageIds: state.ignoredOwnMessageIds };
+}
+
+function rememberOwnOutput(message, runtime = primaryRuntime()) {
   const id = message?.key?.id;
   if (!id) return;
-  state.ignoredOwnMessageIds.add(id);
-  setTimeout(() => state.ignoredOwnMessageIds.delete(id), 5 * 60 * 1000).unref?.();
+  const ignored = runtime?.ignoredOwnMessageIds || state.ignoredOwnMessageIds;
+  ignored.add(id);
+  setTimeout(() => ignored.delete(id), 5 * 60 * 1000).unref?.();
 }
 
 function botSender() {
@@ -333,10 +394,17 @@ function botSender() {
   };
 }
 
-function isIgnoredOwnOutput(message) {
+function primaryBotSender() {
+  return {
+    sendMessage: (jid, content, options = {}) => sendBotMessage(jid, content, { ...options, forcePrimary: true })
+  };
+}
+
+function isIgnoredOwnOutput(message, runtime = primaryRuntime()) {
   const id = message?.key?.id;
-  if (!id || !state.ignoredOwnMessageIds.has(id)) return false;
-  state.ignoredOwnMessageIds.delete(id);
+  const ignored = runtime?.ignoredOwnMessageIds || state.ignoredOwnMessageIds;
+  if (!id || !ignored.has(id)) return false;
+  ignored.delete(id);
   return true;
 }
 
@@ -389,9 +457,9 @@ const HELP_SECTIONS = [
       { name: 'restore', text: ',restore  Restore data' },
       { name: 'update', text: ',update   Update bot' },
       { name: 'restartbot', text: ',restartbot Restart bot' },
+      { name: 'jadibot', text: ',jadibot  Kelola multi akun' },
       { name: 'anticall', text: ',anticall Kelola anti-call' },
       { name: 'changedmsg', text: ',changedmsg Pantau pesan edit/hapus' },
-      { name: 'statussave', text: ',statussave Simpan status WA' },
       { name: 'clear', text: ',clear    Bersihkan temp' },
       { name: 'button', text: ',button   Tes tombol command' }
     ]
@@ -413,11 +481,11 @@ const HELP_ALIASES = {
 };
 
 const HELP_DETAILS = {
-  help: ['Format: ,help <command>', 'Contoh: ,help s, ,help task.'],
+  help: ['Format: ,help [page|command]', 'Contoh: ,help 1, ,help 2, ,help s, ,help task.'],
   s: ['Format: ,s', 'Format: ,s <title>', 'Format: ,s <title>,<author>', 'Kirim/reply media atau sertakan URL media.'],
   smeme: ['Format: ,smeme up <teks>', 'Format: ,smeme down <teks>', 'Advanced: tambah kualitas 1-99 di akhir.'],
   resend: ['Format: ,resend', 'Legacy: ,rs', 'Reply media/view-once. Sticker statis dikirim sebagai PNG, sticker bergerak sebagai GIF.'],
-  status: ['Format: ,status atau ,status bot', ',status menampilkan server ringkas. ,status bot menampilkan destination, scheduler, changedmsg, statussave, dan warning nama grup duplikat.'],
+  status: ['Format: ,status atau ,status bot', ',status menampilkan server ringkas. ,status bot menampilkan destination, scheduler, changedmsg, multi akun, dan warning nama grup duplikat.'],
   topdf: ['Format: ,topdf', 'Format: ,topdf <nama>', 'Format: ,topdf split <nama>', 'Format: ,topdf <nama> max <size>', 'Format: ,topdf split <nama> max <size>', 'Legacy: ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
   toimg: ['Format: ,toimg', 'Reply/kirim dokumen PDF, lalu bot mengirim tiap halaman sebagai gambar.'],
   note: ['Format: ,note list', 'Format: ,note add <judul> <teks>', 'Format: ,note get <id|judul>', 'Format: ,note del <id|judul>', 'Format: ,note rename <id|judul> <judul-baru>', 'Legacy: ,note <judul> <teks> dan ,note change tetap didukung.'],
@@ -433,13 +501,13 @@ const HELP_DETAILS = {
   info: ['Format: ,info <nomor>', 'Contoh: ,info 08123431212'],
   changedmsg: ['Format: ,changedmsg list|allow|del <id|nama-grup|jid>', 'DM dipantau default. Grup harus di-allow. Nama grup duplikat ditolak; pakai JID agar aman.'],
   config: ['Format: ,config, ,config get <key>, ,config set <key> <value>', 'Destination key menerima nama grup, JID, atau nomor. Grup disimpan sebagai JID + nama.'],
-  statussave: ['Format: ,statussave list|add|del <nomor|id>', 'Nomor menerima 081..., +62 123-1234-1234, atau +6212312341234. Status teks dan media dikirim ke dest.saved.'],
   backup: ['Format: ,backup', 'Backup data/ dikirim sebagai dokumen WhatsApp ke dest.backup. Ubah tujuan dengan ,config set dest.backup <group|nomor>.'],
   restore: ['Format: ,restore', 'Mulai sesi restore ZIP lewat WhatsApp. Kirim part ZIP, lalu ,end dan ,confirm.'],
   anticall: ['Format: ,anticall', 'Format: ,anticall new|on|off', 'Format: ,anticall except list|add|del <nomor|id>'],
+  jadibot: ['Format: ,jadibot', 'Format: ,jadibot new', 'Format: ,jadibot del <ID>', 'Format: ,jadibot set <ID> trust|worker', 'Format: ,jadibot control <ID>'],
   allow: ['Format: ,allow here on|off', 'Format: ,allow all on|off', 'Legacy true|false tetap didukung.'],
   admin: ['Format: ,admin list', 'Format: ,admin add <nomor>', 'Format: ,admin del <nomor|id>'],
-  bot: ['Format: ,bot, ,bot on, ,bot off', ',bot off mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall.'],
+  bot: ['Format: ,bot, ,bot on, ,bot off', ',bot off mem-pause command, session, scheduler, backup otomatis, changedmsg, worker log, dan anticall.'],
   update: ['Format: ,update', 'Menjalankan git pull dan restart service dengan konfirmasi.'],
   restartbot: ['Format: ,restartbot', 'Keluar dari proses bot dengan konfirmasi agar supervisor bisa menyalakan ulang.'],
   clear: ['Format: ,clear', 'Membersihkan temp/ dengan konfirmasi.'],
@@ -454,24 +522,69 @@ async function handleHelp(jid, command, context) {
   if (query.startsWith(COMMAND_PREFIX)) query = query.slice(COMMAND_PREFIX.length).trim();
   query = query.toLowerCase();
   if (query) {
+    if (/^\d+$/.test(query)) {
+      await sendHelpPage(jid, context, Number(query));
+      return;
+    }
     await handleHelpDetail(jid, query, context);
     return;
   }
+  await sendHelpPage(jid, context, 1);
+}
+
+async function sendHelpPage(jid, context, pageNumber = 1) {
+  const pages = buildHelpPages(jid, context);
+  const total = Math.max(1, pages.length);
+  const page = Math.min(Math.max(1, Math.floor(pageNumber) || 1), total);
+  const sections = pages[page - 1] || [];
   const lines = [
-    `${BOT_NAME} Help`,
+    `${BOT_NAME} Help ${page}/${total}`,
     '',
     'Pakai:',
-    `${COMMAND_PREFIX}help <command>`,
-    `Contoh: ${COMMAND_PREFIX}help s`
+    `${COMMAND_PREFIX}help <page|command>`,
+    `Contoh: ${COMMAND_PREFIX}help 2 atau ${COMMAND_PREFIX}help task`
   ];
-  for (const section of HELP_SECTIONS) {
-    const items = section.items.filter((item) => canShowHelpItem(item.name, jid, context));
-    if (!items.length) continue;
+  for (const section of sections) {
+    const items = section.items;
     lines.push('', `${section.title}:`, ...items.map((item) => item.text));
   }
   const detailExamples = ['note', 'task', 'topdf'].filter((name) => canShowHelpItem(name, jid, context));
-  if (detailExamples.length) lines.push('', 'Detail:', ...detailExamples.map((name) => `${COMMAND_PREFIX}help ${name}`));
-  await sendText(jid, lines.join('\n'));
+  if (detailExamples.length && page === 1) lines.push('', 'Detail:', ...detailExamples.map((name) => `${COMMAND_PREFIX}help ${name}`));
+  if (total > 1) lines.push('', 'React accept untuk next, negative untuk previous.');
+  const sent = await sendText(jid, lines.join('\n'));
+  if (total > 1) registerHelpPrompt(sent.key, jid, context, page, total);
+}
+
+function buildHelpPages(jid, context) {
+  const visible = HELP_SECTIONS
+    .map((section) => ({
+      ...section,
+      items: section.items.filter((item) => canShowHelpItem(item.name, jid, context))
+    }))
+    .filter((section) => section.items.length);
+  const admin = visible.filter((section) => section.title === 'Admin');
+  const others = visible.filter((section) => section.title !== 'Admin');
+  const pages = [];
+  for (let index = 0; index < others.length; index += 2) pages.push(others.slice(index, index + 2));
+  if (admin.length) pages.push(admin);
+  return pages.length ? pages : [[{ title: 'Command', items: [{ name: 'help', text: ',help     Tampilkan bantuan' }] }]];
+}
+
+function registerHelpPrompt(messageKey, jid, context, page, total) {
+  const actorJid = context?.actorJid;
+  const contextSnapshot = {
+    actorJid,
+    isOwner: Boolean(context?.isOwner),
+    isAdmin: Boolean(context?.isAdmin),
+    publicOpen: Boolean(context?.publicOpen)
+  };
+  state.reactionActions.register(messageKey, {
+    actorJid,
+    scope: `help:${jid}:${actorJid}`,
+    ttlMs: 5 * 60 * 1000,
+    onConfirm: async () => sendHelpPage(jid, contextSnapshot, page >= total ? 1 : page + 1),
+    onCancel: async () => sendHelpPage(jid, contextSnapshot, page <= 1 ? total : page - 1)
+  });
 }
 
 async function handleHelpDetail(jid, query, context) {
@@ -537,21 +650,22 @@ async function handleStatusBot(jid) {
   const botState = state.botState?.snapshot() || { enabled: true };
   const access = state.commandAccess?.snapshot() || { all: false, chatCount: 0, adminCount: 0 };
   const changed = state.changedMessages?.snapshot() || { allowedCount: 0, indexCount: 0 };
-  const statusSave = state.statusSave?.snapshot() || { count: 0 };
   const changedSettings = state.runtimeConfig?.changedmsgSettings?.() || { enabled: true };
-  const statusSettings = state.runtimeConfig?.statussaveSettings?.() || { enabled: true };
+  const multi = state.multiAccount?.snapshot?.() || { mode: 'single', accounts: [] };
   const warnings = await botStatusWarnings();
   await sendText(jid, [
     `${BOT_NAME} bot status:`,
     `Bot: ${botState.enabled ? 'on' : 'off'}`,
+    `Mode akun: ${multi.mode}, akun=${multi.accounts?.length || 1}, trust=${state.multiAccount?.getTrust?.()?.id || '-'}`,
     `Public access: all=${Boolean(access.all)}, chats=${access.chatCount || 0}, admins=${access.adminCount || 0}`,
     `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
     `Dest logs: ${formatDestinationLine('logs')}`,
     `Dest changedmsg: ${formatDestinationLine('changedmsg')}`,
     `Dest saved: ${formatDestinationLine('saved')}`,
     `Dest backup: ${formatDestinationLine('backup')}`,
+    `Dest workerDev: ${formatDestinationLine('workerDev')}`,
+    `Dest workerLogs: ${formatDestinationLine('workerLogs')}`,
     `Changedmsg: ${changedSettings.enabled ? 'aktif' : 'nonaktif'}, group allowlist=${changed.allowedCount || 0}, index=${changed.indexCount || 0}`,
-    `Statussave: ${statusSettings.enabled ? 'aktif' : 'nonaktif'}, nomor=${statusSave.count || 0}`,
     warnings.length ? '' : null,
     warnings.length ? 'Warning:' : null,
     ...warnings.map((warning) => `- ${warning}`)
@@ -564,7 +678,7 @@ async function botStatusWarnings() {
     warnings.push(`Nama grup "${duplicate.name}" duplikat: ${duplicate.jids.map(shortJid).join(', ')}`);
   }
 
-  for (const name of ['logs', 'changedmsg', 'saved', 'backup']) {
+  for (const name of ['logs', 'changedmsg', 'saved', 'backup', 'workerDev', 'workerLogs']) {
     try {
       const destination = resolveConfiguredDestination(name);
       if (destination.jid.endsWith('@g.us') && !state.chatDirectory.hasJid(destination.jid)) {
@@ -580,7 +694,6 @@ async function botStatusWarnings() {
   }
 
   const changedSettings = state.runtimeConfig?.changedmsgSettings?.() || { enabled: false };
-  const statusSettings = state.runtimeConfig?.statussaveSettings?.() || { enabled: false };
   if (changedSettings.enabled) {
     for (const name of ['logs', 'changedmsg']) {
       try {
@@ -588,13 +701,6 @@ async function botStatusWarnings() {
       } catch {
         warnings.push(`Changedmsg aktif tapi dest.${name} belum valid.`);
       }
-    }
-  }
-  if (statusSettings.enabled) {
-    try {
-      resolveConfiguredDestination('saved');
-    } catch {
-      warnings.push('Statussave aktif tapi dest.saved belum valid.');
     }
   }
   return [...new Set(warnings)];
@@ -775,7 +881,7 @@ function formatStoredChatItem(item) {
 
 async function hydrateConfiguredDestinations() {
   if (!state.runtimeConfig) return;
-  for (const key of ['dest.logs', 'dest.changedmsg', 'dest.saved', 'dest.backup']) {
+  for (const key of ['dest.logs', 'dest.changedmsg', 'dest.saved', 'dest.backup', 'dest.workerDev', 'dest.workerLogs']) {
     const current = state.runtimeConfig.get(key);
     if (!current || typeof current !== 'string') continue;
     const result = state.chatDirectory.resolve(current);
@@ -849,11 +955,11 @@ async function handleSticker(message, command) {
   });
   let media = null;
   try {
-    media = await downloadQuotedOrOwnMedia(state.sock, message, 'sticker-source');
+    media = await downloadQuotedOrOwnMedia(messageSock(message), message, 'sticker-source');
     if (!media) media = await downloadUrlMedia(command.rawArgs, 'sticker-url');
     if (!media) throw new Error('Kirim/reply media atau sertakan URL media yang valid.');
     const sticker = await makeSticker(media, { author: meta.author, title: meta.title, tools: state.tools });
-    await state.sock.sendMessage(jid, { sticker });
+    await sendBotMessage(jid, { sticker });
   } finally {
     await cleanupFiles([media?.path]);
   }
@@ -864,7 +970,7 @@ async function handleSmeme(message, command) {
   const smeme = parseSmemeArgs(command.args);
   let media = null;
   try {
-    media = await downloadQuotedOrOwnMedia(state.sock, message, 'smeme-source');
+    media = await downloadQuotedOrOwnMedia(messageSock(message), message, 'smeme-source');
     if (!media) throw new Error('Reply image, GIF, video, atau sticker untuk memakai ,smeme.');
     const supportedDocument = media.type === 'documentMessage' && /^(image|video)\//i.test(media.mimetype || '');
     if (!['imageMessage', 'videoMessage', 'stickerMessage'].includes(media.type) && !supportedDocument) {
@@ -876,7 +982,7 @@ async function handleSmeme(message, command) {
       tools: state.tools,
       smeme
     });
-    await state.sock.sendMessage(jid, { sticker });
+    await sendBotMessage(jid, { sticker });
   } finally {
     await cleanupFiles([media?.path]);
   }
@@ -887,7 +993,7 @@ async function handleReverseSticker(message, command) {
   let media = null;
   try {
     if (command.rawArgs.trim()) throw new Error('Format: reply media/view-once lalu ketik ,resend tanpa parameter. Legacy ,rs tetap didukung.');
-    media = await downloadQuotedOrOwnMedia(state.sock, message, 'reverse-source');
+    media = await downloadQuotedOrOwnMedia(messageSock(message), message, 'reverse-source');
     if (!media) throw new Error('Reply media/view-once untuk memakai ,resend. Legacy ,rs tetap didukung.');
     if (media.type === 'stickerMessage') {
       await sendReversedSticker(jid, media);
@@ -904,7 +1010,7 @@ async function handleToImg(message) {
   let media = null;
   let images = [];
   try {
-    media = await downloadQuotedOrOwnMedia(state.sock, message, 'toimg-source');
+    media = await downloadQuotedOrOwnMedia(messageSock(message), message, 'toimg-source');
     if (!media) throw new Error('Kirim/reply dokumen PDF untuk memakai ,toimg.');
     if (!isPdfFile(media.path, media.mimetype) && !isPdfFile(media.fileName, media.mimetype)) {
       throw new Error('Untuk sekarang ,toimg hanya mendukung file PDF.');
@@ -914,7 +1020,7 @@ async function handleToImg(message) {
     if (!images.length) throw new Error('Tidak ada halaman PDF yang berhasil diubah menjadi image.');
     for (const image of images) {
       const buffer = await fs.readFile(image.path);
-      await state.sock.sendMessage(jid, {
+      await sendBotMessage(jid, {
         image: buffer,
         mimetype: image.mimetype,
         caption: `Halaman ${image.page}`
@@ -929,18 +1035,18 @@ async function handleToImg(message) {
 async function sendReversedSticker(jid, media) {
   const converted = await reverseSticker(media, state.tools);
   if (converted.mimetype === 'image/png') {
-    await state.sock.sendMessage(jid, { image: converted.buffer, mimetype: converted.mimetype });
+    await sendBotMessage(jid, { image: converted.buffer, mimetype: converted.mimetype });
     return;
   }
   if (converted.gifPlayback) {
-    await state.sock.sendMessage(jid, {
+    await sendBotMessage(jid, {
       video: converted.buffer,
       mimetype: converted.mimetype,
       gifPlayback: true
     });
     return;
   }
-  await state.sock.sendMessage(jid, {
+  await sendBotMessage(jid, {
     document: converted.buffer,
     mimetype: converted.mimetype,
     fileName: converted.fileName
@@ -955,7 +1061,7 @@ async function maybeHandleSecretMediaTrigger(message, text) {
 
   let media = null;
   try {
-    media = await downloadQuotedOrOwnMedia(state.sock, message, 'secret-media');
+    media = await downloadQuotedOrOwnMedia(messageSock(message), message, 'secret-media');
     if (!media) return false;
     await sendDownloadedMedia(destinationJid, media, { caption: trigger.caption });
     return true;
@@ -972,7 +1078,7 @@ async function sendLatestViewOnce(destinationJid, targetQuery) {
 
   let media = null;
   try {
-    media = await downloadMessageMedia(state.sock, source, 'view-once');
+    media = await downloadMessageMedia(messageSock(source), source, 'view-once');
     if (!media) throw new Error('View-once ditemukan, tapi medianya tidak bisa dibaca.');
     await sendDownloadedMedia(destinationJid, media);
   } finally {
@@ -981,18 +1087,24 @@ async function sendLatestViewOnce(destinationJid, targetQuery) {
 }
 
 async function sendDownloadedMedia(jid, media, options = {}) {
+  return sendDownloadedMediaWithSender({
+    sendMessage: (targetJid, content, sendOptions) => sendBotMessage(targetJid, content, sendOptions)
+  }, jid, media, options);
+}
+
+async function sendDownloadedMediaWithSender(sender, jid, media, options = {}) {
   const buffer = await fs.readFile(media.path);
   const caption = options.caption || media.node?.caption || undefined;
   if (media.type === 'imageMessage') {
-    return sendBotMessage(jid, { image: buffer, mimetype: media.mimetype, caption });
+    return sender.sendMessage(jid, { image: buffer, mimetype: media.mimetype, caption });
   } else if (media.type === 'videoMessage') {
-    return sendBotMessage(jid, { video: buffer, mimetype: media.mimetype, caption });
+    return sender.sendMessage(jid, { video: buffer, mimetype: media.mimetype, caption });
   } else if (media.type === 'audioMessage') {
-    return sendBotMessage(jid, { audio: buffer, mimetype: media.mimetype });
+    return sender.sendMessage(jid, { audio: buffer, mimetype: media.mimetype });
   } else if (media.type === 'stickerMessage') {
-    return sendBotMessage(jid, { sticker: buffer, isAnimated: media.node?.isAnimated || undefined });
+    return sender.sendMessage(jid, { sticker: buffer, isAnimated: media.node?.isAnimated || undefined });
   } else {
-    return sendBotMessage(jid, {
+    return sender.sendMessage(jid, {
       document: buffer,
       mimetype: media.mimetype || 'application/octet-stream',
       fileName: media.fileName || `view-once-${Date.now()}`,
@@ -1023,7 +1135,7 @@ async function maybeMirrorChangedMessage(message) {
   try {
     await sendText(logsJid, metaText);
     if (isViewOnceMediaMessage(message)) {
-      media = await downloadMessageMedia(state.sock, message, 'changed-viewonce');
+      media = await downloadMessageMedia(messageSock(message), message, 'changed-viewonce');
       if (media) {
         const stat = await fs.stat(media.path).catch(() => null);
         const maxBytes = state.runtimeConfig.changedmsgSettings().maxMediaBytes;
@@ -1145,50 +1257,6 @@ function changedMessageMetaText(label, message, extra = {}) {
   return lines.join('\n');
 }
 
-async function maybeSaveStatusMessage(message) {
-  if (message.key?.remoteJid !== 'status@broadcast') return false;
-  if (!state.runtimeConfig?.statussaveSettings?.().enabled) return true;
-  const actorJid = statusAuthorJid(message);
-  if (!state.statusSave?.isWatched(actorJid)) return true;
-  const savedJid = safeDestinationJid('saved');
-  if (!savedJid) return true;
-  const summary = summarizeMessage(message);
-  const caption = [
-    'Status WhatsApp tersimpan:',
-    `Nomor: ${displayPhoneFromJid(actorJid)}`,
-    `JID: ${actorJid}`,
-    `Waktu: ${new Date(summary.timestamp).toLocaleString()}`,
-    `Tipe: ${summary.type}`,
-    summary.text ? `Teks: ${summary.text}` : null
-  ].filter(Boolean).join('\n');
-
-  let media = null;
-  try {
-    if (mediaNode(message)) {
-      media = await downloadMessageMedia(state.sock, message, 'status-save');
-      const stat = await fs.stat(media.path).catch(() => null);
-      const maxBytes = state.runtimeConfig.statussaveSettings().maxMediaBytes;
-      if (stat?.size && stat.size > maxBytes) {
-        await sendText(savedJid, `${caption}\n\nMedia dilewati karena ${formatBytes(stat.size)} melebihi batas ${formatBytes(maxBytes)}.`);
-      } else {
-        await sendDownloadedMedia(savedJid, media, { caption });
-      }
-    } else {
-      await sendText(savedJid, caption);
-    }
-  } catch (error) {
-    await logger.warn('Status save failed', { actorJid, error: error.message });
-  } finally {
-    await cleanupFiles([media?.path]);
-  }
-  return true;
-}
-
-function statusAuthorJid(message) {
-  const raw = message.key?.participant || message.participant || message.key?.remoteJid || '';
-  return raw ? jidNormalizedUser(raw) : '';
-}
-
 function safeDestinationJid(name) {
   try {
     return destinationJid(name);
@@ -1199,7 +1267,7 @@ function safeDestinationJid(name) {
 }
 
 function isDestinationChat(jid) {
-  for (const name of ['logs', 'changedmsg', 'saved', 'backup']) {
+  for (const name of ['logs', 'changedmsg', 'saved', 'backup', 'workerDev', 'workerLogs']) {
     try {
       if (sameJid(jid, destinationJid(name))) return true;
     } catch {
@@ -1238,7 +1306,7 @@ async function handleInfo(message, command) {
   ].join('\n');
 
   if (pictureUrl) {
-    await state.sock.sendMessage(jid, { image: { url: pictureUrl }, caption });
+    await sendBotMessage(jid, { image: { url: pictureUrl }, caption });
   } else {
     await sendText(jid, caption);
   }
@@ -1255,7 +1323,7 @@ async function handleTask(message, command, actorJid = messageActorJid(message))
     await handleTaskStateChange(jid, actorJid, action, command.args[1], ',task pause|resume|del <id>');
     return;
   }
-  const task = await createTask(state.sock, message, command.args);
+  const task = await createTask(messageSock(message), message, command.args);
   await sendText(jid, `Task #${task.id} dibuat.\nBerikutnya: ${formatWib(task.nextRunAt)}`);
 }
 
@@ -1322,7 +1390,7 @@ async function handleTopdf(message, command, actorJid) {
   const session = state.pdfSessions.start(jid, { ...pdfArgs, actorJid });
   const hasInitialMedia = mediaNode(message) || quotedMediaNode(message);
   if (hasInitialMedia) {
-    const item = await state.pdfSessions.addAny(state.sock, message, null);
+    const item = await state.pdfSessions.addAny(messageSock(message), message, null);
     const sent = await updatePdfProgressMessage(jid, session, item);
     registerSessionPrompt(sent.key, jid, actorJid);
     return;
@@ -1390,7 +1458,7 @@ async function handleEndPdfByJid(jid, actorJid) {
     if (session.split) {
       const pdfs = await state.pdfSessions.buildSplit(session);
       for (const file of pdfs) {
-        await state.sock.sendMessage(jid, {
+        await sendBotMessage(jid, {
           document: file.buffer,
           mimetype: 'application/pdf',
           fileName: file.fileName
@@ -1398,7 +1466,7 @@ async function handleEndPdfByJid(jid, actorJid) {
       }
     } else {
       const pdf = await state.pdfSessions.build(session);
-      await state.sock.sendMessage(jid, {
+      await sendBotMessage(jid, {
         document: pdf,
         mimetype: 'application/pdf',
         fileName: session.fileName || `${PDF_DEFAULT_FILE_NAME}-${Date.now()}.pdf`
@@ -1694,7 +1762,7 @@ async function finishRestoreByJid(jid, actorJid) {
 
 async function maybeCollectRestorePart(message) {
   if (!state.restoreSessions.has(message.key.remoteJid)) return false;
-  const item = await state.restoreSessions.add(state.sock, message);
+  const item = await state.restoreSessions.add(messageSock(message), message);
   if (item) {
     await sendText(message.key.remoteJid, `Restore part diterima: ${item.fileName}`);
     return true;
@@ -1707,7 +1775,7 @@ async function maybeCollectPdfItem(message, text) {
   if (!state.pdfSessions.has(message.key.remoteJid)) return false;
   if (!mediaNode(message) && !quotedMediaNode(message)) return false;
   const order = parsePdfOrderText(text);
-  const item = await state.pdfSessions.addAny(state.sock, message, order);
+  const item = await state.pdfSessions.addAny(messageSock(message), message, order);
   if (item) await updatePdfProgressMessage(message.key.remoteJid, state.pdfSessions.get(message.key.remoteJid), item);
   return Boolean(item);
 }
@@ -1726,7 +1794,7 @@ async function handleClear(jid) {
 async function handleBackup(jid) {
   await sendText(jid, 'Membuat backup data/ dan mengirim ke destination backup WhatsApp...');
   const destination = destinationJid('backup');
-  const files = await sendDataBackupToWhatsApp(botSender(), destination, {
+  const files = await sendDataBackupToWhatsApp(primaryBotSender(), destination, {
     partSizeBytes: state.runtimeConfig.backupPartSizeBytes()
   });
   await sendText(jid, `Backup terkirim ke ${formatDestinationLine('backup')}:\n${files.join('\n')}`);
@@ -2039,50 +2107,386 @@ async function sendChangedMsgAllowList(jid, actorJid) {
   });
 }
 
-async function handleStatusSaveCommand(message, command, context) {
-  if (!context.isOwner) throw new Error('Command ,statussave hanya bisa dipakai nomor yang terhubung ke session bot.');
+async function handleJadibotCommand(message, command, context) {
+  if (!context.isOwner) throw new Error('Command ,jadibot hanya untuk super admin.');
+  if (!state.multiAccount?.isMulti?.()) throw new Error('Mode multi akun belum aktif. Jalankan setup mode multi terlebih dahulu.');
   const jid = message.key.remoteJid;
   const action = (command.args[0] || 'list').toLowerCase();
   if (action === 'list') {
-    await sendStatusSaveList(jid, context.actorJid);
+    await sendJadibotList(jid);
     return;
   }
-  if (action === 'add') {
-    const input = command.args.slice(1).join(' ').trim();
-    if (!input) throw new Error('Format: ,statussave add <nomor>');
-    const item = await state.statusSave.add(input, context.actorJid);
-    invalidateListKind('statussave');
-    await sendText(jid, `Statussave #${item.id} ${item.title} ditambahkan.`);
-    return;
-  }
-  if (action === 'del' || action === 'delete') {
-    const query = command.args.slice(1).join(' ').trim();
-    if (!query) throw new Error('Format: ,statussave del <nomor|id>');
+  if (action === 'new') {
     await requestConfirmation(jid, context.actorJid, {
-      title: `Hapus statussave "${query}"`,
-      description: 'Status WhatsApp dari nomor ini tidak lagi disimpan otomatis.',
+      title: 'Tambah akun worker baru',
+      description: 'Bot akan membuat session baru dan mengirim QR ke chat ini. QR digenerate ulang maksimal 5 kali.',
       execute: async () => {
-        const item = await state.statusSave.delete(query);
-        invalidateListKind('statussave');
-        await sendText(jid, `Statussave #${item.id} ${item.title} dihapus.`);
+        if (state.activePairing) throw new Error('Masih ada sesi QR jadibot aktif. Kirim input lain atau tunggu selesai untuk membatalkan.');
+        const account = await state.multiAccount.addWorker();
+        await state.workerLogs.setMode(account.id, state.runtimeConfig?.workerLogsSettings?.().defaultMode || 'dm');
+        await sendText(jid, `Membuat bot worker #${account.id}. QR akan dikirim saat tersedia.`);
+        await connectAccount(account, {
+          pairing: {
+            chatJid: jid,
+            actorJid: context.actorJid,
+            qrLimit: 5
+          }
+        });
       }
     });
     return;
   }
-  throw new Error('Format: ,statussave list|add|del <nomor|id>');
+  if (action === 'del') {
+    const id = Number(command.args[1]);
+    if (!Number.isInteger(id)) throw new Error('Format: ,jadibot del <ID>');
+    if (id === 1) throw new Error('Akun primary tidak bisa dihapus.');
+    const account = state.multiAccount.getAccount(id);
+    if (!account) throw new Error(`Akun #${id} tidak ditemukan.`);
+    await requestConfirmation(jid, context.actorJid, {
+      title: `Hapus bot #${id}`,
+      description: `Session ${accountWaLink(account)} akan dihapus permanen dari server.`,
+      execute: async () => {
+        const runtime = state.accountRuntimes.get(id);
+        runtime?.sock?.end?.(new Error('jadibot deleted'));
+        state.accountRuntimes.delete(id);
+        await state.multiAccount.deleteAccount(id);
+        await state.workerLogs.deleteWorkerData(id);
+        await fs.rm(accountAuthPath(account, ROOT_DIR), { recursive: true, force: true });
+        if (state.activePairing?.accountId === id) state.activePairing = null;
+        await sendText(jid, `Bot #${id} ${accountWaLink(account)} dihapus permanen.`);
+      }
+    });
+    return;
+  }
+  if (action === 'set') {
+    const id = Number(command.args[1]);
+    const role = String(command.args[2] || '').toLowerCase();
+    if (!Number.isInteger(id) || !['trust', 'worker'].includes(role)) throw new Error('Format: ,jadibot set <ID> trust|worker');
+    if (id === 1) throw new Error('Akun primary tidak bisa diubah role-nya.');
+    const account = state.multiAccount.getAccount(id);
+    if (!account) throw new Error(`Akun #${id} tidak ditemukan.`);
+    await requestConfirmation(jid, context.actorJid, {
+      title: `Ubah bot #${id} menjadi ${role}`,
+      description: role === 'trust'
+        ? 'Akun trust lama, jika ada, akan otomatis menjadi worker. Trust hanya satu akun.'
+        : 'Akun ini akan menjadi worker pasif.',
+      execute: async () => {
+        const updated = await state.multiAccount.setRole(id, role);
+        const runtime = state.accountRuntimes.get(id);
+        if (runtime) runtime.account = updated;
+        refreshAllRuntimeAccounts();
+        refreshSchedulerSock();
+        await sendText(jid, `Bot #${id} sekarang role ${role}.`);
+      }
+    });
+    return;
+  }
+  if (action === 'control') {
+    const id = Number(command.args[1]);
+    if (!Number.isInteger(id)) throw new Error('Format: ,jadibot control <ID>');
+    await startWorkerControlSession(jid, context.actorJid, id);
+    return;
+  }
+  throw new Error('Format: ,jadibot [new|del|set|control]');
 }
 
-async function sendStatusSaveList(jid, actorJid) {
-  await sendReactionList(jid, actorJid, 'statussave', state.statusSave.list(), {
-    emptyText: 'Belum ada nomor statussave.',
-    formatItem: (item) => `#${item.id} - ${item.title} (${shortJid(item.jid)})`,
-    deleteTitle: (item) => `Hapus statussave #${item.id}`,
-    deleteDescription: 'Status WhatsApp dari nomor ini tidak lagi disimpan otomatis.',
-    deleteItem: async (item) => {
-      const deleted = await state.statusSave.delete(item.id);
-      return `Statussave #${deleted.id} ${deleted.title} dihapus.`;
+async function sendJadibotList(jid) {
+  const lines = ['Daftar akun bot:'];
+  for (const account of state.multiAccount.listAccounts()) {
+    const runtime = state.accountRuntimes.get(account.id);
+    const status = runtime?.status || account.status || 'disconnected';
+    lines.push([
+      `#${account.id}`,
+      `role=${account.role}`,
+      accountWaLink(account),
+      account.name ? `nama=${account.name}` : null,
+      `status=${status}`,
+      `auth=${account.authDir}`
+    ].filter(Boolean).join(' | '));
+  }
+  await sendText(jid, lines.join('\n'));
+}
+
+function refreshAllRuntimeAccounts() {
+  for (const account of state.multiAccount.listAccounts()) {
+    const runtime = state.accountRuntimes.get(account.id);
+    if (runtime) runtime.account = account;
+  }
+}
+
+function controlKey(jid, actorJid) {
+  return `${jid}:${actorJid}`;
+}
+
+async function startWorkerControlSession(jid, actorJid, workerId) {
+  const account = state.multiAccount.getAccount(workerId);
+  if (!account || account.role !== 'worker') throw new Error(`Bot #${workerId} bukan worker.`);
+  const runtime = state.accountRuntimes.get(workerId);
+  if (!runtime?.sock || runtime.status !== 'connected') throw new Error(`Worker #${workerId} belum connected.`);
+  const session = {
+    jid,
+    actorJid,
+    workerId,
+    compose: null,
+    timer: null,
+    updatedAt: Date.now()
+  };
+  state.controlSessions.set(controlKey(jid, actorJid), session);
+  touchWorkerControlSession(session);
+  await sendControlText(jid, [
+    `Masuk sesi control worker #${workerId} ${accountWaLink(account)}.`,
+    'Ketik ,help untuk command worker, atau ,exit untuk keluar.'
+  ].join('\n'));
+}
+
+function touchWorkerControlSession(session) {
+  if (!session) return;
+  session.updatedAt = Date.now();
+  if (session.timer) clearTimeout(session.timer);
+  const timeoutMs = state.runtimeConfig?.workerControlTimeoutMs?.() || 10 * 60 * 1000;
+  session.timer = setTimeout(() => {
+    state.controlSessions.delete(controlKey(session.jid, session.actorJid));
+    sendControlText(session.jid, `Sesi control worker #${session.workerId} otomatis keluar karena tidak ada aktivitas.`).catch(() => {});
+  }, timeoutMs);
+  session.timer.unref?.();
+}
+
+function endWorkerControlSession(session) {
+  if (!session) return false;
+  if (session.timer) clearTimeout(session.timer);
+  state.controlSessions.delete(controlKey(session.jid, session.actorJid));
+  return true;
+}
+
+async function maybeHandleWorkerControlInput(message, text, command, context) {
+  if (!context?.isOwner) return false;
+  const session = state.controlSessions.get(controlKey(message.key.remoteJid, context.actorJid));
+  if (!session) return false;
+  touchWorkerControlSession(session);
+  if (command?.name === 'exit') {
+    endWorkerControlSession(session);
+    await sendControlText(message.key.remoteJid, `Keluar dari sesi control worker #${session.workerId}.`);
+    return true;
+  }
+  if (session.compose && !command) {
+    await sendWorkerComposeMessage(session, message, text);
+    return true;
+  }
+  if (!command) return true;
+  await handleWorkerControlCommand(session, message, command, context);
+  return true;
+}
+
+async function handleWorkerControlCommand(session, message, command) {
+  const jid = message.key.remoteJid;
+  const runtime = state.accountRuntimes.get(session.workerId);
+  if (!runtime?.sock) throw new Error(`Worker #${session.workerId} tidak aktif.`);
+  const action = command.name;
+  if (action === 'help') {
+    await sendControlText(jid, workerControlHelp(session.workerId));
+    return;
+  }
+  if (action === 'contacts' || action === 'kontak') {
+    await sendControlText(jid, formatWorkerContacts(runtime));
+    return;
+  }
+  if (action === 'groups' || action === 'grup') {
+    await sendControlText(jid, formatWorkerGroups(runtime));
+    return;
+  }
+  if (action === 'logs') {
+    await handleWorkerLogsCommand(session, runtime, message, command);
+    return;
+  }
+  if (action === 'extract') {
+    const query = command.rawArgs.trim();
+    if (!query) throw new Error('Format: ,extract <nomor|wa.me|nama group>');
+    const target = resolveWorkerTarget(runtime, query);
+    const filePath = await state.workerLogs.exportText(session.workerId, target.jid, { title: target.title });
+    try {
+      await sendControlMessage(jid, {
+        document: await fs.readFile(filePath),
+        mimetype: 'text/plain',
+        fileName: `worker-${session.workerId}-${safeFileName(target.title)}.txt`,
+        caption: `Extract worker #${session.workerId}: ${target.title}`
+      });
+    } finally {
+      await cleanupFiles([filePath]);
     }
-  });
+    return;
+  }
+  if (action === 'send') {
+    const { targetText, bodyText } = parseWorkerSendArgs(command.rawArgs);
+    if (!targetText) throw new Error('Format: ,send <nomor|kontak|group> [teks]');
+    const target = resolveWorkerTarget(runtime, targetText);
+    if (bodyText) {
+      await runtime.sock.sendMessage(target.jid, { text: bodyText });
+      await sendControlText(jid, `Worker #${session.workerId} mengirim pesan ke ${target.title}.`);
+      return;
+    }
+    session.compose = { target };
+    await sendControlText(jid, `Compose worker #${session.workerId} ke ${target.title}. Kirim teks/media berikutnya untuk diteruskan.`);
+    return;
+  }
+  await sendControlText(jid, `Command worker tidak dikenal: ${COMMAND_PREFIX}${action}\nKetik ,help.`);
+}
+
+async function handleWorkerLogsCommand(session, runtime, message, command) {
+  const jid = message.key.remoteJid;
+  const sub = (command.args[0] || 'status').toLowerCase();
+  if (sub === 'status') {
+    await sendControlText(jid, formatWorkerConfig(await state.workerLogs.loadConfig(session.workerId)));
+    return;
+  }
+  if (['off', 'dm', 'all'].includes(sub)) {
+    const config = await state.workerLogs.setMode(session.workerId, sub);
+    await sendControlText(jid, formatWorkerConfig(config));
+    return;
+  }
+  if (sub === 'list') {
+    await sendControlText(jid, formatWorkerConfig(await state.workerLogs.loadConfig(session.workerId)));
+    return;
+  }
+  if (sub === 'add') {
+    const query = command.args.slice(1).join(' ').trim();
+    if (!query) throw new Error('Format: ,logs add <nomor|group>');
+    const target = resolveWorkerTarget(runtime, query);
+    const item = await state.workerLogs.addTarget(session.workerId, target);
+    await sendControlText(jid, `Target log #${item.id} ditambahkan: ${item.title} (${item.jid}).`);
+    return;
+  }
+  if (sub === 'del') {
+    const query = command.args.slice(1).join(' ').trim();
+    if (!query) throw new Error('Format: ,logs del <id|target>');
+    const item = await state.workerLogs.deleteTarget(session.workerId, query);
+    await sendControlText(jid, `Target log #${item.id} ${item.title} dihapus.`);
+    return;
+  }
+  throw new Error('Format: ,logs status|off|dm|all|list|add <target>|del <target>');
+}
+
+async function sendWorkerComposeMessage(session, message, text) {
+  const runtime = state.accountRuntimes.get(session.workerId);
+  if (!runtime?.sock) throw new Error(`Worker #${session.workerId} tidak aktif.`);
+  const target = session.compose.target;
+  let media = null;
+  try {
+    media = await downloadQuotedOrOwnMedia(messageSock(message), message, `worker-${session.workerId}-compose`).catch(() => null);
+    if (media) {
+      await sendDownloadedMediaWithSender(runtime.sock, target.jid, media, { caption: getMessageText(message).trim() });
+    } else {
+      const body = String(text || '').trim();
+      if (!body) throw new Error('Kirim teks atau media untuk compose worker.');
+      await runtime.sock.sendMessage(target.jid, { text: body });
+    }
+    session.compose = null;
+    await sendControlText(session.jid, `Worker #${session.workerId} mengirim pesan ke ${target.title}.`);
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
+}
+
+async function sendControlText(jid, text) {
+  return sendControlMessage(jid, { text });
+}
+
+async function sendControlMessage(jid, content, options) {
+  const previous = state.commandOutputMode;
+  state.commandOutputMode = 'trust';
+  try {
+    return await sendBotMessage(jid, content, options);
+  } finally {
+    state.commandOutputMode = previous;
+  }
+}
+
+function workerControlHelp(workerId) {
+  return [
+    `Help control worker #${workerId}`,
+    `${COMMAND_PREFIX}contacts / ${COMMAND_PREFIX}kontak`,
+    `${COMMAND_PREFIX}groups / ${COMMAND_PREFIX}grup`,
+    `${COMMAND_PREFIX}logs status|off|dm|all|list|add <target>|del <target>`,
+    `${COMMAND_PREFIX}extract <nomor|wa.me|nama group>`,
+    `${COMMAND_PREFIX}send <target> [teks]`,
+    `${COMMAND_PREFIX}exit`
+  ].join('\n');
+}
+
+function formatWorkerContacts(runtime) {
+  const contacts = [...runtime.contacts.values()]
+    .filter((item) => item.jid.endsWith('@s.whatsapp.net') || /^\d+@/.test(item.jid))
+    .sort((a, b) => (a.name || a.jid).localeCompare(b.name || b.jid));
+  if (!contacts.length) return 'Kontak worker belum tersedia di cache.';
+  return ['Kontak worker:', ...contacts.map((item, index) => `${index + 1}. ${item.name || '-'} - ${workerWaLink(item.jid)}`)].join('\n');
+}
+
+function formatWorkerGroups(runtime) {
+  const groups = [...runtime.groups.values()].sort((a, b) => a.subject.localeCompare(b.subject));
+  if (!groups.length) return 'Group worker belum tersedia di cache.';
+  return ['Group worker:', ...groups.map((item, index) => `${index + 1}. ${item.subject} - ${item.jid}`)].join('\n');
+}
+
+function parseWorkerSendArgs(rawArgs) {
+  const text = String(rawArgs || '').trim();
+  if (!text) return { targetText: '', bodyText: '' };
+  if (text.startsWith('"') || text.startsWith("'")) {
+    const quote = text[0];
+    let escaped = false;
+    for (let index = 1; index < text.length; index += 1) {
+      const char = text[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (char === quote) {
+        return {
+          targetText: text.slice(1, index),
+          bodyText: text.slice(index + 1).trim()
+        };
+      }
+    }
+  }
+  const [targetText, ...body] = text.split(/\s+/);
+  return { targetText, bodyText: body.join(' ').trim() };
+}
+
+function resolveWorkerTarget(runtime, input) {
+  const text = String(input || '').trim();
+  if (!text) throw new Error('Target wajib diisi.');
+  const waMe = text.match(/wa\.me\/(\d+)/i)?.[1];
+  if (waMe) {
+    const jid = normalizePhoneToWhatsAppJid(waMe);
+    return { jid, title: workerWaLink(jid), type: 'user' };
+  }
+  const normalizedJid = tryNormalizeJid(text);
+  if (normalizedJid) return describeWorkerTarget(runtime, normalizedJid, text);
+  const phoneJid = tryNormalizePhoneToWhatsAppJid(text);
+  if (phoneJid) return { jid: phoneJid, title: workerWaLink(phoneJid), type: 'user' };
+  const key = normalizeLookupText(text);
+  const contactMatches = [...runtime.contacts.values()].filter((item) => normalizeLookupText(item.name) === key);
+  if (contactMatches.length === 1) return describeWorkerTarget(runtime, contactMatches[0].jid, text);
+  const groupMatches = [...runtime.groups.values()].filter((item) => normalizeLookupText(item.subject) === key);
+  if (groupMatches.length === 1) return describeWorkerTarget(runtime, groupMatches[0].jid, text);
+  const fuzzyGroups = [...runtime.groups.values()].filter((item) => normalizeLookupText(item.subject).includes(key));
+  if (fuzzyGroups.length === 1) return describeWorkerTarget(runtime, fuzzyGroups[0].jid, text);
+  const resolved = runtime.chatDirectory.resolve(text);
+  if (resolved.ok) return { jid: resolved.item.jid, title: resolved.item.currentName || resolved.item.savedName, type: resolved.item.type };
+  throw new Error(`Target worker "${text}" tidak ditemukan di cache kontak/group worker.`);
+}
+
+function describeWorkerTarget(runtime, jid, input) {
+  const group = runtime.groups.get(jid);
+  if (group) return { jid, title: group.subject || input || jid, type: 'group' };
+  const contact = runtime.contacts.get(jid);
+  return { jid, title: contact?.name || input || workerWaLink(jid), type: jid.endsWith('@g.us') ? 'group' : 'user' };
+}
+
+function safeFileName(value) {
+  return String(value || 'target').replace(/[<>:"/\\|?*\x00-\x1F]+/g, '-').slice(0, 80) || 'target';
 }
 
 async function handleRestoreStart(message, actorJid) {
@@ -2200,7 +2604,10 @@ function isNamedMutation(command) {
 
 async function handleCommand(message, command, context = commandContext(message)) {
   const jid = message.key.remoteJid;
-  switch (command.name) {
+  const previousOutputMode = state.commandOutputMode;
+  state.commandOutputMode = shouldUseTrustForCommand(command.name, context) ? 'trust' : null;
+  try {
+    switch (command.name) {
     case 'help':
       await handleHelp(jid, command, context);
       break;
@@ -2336,9 +2743,6 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'changedmsg':
       await handleChangedMsgCommand(message, command, context);
       break;
-    case 'statussave':
-      await handleStatusSaveCommand(message, command, context);
-      break;
     case 'restore':
       await handleRestoreStart(message, context.actorJid);
       break;
@@ -2365,6 +2769,9 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'bot':
       await handleBotCommand(message, command, context);
       break;
+    case 'jadibot':
+      await handleJadibotCommand(message, command, context);
+      break;
     case 'update':
       await requestConfirmation(jid, context.actorJid, {
         title: 'Update repo dan restart service',
@@ -2378,23 +2785,50 @@ async function handleCommand(message, command, context = commandContext(message)
     default:
       await sendText(jid, `Command tidak dikenal: ${COMMAND_PREFIX}${command.name}\nKetik ,help`);
       break;
+    }
+  } finally {
+    state.commandOutputMode = previousOutputMode;
   }
 }
 
-async function onMessageUpsert(event) {
+function shouldUseTrustForCommand(commandName, context) {
+  if (!context?.isOwner || !state.multiAccount?.isMulti?.()) return false;
+  if (!trustRuntime()) return false;
+  return !new Set([
+    'admin',
+    'allow',
+    'anticall',
+    'backup',
+    'bot',
+    'changedmsg',
+    'clear',
+    'config',
+    'jadibot',
+    'log',
+    'restore',
+    'restartbot',
+    'update'
+  ]).has(String(commandName || '').toLowerCase());
+}
+
+async function onMessageUpsert(event, runtime = primaryRuntime()) {
   for (const message of event.messages || []) {
+    attachRuntime(message, runtime);
     if (!message.message || !message.key?.remoteJid) continue;
     if (message.key.remoteJid === 'status@broadcast') {
-      if (isBotEnabled()) await maybeSaveStatusMessage(message);
       continue;
     }
     const jid = message.key.remoteJid;
-    const isOwner = Boolean(message.key?.fromMe);
-    if (isOwner && isIgnoredOwnOutput(message)) continue;
     const text = getMessageText(message);
     const command = parseCommand(text);
     const context = commandContext(message);
+    const isOwner = Boolean(context.isOwner);
+    if (message.key?.fromMe && isIgnoredOwnOutput(message, runtime)) continue;
     try {
+      if (await maybeCancelActivePairingFromInput(context, text, command)) {
+        // The input still continues through normal command handling after the QR session stops.
+      }
+      if (await maybeHandleWorkerControlInput(message, text, command, context)) continue;
       if (!isBotEnabled()) {
         if (context.isOwner && command?.name === 'bot') await handleCommand(message, command, context);
         continue;
@@ -2411,11 +2845,11 @@ async function onMessageUpsert(event) {
       }
 
       if (sessionActorMatches && state.saveRecorder.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
-        await state.saveRecorder.record(state.sock, message);
+        await state.saveRecorder.record(messageSock(message), message);
         continue;
       }
       if (sessionActorMatches && state.anticall.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
-        await state.anticall.record(state.sock, message);
+        await state.anticall.record(messageSock(message), message);
         continue;
       }
       if (sessionActorMatches && state.restoreSessions.has(jid) && (!command || !['end', 'cancel', 'confirm'].includes(command.name))) {
@@ -2472,12 +2906,12 @@ async function onMessagesDelete(update) {
   }
 }
 
-async function onMessagesReaction(updates) {
+async function onMessagesReaction(updates, runtime = primaryRuntime()) {
   if (!isBotEnabled()) return;
   for (const update of updates || []) {
     const intent = reactionIntent(update?.reaction?.text);
     if (!intent) continue;
-    const actorJid = reactionActorJid(update);
+    const actorJid = reactionActorJid(update, runtime);
     const action = state.reactionActions.get(update.key, actorJid);
     if (!action) continue;
     try {
@@ -2513,6 +2947,182 @@ async function loadGroups(sock) {
     await logger.info('Loaded groups', { count: Object.keys(groups || {}).length });
   } catch (error) {
     await logger.warn('Could not fetch groups', { error: error.message });
+  }
+}
+
+async function loadGroupsForRuntime(runtime) {
+  try {
+    const groups = await runtime.sock.groupFetchAllParticipating();
+    for (const group of Object.values(groups || {})) rememberRuntimeGroup(runtime, group);
+    if (runtime.account.id === 1) {
+      for (const group of Object.values(groups || {})) state.chatDirectory.remember(group.id, group.subject);
+    }
+    await logger.info('Loaded account groups', { accountId: runtime.account.id, count: Object.keys(groups || {}).length });
+  } catch (error) {
+    await logger.warn('Could not fetch account groups', { accountId: runtime.account.id, error: error.message });
+  }
+}
+
+function createRuntime(account) {
+  const existing = state.accountRuntimes.get(account.id);
+  const runtime = existing || {
+    account,
+    sock: null,
+    status: account.status || 'disconnected',
+    ignoredOwnMessageIds: new Set(),
+    chatDirectory: new ChatDirectory(),
+    contacts: new Map(),
+    groups: new Map(),
+    reconnecting: false,
+    stopReconnect: false,
+    pairing: null
+  };
+  runtime.account = account;
+  runtime.status = account.status || runtime.status || 'disconnected';
+  state.accountRuntimes.set(account.id, runtime);
+  return runtime;
+}
+
+function rememberRuntimeContact(runtime, contact = {}) {
+  const jid = tryNormalizeJid(contact.id || contact.jid);
+  if (!jid) return;
+  const name = contact.name || contact.notify || contact.verifiedName || contact.pushName || contact.shortName || '';
+  runtime.contacts.set(jid, {
+    jid,
+    name: String(name || '').trim(),
+    updatedAt: new Date().toISOString()
+  });
+  runtime.chatDirectory.remember(jid, name);
+}
+
+function rememberRuntimeChat(runtime, chat = {}) {
+  const jid = tryNormalizeJid(chat.id || chat.jid);
+  if (!jid) return;
+  const name = chat.name || chat.subject || chat.pushName || '';
+  runtime.chatDirectory.remember(jid, name);
+  if (jid.endsWith('@g.us')) {
+    runtime.groups.set(jid, {
+      jid,
+      subject: String(name || '').trim() || jid,
+      updatedAt: new Date().toISOString()
+    });
+  }
+}
+
+function rememberRuntimeGroup(runtime, group = {}) {
+  const jid = tryNormalizeJid(group.id || group.jid);
+  if (!jid) return;
+  const subject = String(group.subject || group.name || jid).trim();
+  runtime.groups.set(jid, {
+    jid,
+    subject,
+    participants: Array.isArray(group.participants) ? group.participants.length : undefined,
+    updatedAt: new Date().toISOString()
+  });
+  runtime.chatDirectory.remember(jid, subject);
+}
+
+function rememberRuntimeMessageDirectory(runtime, message) {
+  const remoteJid = message.key?.remoteJid;
+  if (!remoteJid) return;
+  runtime.chatDirectory.remember(remoteJid);
+  if (!remoteJid.endsWith('@g.us')) {
+    runtime.chatDirectory.remember(remoteJid, message.pushName);
+    if (message.pushName) {
+      runtime.contacts.set(remoteJid, {
+        jid: remoteJid,
+        name: message.pushName,
+        updatedAt: new Date().toISOString()
+      });
+    }
+  }
+  if (message.key?.participant) runtime.chatDirectory.remember(message.key.participant, message.pushName);
+}
+
+async function onSecondaryMessageUpsert(runtime, event) {
+  for (const message of event.messages || []) {
+    attachRuntime(message, runtime);
+    if (!message.message || !message.key?.remoteJid || message.key.remoteJid === 'status@broadcast') continue;
+    if (message.key?.fromMe && isIgnoredOwnOutput(message, runtime)) continue;
+
+    rememberRuntimeMessageDirectory(runtime, message);
+    if (runtime.account.role === 'trust') {
+      await handleTrustMessage(runtime, message);
+      continue;
+    }
+    if (runtime.account.role === 'worker') {
+      await maybeLogWorkerMessage(runtime, message);
+    }
+  }
+}
+
+async function handleTrustMessage(runtime, message) {
+  const text = getMessageText(message);
+  const command = parseCommand(text);
+  const context = commandContext(message);
+  try {
+    if (await maybeCancelActivePairingFromInput(context, text, command)) {
+      // Continue handling the new input after stopping the QR session.
+    }
+    if (await maybeHandleWorkerControlInput(message, text, command, context)) return;
+    if (!command || !context.isOwner) return;
+    if (!isBotEnabled() && command.name !== 'bot') return;
+    if (!state.commandAccess?.canUseAs(command.name, message.key.remoteJid, context.actorJid, { owner: context.isOwner })) return;
+    await handleCommand(message, command, context);
+  } catch (error) {
+    await logger.error('Trust command error', { accountId: runtime.account.id, jid: message.key.remoteJid, error: error.message, text });
+    await sendText(message.key.remoteJid, `Error: ${error.message}`);
+  }
+}
+
+async function maybeLogWorkerMessage(runtime, message) {
+  if (!state.workerLogs || !runtime?.sock) return false;
+  if (isDestinationChat(message.key?.remoteJid)) return false;
+  if (!await state.workerLogs.shouldLog(runtime.account.id, message)) return false;
+
+  const actorJid = messageActorJid(message);
+  const entry = await state.workerLogs.append(runtime.account.id, createWorkerLogEntry(runtime.account, message, {
+    actorJid,
+    actorName: runtime.chatDirectory.nameFor(actorJid) || message.pushName || '',
+    remoteName: runtime.chatDirectory.nameFor(message.key.remoteJid) || runtime.groups.get(message.key.remoteJid)?.subject || ''
+  }));
+  const header = formatWorkerLogHeader(entry);
+  const targets = [...new Set([safeDestinationJid('workerDev'), safeDestinationJid('workerLogs')].filter(Boolean))];
+  if (!targets.length) return true;
+
+  for (const target of targets) {
+    try {
+      const sentHeader = await runtime.sock.sendMessage(target, { text: header });
+      rememberOwnOutput(sentHeader, runtime);
+      if (mediaNode(message)) await forwardWorkerLogMedia(runtime, target, message);
+    } catch (error) {
+      await logger.warn('Worker log send failed', { accountId: runtime.account.id, target, error: error.message });
+    }
+  }
+  return true;
+}
+
+async function forwardWorkerLogMedia(runtime, target, message) {
+  let media = null;
+  try {
+    if (isViewOnceMediaMessage(message)) {
+      media = await downloadMessageMedia(runtime.sock, message, `worker-${runtime.account.id}-viewonce`);
+      if (!media) return;
+      const stat = await fs.stat(media.path).catch(() => null);
+      const maxBytes = state.runtimeConfig?.workerLogsSettings?.().maxMediaBytes || 25 * 1024 * 1024;
+      if (stat?.size && stat.size > maxBytes) {
+        const sent = await runtime.sock.sendMessage(target, { text: `Media dilewati karena ${formatBytes(stat.size)} melebihi batas ${formatBytes(maxBytes)}.` });
+        rememberOwnOutput(sent, runtime);
+        return;
+      }
+      const sent = await sendDownloadedMediaWithSender(runtime.sock, target, media, { caption: media.node?.caption });
+      rememberOwnOutput(sent, runtime);
+      return;
+    }
+    const sent = await runtime.sock.sendMessage(target, { forward: message, force: true });
+    rememberOwnOutput(sent, runtime);
+  } finally {
+    await cleanupFiles([media?.path]);
   }
 }
 
@@ -2561,7 +3171,34 @@ async function maybeRejectCall(call) {
 }
 
 async function connect() {
-  const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  await connectAccount(state.multiAccount.getPrimary());
+  if (state.multiAccount.isMulti()) {
+    for (const account of state.multiAccount.listAccounts().filter((item) => item.id !== 1)) {
+      connectAccount(account).catch((error) => logger.error('Secondary connect failed', { accountId: account.id, error: error.message }));
+    }
+  }
+}
+
+async function connectAccount(account, options = {}) {
+  const runtime = createRuntime(account);
+  runtime.stopReconnect = false;
+  if (options.pairing) {
+    runtime.pairing = {
+      ...options.pairing,
+      qrCount: options.pairing.qrCount || 0,
+      qrLimit: options.pairing.qrLimit || 5,
+      expiresTimer: null,
+      connected: false,
+      cancelled: false
+    };
+    state.activePairing = {
+      accountId: account.id,
+      actorJid: options.pairing.actorJid,
+      chatJid: options.pairing.chatJid
+    };
+  }
+
+  const { state: authState, saveCreds } = await useMultiFileAuthState(accountAuthPath(account, ROOT_DIR));
   const { version } = await fetchLatestBaileysVersion();
   const sock = makeWASocket({
     auth: authState,
@@ -2570,58 +3207,216 @@ async function connect() {
     markOnlineOnConnect: false,
     syncFullHistory: false,
     logger: pino({ level: 'silent' }),
-    browser: ['IrOBot', 'Chrome', '1.0.0']
+    browser: [`IrOBot-${account.role}-${account.id}`, 'Chrome', '1.0.0']
   });
 
-  state.sock = sock;
-  state.scheduler?.stop();
-  state.scheduler = new TaskScheduler(sock, state.chatDirectory, logger);
-  state.reminderScheduler?.stop();
-  state.reminderScheduler = new ReminderScheduler(sock, state.chatDirectory, logger);
+  runtime.sock = sock;
+  runtime.status = 'connecting';
+  runtime.account = await state.multiAccount.updateAccount(account.id, { status: 'connecting', lastError: null });
+
+  if (account.id === 1) {
+    state.sock = sock;
+    state.scheduler?.stop();
+    state.scheduler = new TaskScheduler(schedulerSock(), state.chatDirectory, logger);
+    state.reminderScheduler?.stop();
+    state.reminderScheduler = new ReminderScheduler(schedulerSock(), state.chatDirectory, logger);
+  }
 
   sock.ev.on('creds.update', saveCreds);
-  sock.ev.on('messages.upsert', onMessageUpsert);
-  sock.ev.on('messages.update', onMessagesUpdate);
-  sock.ev.on('messages.delete', onMessagesDelete);
-  sock.ev.on('messages.reaction', onMessagesReaction);
-  sock.ev.on('call', onCallUpdate);
+  sock.ev.on('messages.upsert', (event) => {
+    if (runtime.account.id === 1) onMessageUpsert(event, runtime);
+    else onSecondaryMessageUpsert(runtime, event);
+  });
+  if (account.id === 1) {
+    sock.ev.on('messages.update', onMessagesUpdate);
+    sock.ev.on('messages.delete', onMessagesDelete);
+    sock.ev.on('call', onCallUpdate);
+  }
+  sock.ev.on('messages.reaction', (updates) => onMessagesReaction(updates, runtime));
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const contact of contacts || []) rememberRuntimeContact(runtime, contact);
+  });
+  sock.ev.on('contacts.update', (contacts) => {
+    for (const contact of contacts || []) rememberRuntimeContact(runtime, contact);
+  });
   sock.ev.on('chats.upsert', (chats) => {
-    for (const chat of chats || []) state.chatDirectory.remember(chat.id, chat.name || chat.subject);
+    for (const chat of chats || []) {
+      rememberRuntimeChat(runtime, chat);
+      if (runtime.account.id === 1 || runtime.account.role === 'trust') state.chatDirectory.remember(chat.id, chat.name || chat.subject);
+    }
   });
   sock.ev.on('chats.update', (chats) => {
-    for (const chat of chats || []) state.chatDirectory.remember(chat.id, chat.name || chat.subject);
+    for (const chat of chats || []) {
+      rememberRuntimeChat(runtime, chat);
+      if (runtime.account.id === 1 || runtime.account.role === 'trust') state.chatDirectory.remember(chat.id, chat.name || chat.subject);
+    }
+  });
+  sock.ev.on('groups.upsert', (groups) => {
+    for (const group of groups || []) {
+      rememberRuntimeGroup(runtime, group);
+      if (runtime.account.id === 1 || runtime.account.role === 'trust') state.chatDirectory.remember(group.id, group.subject);
+    }
   });
   sock.ev.on('groups.update', (groups) => {
-    for (const group of groups || []) state.chatDirectory.remember(group.id, group.subject);
-  });
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      console.log(await QRCode.toString(qr, { type: 'terminal', small: true }));
-    }
-    if (connection === 'open') {
-      console.log('WhatsApp connected.');
-      await logger.info('WhatsApp connected');
-      await loadGroups(sock);
-      await hydrateConfiguredDestinations();
-      applyBotRuntimeState();
-    }
-    if (connection === 'close') {
-      state.scheduler?.stop();
-      state.reminderScheduler?.stop();
-      state.backupScheduler?.stop();
-      await logger.warn('Connection closed', { error: lastDisconnect?.error?.message });
-      if (shouldReconnect(lastDisconnect) && !state.reconnecting) {
-        state.reconnecting = true;
-        setTimeout(() => {
-          state.reconnecting = false;
-          connect().catch((error) => logger.error('Reconnect failed', { error: error.message }));
-        }, 3000);
-      } else if (!shouldReconnect(lastDisconnect)) {
-        console.log('Logged out. Hapus folder auth lalu scan ulang jika ingin login lagi.');
-      }
+    for (const group of groups || []) {
+      rememberRuntimeGroup(runtime, group);
+      if (runtime.account.id === 1 || runtime.account.role === 'trust') state.chatDirectory.remember(group.id, group.subject);
     }
   });
+  sock.ev.on('connection.update', (update) => handleConnectionUpdate(runtime, update));
+  return runtime;
+}
+
+function schedulerSock() {
+  return trustRuntime()?.sock || state.sock;
+}
+
+function refreshSchedulerSock() {
+  const sock = schedulerSock();
+  if (state.scheduler) state.scheduler.sock = sock;
+  if (state.reminderScheduler) state.reminderScheduler.sock = sock;
+}
+
+async function handleConnectionUpdate(runtime, update) {
+  const { connection, lastDisconnect, qr } = update;
+  if (qr) await handleAccountQr(runtime, qr);
+  if (connection === 'open') await handleAccountOpen(runtime);
+  if (connection === 'close') await handleAccountClose(runtime, lastDisconnect);
+}
+
+async function handleAccountQr(runtime, qr) {
+  runtime.status = 'qr';
+  runtime.account = await state.multiAccount.updateAccount(runtime.account.id, {
+    status: 'qr',
+    lastQrAt: new Date().toISOString(),
+    lastError: null
+  });
+  if (runtime.account.id === 1) {
+    console.log(await QRCode.toString(qr, { type: 'terminal', small: true }));
+    return;
+  }
+  if (!runtime.pairing || runtime.pairing.cancelled) return;
+  if (runtime.pairing.qrCount >= runtime.pairing.qrLimit) {
+    await stopPairingRuntime(runtime, 'QR pairing melebihi batas 5 kali.');
+    return;
+  }
+  runtime.pairing.qrCount += 1;
+  if (runtime.pairing.expiresTimer) clearTimeout(runtime.pairing.expiresTimer);
+  const buffer = await QRCode.toBuffer(qr, { type: 'png', margin: 1, width: 512 });
+  await sendPrimaryMessage(runtime.pairing.chatJid, {
+    image: buffer,
+    caption: [
+      `QR akun bot #${runtime.account.id}`,
+      `Percobaan: ${runtime.pairing.qrCount}/${runtime.pairing.qrLimit}`,
+      'Scan QR ini dari perangkat WhatsApp yang ingin dijadikan bot.'
+    ].join('\n')
+  });
+  runtime.pairing.expiresTimer = setTimeout(() => {
+    if (!runtime.pairing?.connected && runtime.pairing.qrCount >= runtime.pairing.qrLimit) {
+      stopPairingRuntime(runtime, 'QR pairing kadaluarsa setelah 5 kali percobaan.').catch((error) => {
+        logger.warn('Stop pairing failed', { accountId: runtime.account.id, error: error.message });
+      });
+    }
+  }, 65_000);
+  runtime.pairing.expiresTimer.unref?.();
+}
+
+async function handleAccountOpen(runtime) {
+  runtime.status = 'connected';
+  const jid = ownUserJid(runtime);
+  runtime.account = await state.multiAccount.updateAccount(runtime.account.id, {
+    status: 'connected',
+    jid,
+    phone: displayPhoneFromJid(jid),
+    name: runtime.sock?.user?.name || runtime.sock?.user?.verifiedName || runtime.account.name,
+    lastConnectedAt: new Date().toISOString(),
+    lastError: null
+  });
+  console.log(`WhatsApp account #${runtime.account.id} connected.`);
+  await logger.info('WhatsApp connected', { accountId: runtime.account.id, role: runtime.account.role, jid });
+  await loadGroupsForRuntime(runtime);
+  if (runtime.account.id === 1) {
+    await hydrateConfiguredDestinations();
+    applyBotRuntimeState();
+  }
+  if (runtime.account.role === 'trust') refreshSchedulerSock();
+  if (runtime.pairing) {
+    runtime.pairing.connected = true;
+    if (runtime.pairing.expiresTimer) clearTimeout(runtime.pairing.expiresTimer);
+    state.activePairing = null;
+    await sendPrimaryMessage(runtime.pairing.chatJid, {
+      text: `Bot #${runtime.account.id} ${runtime.account.name || accountWaLink(runtime.account)} telah aktif.`
+    });
+    runtime.pairing = null;
+  }
+}
+
+async function handleAccountClose(runtime, lastDisconnect) {
+  if (runtime.account.id === 1) {
+    state.scheduler?.stop();
+    state.reminderScheduler?.stop();
+    state.backupScheduler?.stop();
+  }
+  const canReconnect = shouldReconnect(lastDisconnect);
+  const reconnect = canReconnect && !runtime.stopReconnect;
+  const status = canReconnect ? 'disconnected' : 'logged_out';
+  runtime.status = status;
+  runtime.account = await state.multiAccount.updateAccount(runtime.account.id, {
+    status,
+    lastError: lastDisconnect?.error?.message || null
+  }).catch(() => runtime.account);
+  await logger.warn('Connection closed', { accountId: runtime.account.id, error: lastDisconnect?.error?.message });
+  if (runtime.account.role === 'trust') refreshSchedulerSock();
+
+  if (runtime.pairing && runtime.pairing.qrCount >= runtime.pairing.qrLimit) {
+    await stopPairingRuntime(runtime, 'QR pairing gagal tersambung setelah 5 kali percobaan.');
+    return;
+  }
+  if (reconnect && !runtime.reconnecting) {
+    runtime.reconnecting = true;
+    setTimeout(() => {
+      runtime.reconnecting = false;
+      connectAccount(runtime.account, runtime.pairing ? { pairing: runtime.pairing } : {}).catch((error) => logger.error('Reconnect failed', {
+        accountId: runtime.account.id,
+        error: error.message
+      }));
+    }, 3000);
+  } else if (!reconnect && runtime.account.id === 1) {
+    console.log('Logged out. Hapus folder auth lalu scan ulang jika ingin login lagi.');
+  }
+}
+
+async function sendPrimaryMessage(jid, content, options) {
+  const runtime = primaryRuntime();
+  if (!runtime?.sock) throw new Error('Akun primary belum siap.');
+  const sent = await runtime.sock.sendMessage(jid, content, options);
+  rememberOwnOutput(sent, runtime);
+  return sent;
+}
+
+async function stopPairingRuntime(runtime, reason) {
+  if (!runtime?.pairing) return false;
+  runtime.pairing.cancelled = true;
+  runtime.stopReconnect = true;
+  if (runtime.pairing.expiresTimer) clearTimeout(runtime.pairing.expiresTimer);
+  const chatJid = runtime.pairing.chatJid;
+  state.activePairing = null;
+  runtime.pairing = null;
+  runtime.sock?.end?.(new Error(reason));
+  runtime.account = await state.multiAccount.updateAccount(runtime.account.id, {
+    status: 'disconnected',
+    lastError: reason
+  }).catch(() => runtime.account);
+  if (chatJid) await sendPrimaryMessage(chatJid, { text: `Sesi QR bot #${runtime.account.id} berhenti: ${reason}` }).catch(() => {});
+  return true;
+}
+
+async function maybeCancelActivePairingFromInput(context, text, command) {
+  if (!state.activePairing || !context?.isOwner || !String(text || '').trim()) return false;
+  const runtime = state.accountRuntimes.get(state.activePairing.accountId);
+  if (!runtime?.pairing) return false;
+  if (command?.name === 'confirm') return false;
+  return stopPairingRuntime(runtime, 'super admin mengirim input lain.');
 }
 
 async function maybeLogSystemdTip() {
@@ -2650,8 +3445,9 @@ async function main() {
   await state.runtimeConfig.load();
   state.changedMessages = new ChangedMessageStore();
   await state.changedMessages.load();
-  state.statusSave = new StatusSaveStore();
-  await state.statusSave.load();
+  state.multiAccount = new MultiAccountStore();
+  await state.multiAccount.load();
+  state.workerLogs = new WorkerLogStore(WORKER_LOG_DIR);
   state.tools = await detectTools();
   state.pdfSessions = new PdfSessions(state.tools);
   state.restoreSessions = new RestoreSessions();
@@ -2660,7 +3456,7 @@ async function main() {
   await state.anticall.load();
   state.backupScheduler = new DailyBackupScheduler(
     logger,
-    async () => sendDataBackupToWhatsApp(botSender(), destinationJid('backup'), {
+    async () => sendDataBackupToWhatsApp(primaryBotSender(), destinationJid('backup'), {
       partSizeBytes: state.runtimeConfig.backupPartSizeBytes()
     }),
     {

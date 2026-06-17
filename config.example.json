@@ -30,16 +30,21 @@
     "logs": "logs",
     "changedmsg": "changedmsg",
     "saved": "saved",
-    "backup": "backup"
+    "backup": "backup",
+    "workerDev": "dev",
+    "workerLogs": "worker-logs"
   },
   "changedmsg": {
     "enabled": true,
     "indexMaxItems": 1000,
     "maxMediaMb": 25
   },
-  "statussave": {
-    "enabled": true,
-    "maxMediaMb": 25
+  "workerLogs": {
+    "maxMediaMb": 25,
+    "defaultMode": "dm"
+  },
+  "workerControl": {
+    "timeoutMs": 600000
   },
   "update": {
     "restartMode": "systemctl",

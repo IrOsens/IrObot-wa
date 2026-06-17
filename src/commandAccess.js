@@ -11,7 +11,7 @@ export const ADMIN_RESTRICTED_COMMANDS = new Set([
   'bot',
   'changedmsg',
   'config',
-  'statussave',
+  'jadibot',
   'backup',
   'restore',
   'clear',

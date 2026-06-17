@@ -10,6 +10,8 @@ export const SAVED_MESSAGES_DIR = path.join(DATA_DIR, 'saved-messages');
 export const SAVED_MESSAGES_FILE = path.join(DATA_DIR, 'saved-messages.json');
 export const ANTICALL_MEDIA_DIR = path.join(DATA_DIR, 'anticall-media');
 export const ANTICALL_FILE = path.join(DATA_DIR, 'anticall.json');
+export const MULTI_ACCOUNT_FILE = path.join(DATA_DIR, 'multi-account.json');
+export const WORKER_LOG_DIR = path.join(DATA_DIR, 'worker-logs');
 export const LOG_DIR = path.join(ROOT_DIR, 'logs');
 export const TEMP_DIR = path.join(ROOT_DIR, 'temp');
 export const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
@@ -17,7 +19,6 @@ export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 export const COMMAND_ACCESS_FILE = path.join(DATA_DIR, 'command-access.json');
 export const BOT_STATE_FILE = path.join(DATA_DIR, 'bot-state.json');
 export const CHANGED_MESSAGES_FILE = path.join(DATA_DIR, 'changed-messages.json');
-export const STATUS_SAVE_FILE = path.join(DATA_DIR, 'status-save.json');
 export const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
 export const LINKS_FILE = path.join(DATA_DIR, 'links.json');
 export const REMINDERS_FILE = path.join(DATA_DIR, 'reminders.json');
@@ -56,16 +57,21 @@ export const DEFAULT_APP_CONFIG = {
     logs: 'logs',
     changedmsg: 'changedmsg',
     saved: 'saved',
-    backup: 'backup'
+    backup: 'backup',
+    workerDev: 'dev',
+    workerLogs: 'worker-logs'
   },
   changedmsg: {
     enabled: true,
     indexMaxItems: 1000,
     maxMediaMb: 25
   },
-  statussave: {
-    enabled: true,
-    maxMediaMb: 25
+  workerLogs: {
+    maxMediaMb: 25,
+    defaultMode: 'dm'
+  },
+  workerControl: {
+    timeoutMs: 10 * 60 * 1000
   },
   update: {
     restartMode: 'systemctl',
@@ -115,6 +121,7 @@ export async function ensureRuntimeDirs() {
     fs.mkdir(TASK_MEDIA_DIR, { recursive: true }),
     fs.mkdir(SAVED_MESSAGES_DIR, { recursive: true }),
     fs.mkdir(ANTICALL_MEDIA_DIR, { recursive: true }),
+    fs.mkdir(WORKER_LOG_DIR, { recursive: true }),
     fs.mkdir(LOG_DIR, { recursive: true }),
     fs.mkdir(TEMP_DIR, { recursive: true })
   ]);
@@ -124,7 +131,7 @@ export async function ensureRuntimeDirs() {
     ensureJsonFile(COMMAND_ACCESS_FILE, { all: false, chats: {}, admins: [], nextAdminId: 1 }),
     ensureJsonFile(BOT_STATE_FILE, { enabled: true, updatedAt: null }),
     ensureJsonFile(CHANGED_MESSAGES_FILE, { allowedChats: [], nextAllowedId: 1, index: [], updatedAt: null }),
-    ensureJsonFile(STATUS_SAVE_FILE, { nextId: 1, items: [], updatedAt: null }),
+    ensureJsonFile(MULTI_ACCOUNT_FILE, { mode: 'single', superAdminJid: null, nextId: 2, accounts: [{ id: 1, role: 'primary', authDir: 'auth', status: 'disconnected', createdAt: null }] }),
     ensureJsonFile(ANTICALL_FILE, { enabled: false, entries: [], updatedAt: null }),
     ensureJsonFile(TASKS_FILE, { nextId: 1, tasks: [] }),
     ensureJsonFile(SAVED_MESSAGES_FILE, { nextId: 1, items: [] }),
