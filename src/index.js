@@ -854,20 +854,10 @@ async function handleSticker(message, command) {
     if (!media) throw new Error('Kirim/reply media atau sertakan URL media yang valid.');
     const animated = await isAnimatedMedia(media);
     const sticker = await makeSticker(media, { author: meta.author, title: meta.title, tools: state.tools });
-    await sendBotMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
-    if (message.key?.fromMe && media.url) await sendStickerFileCopy(jid, sticker);
+    await state.sock.sendMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
   } finally {
     await cleanupFiles([media?.path]);
   }
-}
-
-async function sendStickerFileCopy(jid, sticker) {
-  await sendBotMessage(jid, {
-    document: sticker,
-    mimetype: 'image/webp',
-    fileName: `${BOT_NAME}-sticker.webp`,
-    caption: 'Salinan file sticker untuk akun utama jika WhatsApp gagal copy/load sticker dari linked device.'
-  });
 }
 
 async function handleSmeme(message, command) {
@@ -888,7 +878,7 @@ async function handleSmeme(message, command) {
       tools: state.tools,
       smeme
     });
-    await sendBotMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
+    await state.sock.sendMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
   } finally {
     await cleanupFiles([media?.path]);
   }
