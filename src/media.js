@@ -26,11 +26,11 @@ const MEDIA_DOWNLOAD_TIMEOUT_MS = 25_000;
 const MEDIA_DOWNLOAD_RETRIES = 1;
 const MEDIA_DOWNLOAD_RETRY_BASE_MS = 600;
 const DEFAULT_WA_MEDIA_HOST = 'mmg.whatsapp.net';
+const URL_MEDIA_MAX_BYTES = 80 * 1024 * 1024;
 const URL_MEDIA_EXTS = new Set([
-  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.mp4', '.mov', '.mkv', '.webm',
+  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.mp4', '.mov', '.mkv', '.webm', '.avif',
   '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
 ]);
-const URL_PAGE_HOSTS = new Set(['tenor.com', 'www.tenor.com']);
 
 export function mediaNode(message) {
   const content = unwrapMessage(message?.message);
@@ -251,7 +251,6 @@ export async function downloadUrlMedia(text, prefix = 'url') {
 async function downloadUrlMediaFile(url, prefix, depth = 0) {
   const cleanUrl = url.split('?')[0].split('#')[0];
   const ext = path.extname(cleanUrl).toLowerCase();
-  if (!URL_MEDIA_EXTS.has(ext) && !isKnownMediaPage(url)) return null;
   const response = await fetch(url, {
     headers: {
       accept: 'image/avif,image/webp,image/apng,image/*,video/*,*/*;q=0.8',
@@ -259,17 +258,32 @@ async function downloadUrlMediaFile(url, prefix, depth = 0) {
     }
   });
   if (!response.ok) throw new Error(`Download URL gagal: HTTP ${response.status}`);
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (contentLength > URL_MEDIA_MAX_BYTES) {
+    throw new Error(`Download URL gagal: file terlalu besar (${Math.ceil(contentLength / 1024 / 1024)} MB).`);
+  }
   const arrayBuffer = await response.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
   if (!buffer.length) throw new Error('Download URL gagal: file kosong.');
+  if (buffer.length > URL_MEDIA_MAX_BYTES) {
+    throw new Error(`Download URL gagal: file terlalu besar (${Math.ceil(buffer.length / 1024 / 1024)} MB).`);
+  }
 
   const contentType = response.headers.get('content-type') || '';
   const detected = await fileTypeFromBuffer(buffer).catch(() => null);
   if (isHtmlResponse(buffer, contentType, detected)) {
-    if (depth >= 1) throw new Error('URL tidak mengarah ke file media langsung.');
-    const directUrl = extractDirectMediaUrl(buffer.toString('utf8'), url);
-    if (!directUrl) throw new Error('URL tersebut halaman HTML dan media langsungnya tidak ditemukan.');
-    return downloadUrlMediaFile(directUrl, prefix, depth + 1);
+    if (depth >= 2) throw new Error('URL tidak mengarah ke file media langsung.');
+    const directUrls = extractDirectMediaUrls(buffer.toString('utf8'), url);
+    if (!directUrls.length) throw new Error('URL tersebut halaman HTML dan media langsungnya tidak ditemukan.');
+    let lastError = null;
+    for (const directUrl of directUrls) {
+      try {
+        return await downloadUrlMediaFile(directUrl, prefix, depth + 1);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw new Error(`Media dari halaman HTML tidak bisa diunduh: ${lastError?.message || 'kandidat media gagal.'}`);
   }
 
   const saved = await saveBufferToTemp(buffer, prefix, bestFallbackExt({ detected, contentType, ext }));
@@ -300,15 +314,6 @@ async function removeWithRetry(file) {
   }
 }
 
-function isKnownMediaPage(url) {
-  try {
-    const parsed = new URL(url);
-    return URL_PAGE_HOSTS.has(parsed.hostname.toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
 function isHtmlResponse(buffer, contentType, detected) {
   if (/text\/html|application\/xhtml/i.test(contentType)) return true;
   if (detected) return false;
@@ -327,7 +332,7 @@ function isSupportedDownloadedMedia(media) {
   return URL_MEDIA_EXTS.has(ext) || /^(image|video|application\/pdf|application\/msword|application\/vnd\.|audio)\//i.test(media?.mimetype || '');
 }
 
-function extractDirectMediaUrl(html, baseUrl) {
+function extractDirectMediaUrls(html, baseUrl) {
   const candidates = [];
   const metaRe = /<meta\b[^>]*>/gi;
   let match;
@@ -342,9 +347,10 @@ function extractDirectMediaUrl(html, baseUrl) {
   }
 
   for (const pattern of [
+    /"url"\s*:\s*"([^"]+?\.(?:gif|mp4|webm|webp|png|avif|jpe?g)(?:\?[^"]*)?)"/gi,
     /"contentUrl"\s*:\s*"([^"]+)"/gi,
     /"media"\s*:\s*"([^"]+)"/gi,
-    /(https?:\\?\/\\?\/[^"'\s<>]+?\.(?:gif|mp4|webp|png|jpe?g)(?:\?[^"'\s<>]*)?)/gi
+    /(https?:\\?\/\\?\/[^"'\s<>]+?\.(?:gif|mp4|webm|webp|png|avif|jpe?g)(?:\?[^"'\s<>]*)?)/gi
   ]) {
     while ((match = pattern.exec(html))) candidates.push(match[1]);
   }
@@ -353,7 +359,7 @@ function extractDirectMediaUrl(html, baseUrl) {
     .map((candidate) => normalizeExtractedUrl(candidate, baseUrl))
     .filter(Boolean)
     .filter((candidate, index, array) => array.indexOf(candidate) === index)
-    .sort((a, b) => mediaCandidateRank(a) - mediaCandidateRank(b))[0] || null;
+    .sort((a, b) => mediaCandidateRank(a) - mediaCandidateRank(b));
 }
 
 function attrValue(tag, name) {
@@ -377,10 +383,12 @@ function normalizeExtractedUrl(value, baseUrl) {
 }
 
 function mediaCandidateRank(url) {
-  const ext = path.extname(new URL(url).pathname).toLowerCase();
-  return ['.gif', '.mp4', '.webp', '.png', '.jpg', '.jpeg'].indexOf(ext) >= 0
-    ? ['.gif', '.mp4', '.webp', '.png', '.jpg', '.jpeg'].indexOf(ext)
-    : 99;
+  const parsed = new URL(url);
+  const ext = path.extname(parsed.pathname).toLowerCase();
+  const text = parsed.toString().toLowerCase();
+  const sizeRank = /nano|tiny|small|preview/.test(text) ? -10 : /medium/.test(text) ? 5 : 0;
+  const extRank = ['.mp4', '.webm', '.gif', '.webp', '.png', '.jpg', '.jpeg', '.avif'].indexOf(ext);
+  return (extRank >= 0 ? extRank : 99) * 10 + sizeRank;
 }
 
 function decodeHtml(value) {

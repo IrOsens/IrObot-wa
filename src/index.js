@@ -53,7 +53,7 @@ import {
   mediaNode,
   quotedMediaNode
 } from './media.js';
-import { makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerMeta, reverseSticker } from './sticker.js';
+import { isAnimatedMedia, makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerMeta, reverseSticker } from './sticker.js';
 import { TaskScheduler, createTask, formatTaskList, formatWib, listTasks, updateTaskState } from './tasks.js';
 import { PdfSessions, parsePdfOrderText, parsePdfStartArgs } from './pdf.js';
 import { pdfToImages } from './pdfImages.js';
@@ -852,8 +852,9 @@ async function handleSticker(message, command) {
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'sticker-source');
     if (!media) media = await downloadUrlMedia(command.rawArgs, 'sticker-url');
     if (!media) throw new Error('Kirim/reply media atau sertakan URL media yang valid.');
+    const animated = await isAnimatedMedia(media);
     const sticker = await makeSticker(media, { author: meta.author, title: meta.title, tools: state.tools });
-    await state.sock.sendMessage(jid, { sticker });
+    await state.sock.sendMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
   } finally {
     await cleanupFiles([media?.path]);
   }
@@ -870,13 +871,14 @@ async function handleSmeme(message, command) {
     if (!['imageMessage', 'videoMessage', 'stickerMessage'].includes(media.type) && !supportedDocument) {
       throw new Error('Smeme hanya mendukung image, GIF, video, atau sticker.');
     }
+    const animated = await isAnimatedMedia(media);
     const sticker = await makeSmemeSticker(media, {
       author: DEFAULT_STICKER_AUTHOR,
       title: DEFAULT_STICKER_TITLE,
       tools: state.tools,
       smeme
     });
-    await state.sock.sendMessage(jid, { sticker });
+    await state.sock.sendMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
   } finally {
     await cleanupFiles([media?.path]);
   }

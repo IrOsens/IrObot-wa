@@ -94,8 +94,17 @@ Linux/Armbian:
 npm run service:install
 npm run service:status
 npm run service:logs
+npm run service:start
+npm run service:stop
 npm run service:restart
 npm run service:disable
+```
+
+Alias cepat dari folder project:
+
+```bash
+npm run bot:on
+npm run bot:off
 ```
 
 System service manual:
@@ -103,6 +112,8 @@ System service manual:
 ```bash
 sudo systemctl status irobot-wa --no-pager
 sudo journalctl -u irobot-wa -f
+sudo systemctl start irobot-wa
+sudo systemctl stop irobot-wa
 sudo systemctl restart irobot-wa
 sudo systemctl disable --now irobot-wa
 ```
@@ -112,6 +123,8 @@ User service:
 ```bash
 systemctl --user status irobot-wa --no-pager
 journalctl --user -u irobot-wa -f
+systemctl --user start irobot-wa
+systemctl --user stop irobot-wa
 systemctl --user restart irobot-wa
 systemctl --user disable --now irobot-wa
 ```

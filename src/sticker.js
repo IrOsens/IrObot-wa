@@ -40,6 +40,20 @@ export const SMEME_STYLE = {
   webpQuality: 90
 };
 
+const STICKER_MAX_BYTES = 950 * 1024;
+const STATIC_STICKER_PRESETS = [
+  { canvas: 512, quality: 90 },
+  { canvas: 448, quality: 82 },
+  { canvas: 384, quality: 74 }
+];
+const ANIMATED_STICKER_PRESETS = [
+  { canvas: 512, quality: 88, fps: 15, durationSeconds: 10 },
+  { canvas: 512, quality: 76, fps: 12, durationSeconds: 8 },
+  { canvas: 448, quality: 68, fps: 10, durationSeconds: 6 },
+  { canvas: 384, quality: 60, fps: 8, durationSeconds: 5 },
+  { canvas: 320, quality: 52, fps: 8, durationSeconds: 4 }
+];
+
 function buildStickerExif(author, title) {
   const json = Buffer.from(JSON.stringify({
     'sticker-pack-id': 'com.iro.wabot',
@@ -66,43 +80,76 @@ async function attachExif(inputPath, author, title) {
 }
 
 export async function makeSticker(media, { author, title, tools }) {
-  const temp = [];
-  try {
-    const rawSticker = makeTempPath('sticker', '.webp');
-    temp.push(rawSticker);
-    const animated = await isAnimatedMedia(media);
-    if (animated) {
-      if (await isAnimatedWebpMedia(media)) {
-        await animatedWebpToStickerWebp(media.path, rawSticker, {
-          canvas: SMEME_STYLE.baseSize,
-          quality: 90
-        });
-      } else {
-        if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Install FFmpeg untuk membuat sticker bergerak.');
-        await runTool(tools.ffmpeg, [
-          '-y',
-          '-i', media.path,
-          '-t', '10',
-          '-vf', 'fps=15,scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:-1:-1:color=0x00000000',
-          '-loop', '0',
-          '-an',
-          '-fps_mode', 'passthrough',
-          rawSticker
-        ]);
-      }
-    } else {
-      await sharp(media.path, { animated: false })
-        .resize(512, 512, { fit: 'inside', withoutEnlargement: true })
-        .webp({ quality: 90 })
-        .toFile(rawSticker);
-    }
+  const animated = await isAnimatedMedia(media);
+  const presets = animated ? ANIMATED_STICKER_PRESETS : STATIC_STICKER_PRESETS;
+  let smallestOversize = Infinity;
+  let lastError = null;
 
-    const withExif = await attachExif(rawSticker, author, title);
-    temp.push(withExif);
-    return await fs.readFile(withExif);
-  } finally {
-    await cleanupFiles(temp);
+  for (const preset of presets) {
+    const temp = [];
+    try {
+      const rawSticker = makeTempPath('sticker', '.webp');
+      temp.push(rawSticker);
+      if (animated) await renderAnimatedStickerWebp(media, rawSticker, tools, preset);
+      else await renderStaticStickerWebp(media, rawSticker, preset);
+
+      const withExif = await attachExif(rawSticker, author, title);
+      temp.push(withExif);
+      const sticker = await fs.readFile(withExif);
+      if (sticker.length <= STICKER_MAX_BYTES) return sticker;
+      smallestOversize = Math.min(smallestOversize, sticker.length);
+    } catch (error) {
+      lastError = error;
+    } finally {
+      await cleanupFiles(temp);
+    }
   }
+
+  if (Number.isFinite(smallestOversize)) {
+    throw new Error(`Sticker hasil konversi masih terlalu besar (${formatStickerBytes(smallestOversize)}). Coba URL/media yang lebih pendek atau lebih kecil.`);
+  }
+  throw lastError || new Error('Sticker gagal dibuat.');
+}
+
+async function renderStaticStickerWebp(media, outPath, preset) {
+  await sharp(media.path, { animated: false })
+    .resize(preset.canvas, preset.canvas, {
+      fit: 'contain',
+      withoutEnlargement: true,
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    })
+    .webp({ quality: preset.quality, effort: 6 })
+    .toFile(outPath);
+}
+
+async function renderAnimatedStickerWebp(media, outPath, tools, preset) {
+  if (await isAnimatedWebpMedia(media)) {
+    await animatedWebpToStickerWebp(media.path, outPath, {
+      canvas: preset.canvas,
+      quality: preset.quality,
+      maxDurationMs: preset.durationSeconds * 1000
+    });
+    return;
+  }
+
+  if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Install FFmpeg untuk membuat sticker bergerak.');
+  await runTool(tools.ffmpeg, [
+    '-y',
+    '-i', media.path,
+    '-t', String(preset.durationSeconds),
+    '-vf', `fps=${preset.fps},scale=${preset.canvas}:${preset.canvas}:force_original_aspect_ratio=decrease,pad=${preset.canvas}:${preset.canvas}:-1:-1:color=0x00000000`,
+    '-loop', '0',
+    '-an',
+    '-fps_mode', 'passthrough',
+    '-q:v', String(Math.max(1, 100 - preset.quality)),
+    outPath
+  ]);
+}
+
+function formatStickerBytes(bytes) {
+  if (!Number.isFinite(bytes)) return 'unknown';
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${Math.ceil(bytes / 1024)} KB`;
 }
 
 export function parseSmemeArgs(args) {
@@ -585,9 +632,14 @@ function isWebpMedia(media) {
   return /webp/i.test(media?.mimetype || '') || /\.webp$/i.test(media?.fileName || media?.path || '');
 }
 
-async function animatedWebpToStickerWebp(inputPath, outPath, { canvas, overlay = null, quality = 90 }) {
+async function animatedWebpToStickerWebp(inputPath, outPath, {
+  canvas,
+  overlay = null,
+  quality = 90,
+  maxDurationMs = SMEME_STYLE.maxDurationSeconds * 1000
+}) {
   const decoded = await decodeAnimatedWebpFrames(inputPath, {
-    maxDurationMs: SMEME_STYLE.maxDurationSeconds * 1000
+    maxDurationMs
   });
   const frames = [];
   for (const frame of decoded.frames) {

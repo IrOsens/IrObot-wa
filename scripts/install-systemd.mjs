@@ -224,6 +224,16 @@ async function main() {
     await systemctl(mode, ['restart', SERVICE_FILE]);
     return;
   }
+  if (action === 'start' || action === 'on') {
+    await systemctl(mode, ['start', SERVICE_FILE]);
+    log(`Service ${SERVICE_FILE} dinyalakan.`);
+    return;
+  }
+  if (action === 'stop' || action === 'off') {
+    await systemctl(mode, ['stop', SERVICE_FILE]);
+    log(`Service ${SERVICE_FILE} dimatikan.`);
+    return;
+  }
   if (action === 'enable') {
     await systemctl(mode, ['enable', SERVICE_FILE]);
     return;
@@ -232,7 +242,7 @@ async function main() {
     await systemctl(mode, ['disable', '--now', SERVICE_FILE]);
     return;
   }
-  fail('Command service tidak dikenal. Pakai install, status, logs, restart, enable, atau disable.');
+  fail('Command service tidak dikenal. Pakai install, status, logs, restart, start/on, stop/off, enable, atau disable.');
 }
 
 main().catch((error) => fail(error.message));
