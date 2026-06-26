@@ -371,6 +371,7 @@ const HELP_SECTIONS = [
     title: 'Server',
     items: [
       { name: 'status', text: ',status   Status server' },
+      { name: 'serverinfo', text: ',serverinfo Spesifikasi lengkap server' },
       { name: 'net', text: ',net      Cek koneksi' },
       { name: 'log', text: ',log      Lihat log terbaru' },
       { name: 'wol', text: ',wol      Wake-on-LAN' },
@@ -418,6 +419,7 @@ const HELP_DETAILS = {
   smeme: ['Format: ,smeme up <teks>', 'Format: ,smeme down <teks>', 'Advanced: tambah kualitas 1-99 di akhir.'],
   resend: ['Format: ,resend', 'Legacy: ,rs', 'Reply media/view-once. Sticker statis dikirim sebagai PNG, sticker bergerak sebagai GIF.'],
   status: ['Format: ,status atau ,status bot', ',status menampilkan server ringkas. ,status bot menampilkan destination, scheduler, changedmsg, statussave, dan warning nama grup duplikat.'],
+  serverinfo: ['Format: ,serverinfo', 'Menampilkan spesifikasi server lengkap: OS, CPU, RAM, disk, network, Node.js, dan proses bot.'],
   topdf: ['Format: ,topdf', 'Format: ,topdf <nama>', 'Format: ,topdf split <nama>', 'Format: ,topdf <nama> max <size>', 'Format: ,topdf split <nama> max <size>', 'Legacy: ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
   toimg: ['Format: ,toimg', 'Reply/kirim dokumen PDF, lalu bot mengirim tiap halaman sebagai gambar.'],
   note: ['Format: ,note list', 'Format: ,note add <judul> <teks>', 'Format: ,note get <id|judul>', 'Format: ,note del <id|judul>', 'Format: ,note rename <id|judul> <judul-baru>', 'Legacy: ,note <judul> <teks> dan ,note change tetap didukung.'],
@@ -531,6 +533,101 @@ async function handleStatus(jid) {
     `Process RAM: RSS ${formatBytes(mem.rss)}, heap ${formatBytes(mem.heapUsed)}/${formatBytes(mem.heapTotal)}`,
     `Time: ${new Date().toLocaleString()}`
   ].join('\n'));
+}
+
+async function handleServerInfo(jid) {
+  const mem = process.memoryUsage();
+  const disk = await getDiskInfo(ROOT_DIR);
+  const cpus = os.cpus();
+  const cpuModel = cpus[0]?.model || 'unknown';
+  const cpuSpeed = cpus[0]?.speed ? `${cpus[0].speed} MHz` : 'unknown';
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const networkLines = formatNetworkInterfaces();
+  const user = safeUserInfo();
+  const diskLines = disk
+    ? [
+        `Disk source: ${disk.source}`,
+        `Disk total: ${formatBytes(disk.size)}`,
+        `Disk used: ${formatBytes(disk.used)} (${formatPercent(disk.used, disk.size)})`,
+        `Disk free: ${formatBytes(disk.free)} (${formatPercent(disk.free, disk.size)})`
+      ]
+    : ['Disk: unavailable'];
+
+  await sendText(jid, [
+    'Server info:',
+    '',
+    'System:',
+    `Hostname: ${os.hostname()}`,
+    `Platform: ${process.platform} ${process.arch}`,
+    `OS: ${os.type()} ${os.release()}`,
+    `OS version: ${typeof os.version === 'function' ? os.version() : 'unavailable'}`,
+    `Machine: ${typeof os.machine === 'function' ? os.machine() : process.arch}`,
+    `User: ${user}`,
+    `Time: ${new Date().toLocaleString()}`,
+    `Timezone offset: UTC${formatTimezoneOffset(new Date().getTimezoneOffset())}`,
+    `Uptime OS: ${formatDuration(os.uptime())}`,
+    '',
+    'CPU:',
+    `Model: ${cpuModel}`,
+    `Cores: ${cpus.length || 'unknown'}`,
+    `Speed: ${cpuSpeed}`,
+    `Load avg: ${getLoadAverageText()}`,
+    '',
+    'Memory:',
+    `RAM total: ${formatBytes(totalMem)}`,
+    `RAM used: ${formatBytes(usedMem)} (${formatPercent(usedMem, totalMem)})`,
+    `RAM free: ${formatBytes(freeMem)} (${formatPercent(freeMem, totalMem)})`,
+    `Process RSS: ${formatBytes(mem.rss)}`,
+    `Process heap: ${formatBytes(mem.heapUsed)} / ${formatBytes(mem.heapTotal)}`,
+    `Process external: ${formatBytes(mem.external)}`,
+    '',
+    'Storage:',
+    ...diskLines,
+    '',
+    'Runtime:',
+    `Bot: ${isBotEnabled() ? 'on' : 'off'}`,
+    `PID: ${process.pid}`,
+    `Node: ${process.version}`,
+    `Exec path: ${process.execPath}`,
+    `Working dir: ${process.cwd()}`,
+    `Project dir: ${ROOT_DIR}`,
+    `Bot uptime: ${formatDuration(process.uptime())}`,
+    '',
+    'Network:',
+    ...networkLines
+  ].join('\n'));
+}
+
+function safeUserInfo() {
+  try {
+    const info = os.userInfo();
+    return info.username || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function formatPercent(value, total) {
+  if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) return 'unknown';
+  return `${((value / total) * 100).toFixed(1)}%`;
+}
+
+function formatTimezoneOffset(offsetMinutes) {
+  const sign = offsetMinutes <= 0 ? '+' : '-';
+  const absolute = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(absolute / 60)).padStart(2, '0');
+  const minutes = String(absolute % 60).padStart(2, '0');
+  return `${sign}${hours}:${minutes}`;
+}
+
+function formatNetworkInterfaces() {
+  const entries = Object.entries(os.networkInterfaces() || {})
+    .flatMap(([name, items]) => (items || [])
+      .filter((item) => !item.internal)
+      .map((item) => `${name}: ${item.family} ${item.address}${item.mac ? `, mac ${item.mac}` : ''}`));
+  return entries.length ? entries.slice(0, 12) : ['No external interface found'];
 }
 
 async function handleStatusBot(jid) {
@@ -2209,6 +2306,9 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'status':
       if ((command.args[0] || '').toLowerCase() === 'bot') await handleStatusBot(jid);
       else await handleStatus(jid);
+      break;
+    case 'serverinfo':
+      await handleServerInfo(jid);
       break;
     case 'health':
       await handleHealth(jid);
