@@ -8,7 +8,7 @@ import { addNamedItem, assertUniqueTitle, deleteNamedItem, readCollection } from
 import { defaultPdfBaseName, parsePdfSizeLimit, parsePdfStartArgs, PdfSessions, parsePdfOrderText } from '../src/pdf.js';
 import { parseDurationMs } from '../src/reminders.js';
 import { normalizeMac } from '../src/wol.js';
-import { parseTaskArgs } from '../src/tasks.js';
+import { parseTaskArgs, parseTaskRecordingArgs } from '../src/tasks.js';
 import { extractZipBuffer, zipDirectory } from '../src/zip.js';
 import { PendingConfirmStore, parseSecretMediaTriggerText } from '../src/confirm.js';
 import { CommandAccessStore, parseAllowArgs } from '../src/commandAccess.js';
@@ -16,6 +16,7 @@ import { ReactionActionStore, reactionIntent } from '../src/reactionActions.js';
 import { normalizePhoneNumber, normalizePhoneToJid } from '../src/phone.js';
 import { handleLinkCommand, handleNoteCommand } from '../src/notes.js';
 import { getMessageText } from '../src/text.js';
+import { recordMessageEntry } from '../src/recordedMessages.js';
 import {
   isAnimatedMedia,
   makeSmemeOverlaySvg,
@@ -31,6 +32,25 @@ import { AnticallStore, formatAnticallStatus } from '../src/anticall.js';
 import { RuntimeConfigStore } from '../src/runtimeConfig.js';
 import { ChangedMessageStore, messageIndexKey } from '../src/changedMessages.js';
 import { StatusSaveStore } from '../src/statusSave.js';
+import { formatServices, listOpenServices, parseSsOutput } from '../src/services.js';
+
+test('services parser classifies open web, SSH, and Samba ports', async () => {
+  const sockets = parseSsOutput([
+    'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*',
+    'tcp LISTEN 0 128 192.168.1.108:8765 0.0.0.0:*',
+    'tcp LISTEN 0 50 0.0.0.0:445 0.0.0.0:*',
+    'udp UNCONN 0 0 0.0.0.0:41641 0.0.0.0:*'
+  ].join('\n'));
+  assert.deepEqual(sockets.map(({ protocol, port }) => [protocol, port]), [
+    ['TCP', 22], ['TCP', 8765], ['TCP', 445], ['UDP', 41641]
+  ]);
+  const result = await listOpenServices({
+    hostname: 'minipc.nyala-duck.ts.net',
+    runner: async () => ({ stdout: 'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n' })
+  });
+  assert.equal(result.sockets[0].service, 'SSH');
+  assert.match(result.sockets[0].access.join(' '), /ssh:\/\/minipc\.nyala-duck\.ts\.net:22/);
+});
 
 test('parseDurationMs supports compact countdown formats', () => {
   assert.equal(parseDurationMs('10s'), 10_000);
@@ -52,6 +72,8 @@ test('normalizePhoneNumber accepts Indonesian public formats', () => {
   assert.equal(normalizePhoneNumber('08123431212'), '628123431212');
   assert.equal(normalizePhoneNumber('+62 123-1234-1234'), '6212312341234');
   assert.equal(normalizePhoneToJid('+6212312341234'), '6212312341234@s.whatsapp.net');
+  assert.equal(normalizePhoneToJid('+62 123-1234-1234-1234'), '62123123412341234@s.whatsapp.net');
+  assert.equal(normalizePhoneToJid('+62123123412341234'), '62123123412341234@s.whatsapp.net');
 });
 
 test('assertUniqueTitle rejects case-insensitive duplicates', () => {
@@ -154,6 +176,28 @@ test('parseTaskArgs supports explicit task actions and legacy schedule syntax', 
   });
   assert.equal(parseTaskArgs(['2', 'legacy', '22', '30']).text, 'legacy');
   assert.throws(() => parseTaskArgs(['add', 'tanpa', 'jam']), /Format task/);
+});
+
+test('parseTaskRecordingArgs accepts a target phone and schedule modes', () => {
+  assert.deepEqual(parseTaskRecordingArgs(['record', '08123431212', 'at', '20:30']), {
+    loop: false,
+    count: 1,
+    targetJid: '628123431212@s.whatsapp.net',
+    hour: 20,
+    minute: 30,
+    second: 0,
+    dateToken: null
+  });
+  assert.deepEqual(parseTaskRecordingArgs(['record', 'loop', '+62 812-3431-212', 'at', '08:00', '12/12/2026']), {
+    loop: true,
+    count: null,
+    targetJid: '628123431212@s.whatsapp.net',
+    hour: 8,
+    minute: 0,
+    second: 0,
+    dateToken: '12/12/2026'
+  });
+  assert.throws(() => parseTaskRecordingArgs(['record', '08123431212', 'besok']), /Format rekam task/);
 });
 
 test('PdfSessions split mode builds one PDF per media item', async () => {
@@ -265,6 +309,14 @@ test('smeme long text stays inside padded canvas', async () => {
   const xs = [...overlay.matchAll(/<text class="smeme-text" x="([\d.]+)"/g)].map((match) => Number(match[1]));
   assert.ok(xs.length > 0);
   assert.ok(xs.every((x) => x >= 20 && x < canvas));
+});
+
+test('recordMessageEntry ignores WhatsApp reactions', async () => {
+  const result = await recordMessageEntry(null, {
+    key: { remoteJid: '120363239168440883@g.us', id: 'reaction-1' },
+    message: { reactionMessage: { text: '👍', key: { id: 'target-message' } } }
+  });
+  assert.equal(result, null);
 });
 
 test('getMessageText reads button replies as commands', () => {

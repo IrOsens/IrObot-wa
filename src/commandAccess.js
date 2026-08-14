@@ -16,7 +16,8 @@ export const ADMIN_RESTRICTED_COMMANDS = new Set([
   'restore',
   'clear',
   'update',
-  'restartbot'
+  'restartbot',
+  'services'
 ]);
 
 const DEFAULT_ACCESS = {

@@ -91,6 +91,7 @@ function serializeNonMedia(message, text) {
   const node = type ? content[type] : null;
 
   if (!type) return null;
+  if (type === 'reactionMessage') return null;
   if (type === 'conversation' || type === 'extendedTextMessage') {
     return text ? { kind: 'text', text } : null;
   }

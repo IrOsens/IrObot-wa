@@ -9,8 +9,8 @@ export function normalizePhoneNumber(input) {
   if (phone.startsWith('0')) phone = `62${phone.slice(1)}`;
   else if (phone.startsWith('8')) phone = `62${phone}`;
 
-  if (!/^\d{8,15}$/.test(phone)) {
-    throw new Error('Nomor telepon tidak valid. Contoh: 08123431212 atau +6212312341234.');
+  if (!/^\d{8,20}$/.test(phone)) {
+    throw new Error('Nomor telepon tidak valid. Gunakan 8-20 digit, misalnya 08123431212, +62 123-1234-1234, atau +62 123-1234-1234-1234.');
   }
   return phone;
 }

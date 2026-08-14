@@ -3,6 +3,14 @@ import path from 'node:path';
 import { TASKS_FILE, TASK_MEDIA_DIR, TASK_TARGET_NAMES } from './config.js';
 import { cleanupFiles, downloadQuotedOrOwnMedia } from './media.js';
 import { renumberCollection } from './namedStore.js';
+import { normalizePhoneToJid } from './phone.js';
+import {
+  cleanupRecordedTempEntries,
+  persistRecordedEntries,
+  recordMessageEntry,
+  sendRecordedEntries,
+  visibleRecordedEntries
+} from './recordedMessages.js';
 
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000;
 const TIME_NUMBER = /^\d{1,2}$/;
@@ -15,7 +23,8 @@ const TASK_FORMAT = [
   ',task add <teks> at <HH:MM> <DD/MM/YYYY>',
   ',task loop <teks> at <HH:MM>',
   ',task repeat <jumlah> <teks> at <HH:MM>',
-  ',task pause <id>',
+  ',task record [loop|repeat <jumlah>] <nomor> at <HH:MM> [DD/MM/YYYY]',
+  ',task pause|stop <id>',
   ',task resume <id>',
   ',task del <id>'
 ].join('\n');
@@ -115,6 +124,36 @@ export function parseTaskArgs(args) {
   const first = String(args[0] || '').toLowerCase();
   if (['add', 'loop', 'repeat'].includes(first)) return parseNaturalTaskArgs(args);
   return parseLegacyTaskArgs(args);
+}
+
+export function parseTaskRecordingArgs(args) {
+  const values = [...args];
+  if (String(values.shift() || '').toLowerCase() !== 'record') {
+    throw new Error('Format rekam task: ,task record [loop|repeat <jumlah>] <nomor> at <HH:MM> [DD/MM/YYYY]');
+  }
+  let loop = false;
+  let count = 1;
+  if (String(values[0] || '').toLowerCase() === 'loop') {
+    loop = true;
+    count = null;
+    values.shift();
+  } else if (String(values[0] || '').toLowerCase() === 'repeat') {
+    values.shift();
+    count = Number(values.shift());
+    if (!Number.isInteger(count) || count < 1) {
+      throw new Error('Format rekam task: ,task record repeat <jumlah> <nomor> at <HH:MM> [DD/MM/YYYY]');
+    }
+  }
+  const target = values.shift();
+  if (!target || String(values.shift() || '').toLowerCase() !== 'at') {
+    throw new Error('Format rekam task: ,task record [loop|repeat <jumlah>] <nomor> at <HH:MM> [DD/MM/YYYY]');
+  }
+  const timeToken = values.shift();
+  const dateToken = values.shift() || null;
+  if (!timeToken || values.length || (dateToken && !FULL_DATE.test(dateToken))) {
+    throw new Error('Format rekam task: ,task record [loop|repeat <jumlah>] <nomor> at <HH:MM> [DD/MM/YYYY]');
+  }
+  return { loop, count, targetJid: normalizePhoneToJid(target), ...parseClockToken(timeToken), dateToken };
 }
 
 function parseNaturalTaskArgs(args) {
@@ -236,6 +275,77 @@ export async function createTask(sock, message, args) {
   return task;
 }
 
+export class TaskRecorder {
+  constructor() {
+    this.sessions = new Map();
+  }
+
+  start(jid, args, actorJid = jid) {
+    const schedule = parseTaskRecordingArgs(args);
+    const session = { jid, actorJid, schedule, entries: [], tempFiles: [] };
+    this.sessions.set(jid, session);
+    return session;
+  }
+
+  has(jid) {
+    return this.sessions.has(jid);
+  }
+
+  isActor(jid, actorJid) {
+    const session = this.sessions.get(jid);
+    return !session || !actorJid || session.actorJid === actorJid;
+  }
+
+  async record(sock, message) {
+    const session = this.sessions.get(message.key.remoteJid);
+    if (!session) return null;
+    const recorded = await recordMessageEntry(sock, message, 'task-record-item');
+    if (!recorded) return null;
+    if (recorded.tempFile) session.tempFiles.push(recorded.tempFile);
+    session.entries.push(recorded.entry);
+    return { type: recorded.type, count: visibleRecordedEntries(session.entries).length };
+  }
+
+  async finish(jid, actorJid = null) {
+    const session = this.sessions.get(jid);
+    if (!session || (actorJid && session.actorJid !== actorJid)) return null;
+    if (!visibleRecordedEntries(session.entries).length) throw new Error('Belum ada pesan yang direkam.');
+    const store = await readStore();
+    const id = store.nextId++;
+    const dir = path.join(TASK_MEDIA_DIR, `task-${id}`);
+    const entries = await persistRecordedEntries(session.entries, dir);
+    const task = {
+      id,
+      text: `Rekaman ${visibleRecordedEntries(entries).length} pesan`,
+      entries,
+      targetJid: session.schedule.targetJid,
+      loop: session.schedule.loop,
+      remaining: session.schedule.loop ? null : session.schedule.count,
+      hour: session.schedule.hour,
+      minute: session.schedule.minute,
+      second: session.schedule.second,
+      dateToken: session.schedule.dateToken,
+      nextRunAt: nextRunAt(session.schedule.hour, session.schedule.minute, session.schedule.second, session.schedule.dateToken),
+      paused: false,
+      media: null,
+      createdAt: new Date().toISOString()
+    };
+    store.tasks.push(task);
+    await writeStore(store);
+    this.sessions.delete(jid);
+    await cleanupRecordedTempEntries(session.entries);
+    return task;
+  }
+
+  async cancel(jid, actorJid = null) {
+    const session = this.sessions.get(jid);
+    if (!session || (actorJid && session.actorJid !== actorJid)) return false;
+    this.sessions.delete(jid);
+    await cleanupRecordedTempEntries(session.entries);
+    return true;
+  }
+}
+
 export async function listTasks() {
   const store = await readStore();
   return store.tasks;
@@ -249,7 +359,7 @@ export async function updateTaskState(action, id) {
     store.tasks = store.tasks.filter((item) => item.id !== id);
     renumberCollection(store, 'tasks');
     await writeStore(store);
-    if (task.media?.path) await cleanupFiles([task.media.path]);
+    await cleanupTaskFiles(task);
     return { deleted: true, task };
   }
   if (action === 'resume' || action === 'true') task.paused = false;
@@ -259,11 +369,22 @@ export async function updateTaskState(action, id) {
   return { deleted: false, task };
 }
 
+async function cleanupTaskFiles(task) {
+  if (task.media?.path) await cleanupFiles([task.media.path]);
+  const entryPaths = (task.entries || []).filter((entry) => entry.kind === 'media').map((entry) => entry.path);
+  if (entryPaths.length) {
+    await cleanupFiles(entryPaths);
+    await fs.rm(path.dirname(entryPaths[0]), { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 function taskMessage(task) {
   const left = task.loop ? 'loop' : `${task.remaining}x tersisa`;
   const state = task.paused ? 'paused' : 'aktif';
   const next = formatWib(task.nextRunAt);
-  return `#${task.id} [${state}] ${task.text}\n${left}, berikutnya: ${next}`;
+  const target = task.targetJid ? `\nTarget: ${task.targetJid.split('@')[0]}` : '';
+  const count = task.entries ? ` (${visibleRecordedEntries(task.entries).length} pesan)` : '';
+  return `#${task.id} [${state}] ${task.text}${count}${target}\n${left}, berikutnya: ${next}`;
 }
 
 export function formatTaskList(tasks) {
@@ -272,6 +393,10 @@ export function formatTaskList(tasks) {
 }
 
 async function sendTask(sock, jid, task) {
+  if (task.entries) {
+    await sendRecordedEntries(sock, jid, task.entries);
+    return;
+  }
   if (task.media?.path) {
     const buffer = await fs.readFile(task.media.path);
     if (task.media.type === 'imageMessage') {
@@ -328,9 +453,9 @@ export class TaskScheduler {
       let changed = false;
       for (const task of [...store.tasks]) {
         if (task.paused || new Date(task.nextRunAt).getTime() > now) continue;
-        const targets = TASK_TARGET_NAMES
-          .map((name) => this.chatDirectory.findByName(name))
-          .filter(Boolean);
+        const targets = task.targetJid
+          ? [task.targetJid]
+          : TASK_TARGET_NAMES.map((name) => this.chatDirectory.findByName(name)).filter(Boolean);
         for (const jid of targets) {
           await sendTask(this.sock, jid, task);
         }
@@ -341,7 +466,7 @@ export class TaskScheduler {
         if (!task.loop && task.remaining <= 0) {
           store.tasks = store.tasks.filter((item) => item.id !== task.id);
           renumberCollection(store, 'tasks');
-          if (task.media?.path) await cleanupFiles([task.media.path]);
+          await cleanupTaskFiles(task);
         } else {
           task.second = task.second ?? 0;
           task.nextRunAt = nextDailyRun(task.nextRunAt, task.hour, task.minute, task.second);

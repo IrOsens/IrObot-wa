@@ -54,7 +54,7 @@ import {
   quotedMediaNode
 } from './media.js';
 import { isAnimatedMedia, makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerMeta, reverseSticker } from './sticker.js';
-import { TaskScheduler, createTask, formatTaskList, formatWib, listTasks, updateTaskState } from './tasks.js';
+import { TaskRecorder, TaskScheduler, createTask, formatTaskList, formatWib, listTasks, updateTaskState } from './tasks.js';
 import { PdfSessions, parsePdfOrderText, parsePdfStartArgs } from './pdf.js';
 import { pdfToImages } from './pdfImages.js';
 import {
@@ -95,6 +95,7 @@ import {
   tryNormalizePhoneToJid as tryNormalizePhoneToWhatsAppJid
 } from './phone.js';
 import { AnticallStore, formatAnticallStatus } from './anticall.js';
+import { formatServices, listOpenServices } from './services.js';
 
 class ChatDirectory {
   constructor() {
@@ -231,6 +232,7 @@ const state = {
   pdfSessions: null,
   restoreSessions: null,
   saveRecorder: null,
+  taskRecorder: null,
   backupScheduler: null,
   confirmStore: new PendingConfirmStore(),
   reactionActions: new ReactionActionStore(),
@@ -373,6 +375,7 @@ const HELP_SECTIONS = [
       { name: 'status', text: ',status   Status server' },
       { name: 'serverinfo', text: ',serverinfo Spesifikasi lengkap server' },
       { name: 'net', text: ',net      Cek koneksi' },
+      { name: 'services', text: ',services Daftar port/service terbuka' },
       { name: 'log', text: ',log      Lihat log terbaru' },
       { name: 'wol', text: ',wol      Wake-on-LAN' },
       { name: 'health', text: ',health   Status teknis bot' },
@@ -427,10 +430,11 @@ const HELP_DETAILS = {
   save: ['Format: ,save <judul> [teks awal]', 'Mulai rekam teks/media sampai ,end atau ,cancel.'],
   load: ['Format: ,load', 'Format: ,load <id|judul>', 'Format: ,load del <id|judul>', 'Format: ,load change <id|judul> <judul-baru>'],
   remindme: ['Format: ,remindme <teks> <durasi>', 'Unit: s = detik, m = menit, h = jam, d = hari.', 'Contoh: ,remindme cek server 1h30m'],
-  task: ['Format: ,task list', 'Format: ,task add <teks> at <HH:MM>', 'Format: ,task add <teks> at <HH:MM> <DD/MM/YYYY>', 'Format: ,task loop <teks> at <HH:MM>', 'Format: ,task repeat <jumlah> <teks> at <HH:MM>', 'Format: ,task pause <id>', 'Format: ,task resume <id>', 'Format: ,task del <id>', 'Legacy: ,ltask true|false|del <id> tetap didukung.'],
+  task: ['Format: ,task list', 'Format: ,task add <teks> at <HH:MM>', 'Format: ,task add <teks> at <HH:MM> <DD/MM/YYYY>', 'Format: ,task loop <teks> at <HH:MM>', 'Format: ,task repeat <jumlah> <teks> at <HH:MM>', 'Format: ,task record [loop|repeat <jumlah>] <nomor> at <HH:MM> [DD/MM/YYYY]', 'Setelah record, kirim pesan bebas/media lalu ,end. ,cancel atau reaction ❌/👎/❎ membatalkan rekaman.', 'Format: ,task pause|stop <id>', 'Format: ,task resume <id>', 'Format: ,task del <id>', 'Legacy: ,ltask true|false|del <id> tetap didukung.'],
   wol: ['Format: ,wol list', 'Format: ,wol add <mac>', 'Format: ,wol wake <id|mac>', 'Format: ,wol del <id|mac>', 'Legacy: ,won, ,won save <mac>, ,won <id|mac>, dan ,won del <id|mac> tetap didukung.'],
   log: ['Format: ,log [baris]', 'Default 30 baris, maksimal 80 baris.'],
   net: ['Format: ,net', 'Cek IP publik, DNS, HTTP latency, IP lokal, dan estimasi download kecil.'],
+  services: ['Format: ,services', 'Menampilkan listener TCP/UDP yang terbuka, klasifikasi web/SSH/Samba/dll, IP lokal, dan URL Tailscale.'],
   health: ['Format: ,health', 'Status teknis proses, tool, data count, scheduler, dan runtime file.'],
   info: ['Format: ,info <nomor>', 'Contoh: ,info 08123431212'],
   changedmsg: ['Format: ,changedmsg list|allow|del <id|nama-grup|jid>', 'DM dipantau default. Grup harus di-allow. Nama grup duplikat ditolak; pakai JID agar aman.'],
@@ -699,6 +703,7 @@ async function botStatusWarnings() {
 
 function activeSessionType(jid) {
   if (state.saveRecorder?.has(jid)) return 'save';
+  if (state.taskRecorder?.has(jid)) return 'rekam task';
   if (state.anticall?.has(jid)) return 'anticall';
   if (state.pdfSessions?.has(jid)) return 'PDF';
   if (state.restoreSessions?.has(jid)) return 'restore';
@@ -707,6 +712,7 @@ function activeSessionType(jid) {
 
 function activeSessionActorMatches(jid, actorJid) {
   if (state.saveRecorder?.has(jid)) return state.saveRecorder.isActor(jid, actorJid);
+  if (state.taskRecorder?.has(jid)) return state.taskRecorder.isActor(jid, actorJid);
   if (state.anticall?.has(jid)) return state.anticall.isActor(jid, actorJid);
   if (state.pdfSessions?.has(jid)) return state.pdfSessions.isActor(jid, actorJid);
   if (state.restoreSessions?.has(jid)) return state.restoreSessions.isActor(jid, actorJid);
@@ -721,6 +727,7 @@ function assertNoActiveSession(jid) {
 function hasAnyTempSession() {
   return Boolean(
     state.saveRecorder?.sessions?.size
+    || state.taskRecorder?.sessions?.size
     || state.anticall?.sessions?.size
     || state.pdfSessions?.count()
     || state.restoreSessions?.count()
@@ -1354,6 +1361,13 @@ async function handleTask(message, command, actorJid = messageActorJid(message))
     await handleTaskStateChange(jid, actorJid, action, command.args[1], ',task pause|resume|del <id>');
     return;
   }
+  if (action === 'record') {
+    assertNoActiveSession(jid);
+    const session = state.taskRecorder.start(jid, command.args, actorJid);
+    const sent = await sendText(jid, `Mulai rekam task ke +${session.schedule.targetJid.split('@')[0]}. Kirim teks, gambar, video, dokumen, audio, sticker, lokasi, kontak, poll, atau event. Selesai: ,end atau reaction ✅/👍/❤️. Batal: ,cancel atau reaction ❌/👎/❎.`);
+    registerSessionPrompt(sent.key, jid, actorJid);
+    return;
+  }
   const task = await createTask(state.sock, message, command.args);
   await sendText(jid, `Task #${task.id} dibuat.\nBerikutnya: ${formatWib(task.nextRunAt)}`);
 }
@@ -1368,12 +1382,12 @@ async function handleListTask(jid, command, actorJid) {
 }
 
 function isTaskStateAction(action) {
-  return ['pause', 'resume', 'del', 'true', 'false'].includes(String(action || '').toLowerCase());
+  return ['pause', 'stop', 'resume', 'del', 'true', 'false'].includes(String(action || '').toLowerCase());
 }
 
 function normalizeTaskStateAction(action) {
   const text = String(action || '').toLowerCase();
-  if (text === 'pause' || text === 'false') return 'pause';
+  if (text === 'pause' || text === 'stop' || text === 'false') return 'pause';
   if (text === 'resume' || text === 'true') return 'resume';
   if (text === 'del') return 'del';
   return null;
@@ -1724,6 +1738,10 @@ async function cancelActiveSessionByJid(jid, actorJid) {
     await sendText(jid, 'Rekaman save dibatalkan.');
     return true;
   }
+  if (await state.taskRecorder.cancel(jid, actorJid)) {
+    await sendText(jid, 'Rekaman task dibatalkan.');
+    return true;
+  }
   if (await state.anticall.cancel(jid, actorJid)) {
     await sendText(jid, 'Rekaman anticall dibatalkan.');
     return true;
@@ -1757,6 +1775,11 @@ async function handleCancelByJid(jid, actorJid) {
 
 async function handleEndSession(jid, actorJid) {
   if (await finishSaveByJid(jid, actorJid)) return true;
+  const task = await state.taskRecorder.finish(jid, actorJid);
+  if (task) {
+    await sendText(jid, `Task #${task.id} dibuat untuk +${task.targetJid.split('@')[0]}. Berikutnya: ${formatWib(task.nextRunAt)}`);
+    return true;
+  }
   if (await finishAnticallByJid(jid, actorJid)) return true;
   if (state.restoreSessions.has(jid)) {
     if (!activeSessionActorMatches(jid, actorJid)) return false;
@@ -2202,6 +2225,11 @@ async function handleRestartBot(jid) {
   setTimeout(() => process.exit(0), 700).unref?.();
 }
 
+async function handleServices(jid) {
+  const result = await listOpenServices();
+  await sendText(jid, formatServices(result));
+}
+
 async function handleUpdateBot(jid) {
   await sendText(jid, `Menjalankan git pull ${UPDATE_REMOTE} ${UPDATE_BRANCH}...`);
   const pull = await runTool('git', ['pull', UPDATE_REMOTE, UPDATE_BRANCH], { cwd: ROOT_DIR });
@@ -2429,6 +2457,9 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'net':
       await handleNet(jid);
       break;
+    case 'services':
+      await handleServices(jid);
+      break;
     case 'button':
       await handleButton(message, command);
       break;
@@ -2514,6 +2545,10 @@ async function onMessageUpsert(event) {
 
       if (sessionActorMatches && state.saveRecorder.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
         await state.saveRecorder.record(state.sock, message);
+        continue;
+      }
+      if (sessionActorMatches && state.taskRecorder.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
+        await state.taskRecorder.record(state.sock, message);
         continue;
       }
       if (sessionActorMatches && state.anticall.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
@@ -2758,6 +2793,7 @@ async function main() {
   state.pdfSessions = new PdfSessions(state.tools);
   state.restoreSessions = new RestoreSessions();
   state.saveRecorder = new SaveRecorder();
+  state.taskRecorder = new TaskRecorder();
   state.anticall = new AnticallStore();
   await state.anticall.load();
   state.backupScheduler = new DailyBackupScheduler(
