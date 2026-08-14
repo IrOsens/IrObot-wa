@@ -3,7 +3,6 @@ import path from 'node:path';
 import { TASKS_FILE, TASK_MEDIA_DIR, TASK_TARGET_NAMES } from './config.js';
 import { cleanupFiles, downloadQuotedOrOwnMedia } from './media.js';
 import { renumberCollection } from './namedStore.js';
-import { normalizePhoneToJid } from './phone.js';
 import {
   cleanupRecordedTempEntries,
   persistRecordedEntries,
@@ -23,7 +22,7 @@ const TASK_FORMAT = [
   ',task add <teks> at <HH:MM> <DD/MM/YYYY>',
   ',task loop <teks> at <HH:MM>',
   ',task repeat <jumlah> <teks> at <HH:MM>',
-  ',task record [loop|repeat <jumlah>] <nomor> at <HH:MM> [DD/MM/YYYY]',
+  ',task record [loop|repeat <jumlah>] <nomor|nama kontak|nama grup> at <HH:MM> [DD/MM/YYYY]',
   ',task pause|stop <id>',
   ',task resume <id>',
   ',task del <id>'
@@ -144,16 +143,17 @@ export function parseTaskRecordingArgs(args) {
       throw new Error('Format rekam task: ,task record repeat <jumlah> <nomor> at <HH:MM> [DD/MM/YYYY]');
     }
   }
-  const target = values.shift();
-  if (!target || String(values.shift() || '').toLowerCase() !== 'at') {
-    throw new Error('Format rekam task: ,task record [loop|repeat <jumlah>] <nomor> at <HH:MM> [DD/MM/YYYY]');
+  const atIndex = values.findIndex((value) => String(value).toLowerCase() === 'at');
+  if (atIndex < 1) {
+    throw new Error('Format rekam task: ,task record [loop|repeat <jumlah>] <nomor|nama kontak|nama grup> at <HH:MM> [DD/MM/YYYY]');
   }
-  const timeToken = values.shift();
-  const dateToken = values.shift() || null;
-  if (!timeToken || values.length || (dateToken && !FULL_DATE.test(dateToken))) {
-    throw new Error('Format rekam task: ,task record [loop|repeat <jumlah>] <nomor> at <HH:MM> [DD/MM/YYYY]');
+  const targetInput = values.slice(0, atIndex).join(' ').trim();
+  const timeToken = values[atIndex + 1];
+  const dateToken = values[atIndex + 2] || null;
+  if (!targetInput || !timeToken || values.length > atIndex + 3 || (dateToken && !FULL_DATE.test(dateToken))) {
+    throw new Error('Format rekam task: ,task record [loop|repeat <jumlah>] <nomor|nama kontak|nama grup> at <HH:MM> [DD/MM/YYYY]');
   }
-  return { loop, count, targetJid: normalizePhoneToJid(target), ...parseClockToken(timeToken), dateToken };
+  return { loop, count, targetInput, ...parseClockToken(timeToken), dateToken };
 }
 
 function parseNaturalTaskArgs(args) {
@@ -280,9 +280,19 @@ export class TaskRecorder {
     this.sessions = new Map();
   }
 
-  start(jid, args, actorJid = jid) {
-    const schedule = parseTaskRecordingArgs(args);
-    const session = { jid, actorJid, schedule, entries: [], tempFiles: [] };
+  start(jid, schedule, actorJid = jid, target = null) {
+    if (!schedule?.targetInput || !target?.jid) throw new Error('Target task tidak valid.');
+    const session = {
+      jid,
+      actorJid,
+      schedule: {
+        ...schedule,
+        targetJid: target.jid,
+        targetName: target.currentName || target.savedName || schedule.targetInput
+      },
+      entries: [],
+      tempFiles: []
+    };
     this.sessions.set(jid, session);
     return session;
   }
@@ -319,6 +329,7 @@ export class TaskRecorder {
       text: `Rekaman ${visibleRecordedEntries(entries).length} pesan`,
       entries,
       targetJid: session.schedule.targetJid,
+      targetName: session.schedule.targetName,
       loop: session.schedule.loop,
       remaining: session.schedule.loop ? null : session.schedule.count,
       hour: session.schedule.hour,
@@ -382,7 +393,7 @@ function taskMessage(task) {
   const left = task.loop ? 'loop' : `${task.remaining}x tersisa`;
   const state = task.paused ? 'paused' : 'aktif';
   const next = formatWib(task.nextRunAt);
-  const target = task.targetJid ? `\nTarget: ${task.targetJid.split('@')[0]}` : '';
+  const target = task.targetJid ? `\nTarget: ${task.targetName || task.targetJid.split('@')[0]}` : '';
   const count = task.entries ? ` (${visibleRecordedEntries(task.entries).length} pesan)` : '';
   return `#${task.id} [${state}] ${task.text}${count}${target}\n${left}, berikutnya: ${next}`;
 }

@@ -204,8 +204,8 @@ Reminder:
 - `,remindme minum 10m`
 - Durasi mendukung `10s`, `5m`, `2h`, `1d`, dan `1h30m`.
 - Reminder dikirim ke grup target `IrOBot`.
-- Task: `,task add "backup server" at 23:00`, `,task loop "cek koneksi" at 08:00`, `,task repeat 3 "ingatkan minum" at 21:00`, `,task record 08123431212 at 21:00`, `,task record loop 08123431212 at 08:00`, `,task pause 2`/`,task stop 2`, `,task resume 2`, `,task del 2`.
-- `,task record` membuka sesi rekam untuk nomor tujuan: kirim teks, gambar, video, dokumen, audio, sticker, lokasi, kontak, poll, atau event; ketik `,end` untuk menjadwalkan. Batalkan dengan `,cancel` atau reaction ❌/👎/❎ pada prompt sesi.
+- Task: `,task add "backup server" at 23:00`, `,task loop "cek koneksi" at 08:00`, `,task repeat 3 "ingatkan minum" at 21:00`, `,task record 08123431212 at 21:00`, `,task record Tim Produksi at 21:00`, `,task record Grup TA at 21:00`, `,task record loop 08123431212 at 08:00`, `,task pause 2`/`,task stop 2`, `,task resume 2`, `,task del 2`.
+- `,task record` membuka sesi rekam untuk nomor, nama kontak, atau nama grup tujuan (tanpa tanda petik; nama yang sama/ambigu akan ditolak): kirim teks, gambar, video, dokumen, audio, sticker, lokasi, kontak, poll, atau event; ketik `,end` untuk menjadwalkan. Batalkan dengan `,cancel` atau reaction ❌/👎/❎ pada prompt sesi.
 - Legacy `,ltask`, `,ltask true|false|del <id>` tetap didukung.
 
 Backup/restore:

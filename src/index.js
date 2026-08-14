@@ -54,7 +54,7 @@ import {
   quotedMediaNode
 } from './media.js';
 import { isAnimatedMedia, makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerMeta, reverseSticker } from './sticker.js';
-import { TaskRecorder, TaskScheduler, createTask, formatTaskList, formatWib, listTasks, updateTaskState } from './tasks.js';
+import { TaskRecorder, TaskScheduler, createTask, formatTaskList, formatWib, listTasks, parseTaskRecordingArgs, updateTaskState } from './tasks.js';
 import { PdfSessions, parsePdfOrderText, parsePdfStartArgs } from './pdf.js';
 import { pdfToImages } from './pdfImages.js';
 import {
@@ -430,7 +430,7 @@ const HELP_DETAILS = {
   save: ['Format: ,save <judul> [teks awal]', 'Mulai rekam teks/media sampai ,end atau ,cancel.'],
   load: ['Format: ,load', 'Format: ,load <id|judul>', 'Format: ,load del <id|judul>', 'Format: ,load change <id|judul> <judul-baru>'],
   remindme: ['Format: ,remindme <teks> <durasi>', 'Unit: s = detik, m = menit, h = jam, d = hari.', 'Contoh: ,remindme cek server 1h30m'],
-  task: ['Format: ,task list', 'Format: ,task add <teks> at <HH:MM>', 'Format: ,task add <teks> at <HH:MM> <DD/MM/YYYY>', 'Format: ,task loop <teks> at <HH:MM>', 'Format: ,task repeat <jumlah> <teks> at <HH:MM>', 'Format: ,task record [loop|repeat <jumlah>] <nomor> at <HH:MM> [DD/MM/YYYY]', 'Setelah record, kirim pesan bebas/media lalu ,end. ,cancel atau reaction ❌/👎/❎ membatalkan rekaman.', 'Format: ,task pause|stop <id>', 'Format: ,task resume <id>', 'Format: ,task del <id>', 'Legacy: ,ltask true|false|del <id> tetap didukung.'],
+  task: ['Format: ,task list', 'Format: ,task add <teks> at <HH:MM>', 'Format: ,task add <teks> at <HH:MM> <DD/MM/YYYY>', 'Format: ,task loop <teks> at <HH:MM>', 'Format: ,task repeat <jumlah> <teks> at <HH:MM>', 'Format: ,task record [loop|repeat <jumlah>] <nomor|nama kontak|nama grup> at <HH:MM> [DD/MM/YYYY]', 'Setelah record, kirim pesan bebas/media lalu ,end. ,cancel atau reaction ❌/👎/❎ membatalkan rekaman.', 'Format: ,task pause|stop <id>', 'Format: ,task resume <id>', 'Format: ,task del <id>', 'Legacy: ,ltask true|false|del <id> tetap didukung.'],
   wol: ['Format: ,wol list', 'Format: ,wol add <mac>', 'Format: ,wol wake <id|mac>', 'Format: ,wol del <id|mac>', 'Legacy: ,won, ,won save <mac>, ,won <id|mac>, dan ,won del <id|mac> tetap didukung.'],
   log: ['Format: ,log [baris]', 'Default 30 baris, maksimal 80 baris.'],
   net: ['Format: ,net', 'Cek IP publik, DNS, HTTP latency, IP lokal, dan estimasi download kecil.'],
@@ -1363,8 +1363,10 @@ async function handleTask(message, command, actorJid = messageActorJid(message))
   }
   if (action === 'record') {
     assertNoActiveSession(jid);
-    const session = state.taskRecorder.start(jid, command.args, actorJid);
-    const sent = await sendText(jid, `Mulai rekam task ke +${session.schedule.targetJid.split('@')[0]}. Kirim teks, gambar, video, dokumen, audio, sticker, lokasi, kontak, poll, atau event. Selesai: ,end atau reaction ✅/👍/❤️. Batal: ,cancel atau reaction ❌/👎/❎.`);
+    const schedule = parseTaskRecordingArgs(command.args);
+    const target = resolveDestinationInput(schedule.targetInput, actorJid);
+    const session = state.taskRecorder.start(jid, schedule, actorJid, target);
+    const sent = await sendText(jid, `Mulai rekam task ke ${session.schedule.targetName}. Kirim teks, gambar, video, dokumen, audio, sticker, lokasi, kontak, poll, atau event. Selesai: ,end atau reaction ✅/👍/❤️. Batal: ,cancel atau reaction ❌/👎/❎.`);
     registerSessionPrompt(sent.key, jid, actorJid);
     return;
   }
@@ -1777,7 +1779,7 @@ async function handleEndSession(jid, actorJid) {
   if (await finishSaveByJid(jid, actorJid)) return true;
   const task = await state.taskRecorder.finish(jid, actorJid);
   if (task) {
-    await sendText(jid, `Task #${task.id} dibuat untuk +${task.targetJid.split('@')[0]}. Berikutnya: ${formatWib(task.nextRunAt)}`);
+    await sendText(jid, `Task #${task.id} dibuat untuk ${task.targetName || `+${task.targetJid.split('@')[0]}`}. Berikutnya: ${formatWib(task.nextRunAt)}`);
     return true;
   }
   if (await finishAnticallByJid(jid, actorJid)) return true;

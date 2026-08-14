@@ -178,20 +178,20 @@ test('parseTaskArgs supports explicit task actions and legacy schedule syntax', 
   assert.throws(() => parseTaskArgs(['add', 'tanpa', 'jam']), /Format task/);
 });
 
-test('parseTaskRecordingArgs accepts a target phone and schedule modes', () => {
+test('parseTaskRecordingArgs accepts a target number, contact, or group name', () => {
   assert.deepEqual(parseTaskRecordingArgs(['record', '08123431212', 'at', '20:30']), {
     loop: false,
     count: 1,
-    targetJid: '628123431212@s.whatsapp.net',
+    targetInput: '08123431212',
     hour: 20,
     minute: 30,
     second: 0,
     dateToken: null
   });
-  assert.deepEqual(parseTaskRecordingArgs(['record', 'loop', '+62 812-3431-212', 'at', '08:00', '12/12/2026']), {
+  assert.deepEqual(parseTaskRecordingArgs(['record', 'loop', 'Tim', 'Produksi', 'at', '08:00', '12/12/2026']), {
     loop: true,
     count: null,
-    targetJid: '628123431212@s.whatsapp.net',
+    targetInput: 'Tim Produksi',
     hour: 8,
     minute: 0,
     second: 0,
