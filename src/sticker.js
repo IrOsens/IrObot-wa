@@ -41,12 +41,13 @@ export const SMEME_STYLE = {
 };
 
 const STICKER_MAX_BYTES = 950 * 1024;
-const STATIC_STICKER_PRESETS = [
+const STATIC_STICKER_FALLBACKS = [
+  { canvas: 512, quality: 95 },
   { canvas: 512, quality: 90 },
   { canvas: 448, quality: 82 },
   { canvas: 384, quality: 74 }
 ];
-const ANIMATED_STICKER_PRESETS = [
+const ANIMATED_STICKER_FALLBACKS = [
   { canvas: 512, quality: 88, fps: 15, durationSeconds: 10 },
   { canvas: 512, quality: 76, fps: 12, durationSeconds: 8 },
   { canvas: 448, quality: 68, fps: 10, durationSeconds: 6 },
@@ -79,9 +80,9 @@ async function attachExif(inputPath, author, title) {
   return outPath;
 }
 
-export async function makeSticker(media, { author, title, tools }) {
+export async function makeSticker(media, { author, title, tools, quality = 100 }) {
   const animated = await isAnimatedMedia(media);
-  const presets = animated ? ANIMATED_STICKER_PRESETS : STATIC_STICKER_PRESETS;
+  const presets = stickerPresets(animated, quality);
   let smallestOversize = Infinity;
   let lastError = null;
 
@@ -112,13 +113,15 @@ export async function makeSticker(media, { author, title, tools }) {
 }
 
 async function renderStaticStickerWebp(media, outPath, preset) {
-  await sharp(media.path, { animated: false })
+  const image = sharp(media.path, { animated: false })
     .resize(preset.canvas, preset.canvas, {
       fit: 'contain',
-      withoutEnlargement: true,
       background: { r: 0, g: 0, b: 0, alpha: 0 }
-    })
-    .webp({ quality: preset.quality, effort: 6 })
+    });
+  await image
+    .webp(preset.lossless
+      ? { lossless: true, effort: 6 }
+      : { quality: preset.quality, alphaQuality: 100, effort: 6 })
     .toFile(outPath);
 }
 
@@ -127,23 +130,60 @@ async function renderAnimatedStickerWebp(media, outPath, tools, preset) {
     await animatedWebpToStickerWebp(media.path, outPath, {
       canvas: preset.canvas,
       quality: preset.quality,
+      lossless: preset.lossless,
       maxDurationMs: preset.durationSeconds * 1000
     });
     return;
   }
 
   if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Install FFmpeg untuk membuat sticker bergerak.');
+  const encodeArgs = preset.lossless
+    ? ['-lossless', '1']
+    : ['-quality', String(preset.quality)];
   await runTool(tools.ffmpeg, [
     '-y',
     '-i', media.path,
     '-t', String(preset.durationSeconds),
-    '-vf', `fps=${preset.fps},scale=${preset.canvas}:${preset.canvas}:force_original_aspect_ratio=decrease,pad=${preset.canvas}:${preset.canvas}:-1:-1:color=0x00000000`,
+    '-vf', `fps=${preset.fps},scale=${preset.canvas}:${preset.canvas}:force_original_aspect_ratio=decrease,pad=${preset.canvas}:${preset.canvas}:-1:-1:color=0x00000000,format=rgba`,
     '-loop', '0',
     '-an',
     '-fps_mode', 'passthrough',
-    '-q:v', String(Math.max(1, 100 - preset.quality)),
+    '-c:v', 'libwebp_anim',
+    '-pix_fmt', 'yuva420p',
+    ...encodeArgs,
     outPath
   ]);
+}
+
+function stickerPresets(animated, requestedQuality) {
+  const quality = normalizeStickerQuality(requestedQuality);
+  const primary = animated
+    ? { canvas: 512, quality, fps: 15, durationSeconds: 10, lossless: quality === 100 }
+    : { canvas: 512, quality, lossless: quality === 100 };
+  const fallbacks = animated ? ANIMATED_STICKER_FALLBACKS : STATIC_STICKER_FALLBACKS;
+  const presets = [primary];
+  for (const fallback of fallbacks) {
+    const preset = {
+      ...fallback,
+      quality: Math.min(quality, fallback.quality),
+      lossless: false
+    };
+    const duplicate = presets.some((item) => item.canvas === preset.canvas
+      && item.quality === preset.quality
+      && item.fps === preset.fps
+      && item.durationSeconds === preset.durationSeconds
+      && item.lossless === preset.lossless);
+    if (!duplicate) presets.push(preset);
+  }
+  return presets;
+}
+
+function normalizeStickerQuality(value) {
+  const quality = Number(value);
+  if (!Number.isInteger(quality) || quality < 1 || quality > 100) {
+    throw new Error('Kualitas sticker harus angka 1-100.');
+  }
+  return quality;
 }
 
 function formatStickerBytes(bytes) {
@@ -636,6 +676,7 @@ async function animatedWebpToStickerWebp(inputPath, outPath, {
   canvas,
   overlay = null,
   quality = 90,
+  lossless = false,
   maxDurationMs = SMEME_STYLE.maxDurationSeconds * 1000
 }) {
   const decoded = await decodeAnimatedWebpFrames(inputPath, {
@@ -654,7 +695,9 @@ async function animatedWebpToStickerWebp(inputPath, outPath, {
       background: { r: 0, g: 0, b: 0, alpha: 0 }
     });
     if (overlay) image = image.composite([{ input: overlay, top: 0, left: 0 }]);
-    const buffer = await image.webp({ quality }).toBuffer();
+    const buffer = await image.webp(lossless
+      ? { lossless: true, effort: 6 }
+      : { quality, alphaQuality: 100, effort: 6 }).toBuffer();
     frames.push(await webp.Image.generateFrame({
       buffer,
       delay: frame.delay,
@@ -834,4 +877,23 @@ export function parseStickerMeta(input, options = {}) {
   const title = titleRaw.trim() || defaultTitle;
   const author = authorParts.join(',').trim() || defaultAuthor;
   return { author, title };
+}
+
+export function parseStickerArgs(input, options = {}) {
+  const raw = Array.isArray(input) ? input.join(' ') : String(input || '');
+  const qualityTokens = raw.match(/(?:^|\s)q=\S+(?=\s|$)/gi) || [];
+  if (qualityTokens.length > 1) throw new Error('Parameter kualitas sticker hanya boleh satu kali.');
+
+  let quality = 100;
+  if (qualityTokens.length) {
+    const value = qualityTokens[0].trim().slice(2);
+    if (!/^\d+$/.test(value)) throw new Error('Kualitas sticker harus memakai format q=1-100.');
+    quality = normalizeStickerQuality(value);
+  }
+
+  const metaInput = raw.replace(/(?:^|\s)q=\S+(?=\s|$)/gi, ' ').trim();
+  return {
+    ...parseStickerMeta(metaInput, options),
+    quality
+  };
 }

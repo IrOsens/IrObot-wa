@@ -133,9 +133,9 @@ systemctl --user disable --now irobot-wa
 
 ## Command
 
-- Media: `,s`, `,smeme`, `,resend`, `,topdf`, `,toimg`
+- Media: `,s`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,toimg`
 - Reminder/task: `,task list|add|loop|repeat|record|pause|stop|resume|del`, `,remindme <teks> <durasi>`
-- Save: `,save`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load change <id|judul> <judul-baru>`
+- Save: `,save`, `,save update`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load rename <id|judul> <judul-baru>`
 - Note/link: `,note list|add|get|del|rename`, `,link list|add|get|del|rename`
 - Utility: `,info`, `,status`, `,status bot`, `,health`, `,wol`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
 - Session: `,end`, `,cancel`, `,confirm`
@@ -148,8 +148,24 @@ View-once/media:
 - Bot mengirim media itu kembali ke chat tempat command dijalankan.
 - Jika `,resend` dipakai pada sticker, sticker statis dikirim sebagai PNG dan sticker bergerak dikirim sebagai GIF.
 - Legacy `,rs` tetap didukung.
-- Reply media lalu kirim teks yang berakhir spasi titik, contoh `halo .`, untuk mengirim media ke grup target `IrOBot`.
-- Teks sebelum ` .` dipakai sebagai caption baru jika media mendukung caption.
+- Jika owner membalas media view-once dengan pesan biasa, bot otomatis mengirim medianya ke grup target `IrOBot`.
+- Teks balasan dipakai sebagai caption baru jika media mendukung caption; balasan berupa command tidak memicu pengiriman otomatis.
+
+Sticker:
+
+- `,s` memakai kualitas maksimum secara default dan membuat canvas 512x512 dengan padding transparan.
+- Gunakan `q=1-100` untuk memilih kualitas, contoh `,s q=80` atau `,s Judul,Author q=80`.
+- Bot hanya menurunkan kualitas/resolusi lebih lanjut jika diperlukan agar ukuran sticker dapat dikirim WhatsApp.
+
+QR code:
+
+- Langsung: `,qr <pesan>`. Hasil dikirim sebagai reply pada pesan command.
+- Sesi: kirim `,qr`, lanjutkan dengan beberapa pesan terpisah, lalu `,end`. Setiap pesan dibuat menjadi QR tersendiri dan hasilnya membalas pesan sumber masing-masing.
+- Sesi juga dapat diselesaikan dengan reaction `✅`/`👍`/`❤️`, atau dibatalkan dengan `,cancel` dan reaction `❌`/`👎`/`❎`.
+- Style opsional: `style=square`, `style=dot`, atau `style=rounded`.
+- Background opsional: `bg=white|black|red|blue|green|yellow|purple|orange` atau hex `bg=#RRGGBB`. Warna modul QR otomatis dibuat hitam/putih dengan kontras terbaik.
+- Contoh: `,qr style=dot bg=blue halo dunia` atau mulai sesi dengan `,qr style=rounded bg=#ffcc00`.
+- Lampirkan gambar/GIF pada pesan yang memiliki teks/caption untuk menjadikannya ikon tengah QR. GIF memakai frame pertama; media tanpa teks ditolak.
 
 Operasional:
 
@@ -157,7 +173,7 @@ Operasional:
 - `,allow here on|off` membuka/menutup akses publik di chat/grup tempat command dikirim.
 - `,allow all on|off` membuka/menutup akses publik di semua chat/grup.
 - Legacy `true|false` tetap didukung untuk `,allow`.
-- Akses publik biasa berlaku untuk `,help`, `,s`, `,smeme`, `,resend`, dan legacy `,rs`.
+- Akses publik biasa berlaku untuk `,help`, `,s`, `,smeme`, `,resend`, `,qr`, dan legacy `,rs`.
 - `,help` dinamis: publik hanya melihat command publik, admin tambahan melihat command yang boleh dia pakai, owner melihat semuanya. `,help <command|prefix>` menampilkan detail atau kandidat command.
 - `,admin list|add|del <nomor|id>` mengelola admin tambahan. Hanya owner/session WhatsApp yang bisa menjalankannya.
 - Admin tambahan hanya aktif saat akses publik chat/all terbuka, dan tetap tidak bisa memakai command server/security seperti `,admin`, `,bot`, `,backup`, `,restore`, `,update`, dan `,restartbot`.
@@ -196,6 +212,9 @@ Save/load:
 
 - Judul `,save`, `,note`, dan `,link` wajib unik.
 - Judul dengan spasi bisa memakai quote, contoh: `,save "judul panjang"`.
+- Update isi dengan `,save update <id|"judul lama"> ["judul baru"]`, kirim isi pengganti, lalu `,end`. Hasil update mendapat ID baru dan muncul paling bawah.
+- Ganti nama tanpa mengubah isi/urutan dengan `,load rename <id|"judul lama"> "judul baru"`; legacy `,load change` tetap didukung.
+- ID save yang masih ada tidak berubah setelah save lain dihapus; angka yang sudah dipakai tidak digunakan ulang.
 - Note: `,note add <judul> <teks>`, `,note get <id|judul>`, `,note del <id|judul>`, `,note rename <id|judul> <judul-baru>`.
 - Link: `,link add <nama> <https://link>`, `,link get <id|nama>`, `,link del <id|nama>`, `,link rename <id|nama> <nama-baru>`.
 

@@ -48,12 +48,14 @@ import {
   downloadMessageMedia,
   downloadQuotedOrOwnMedia,
   downloadUrlMedia,
+  extractQuotedViewOnceMessage,
   isPdfFile,
   isViewOnceMediaMessage,
   mediaNode,
   quotedMediaNode
 } from './media.js';
-import { isAnimatedMedia, makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerMeta, reverseSticker } from './sticker.js';
+import { isAnimatedMedia, makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerArgs, reverseSticker } from './sticker.js';
+import { QrSessions, downloadQrIcon, makeQrCode, parseQrArgs } from './qr.js';
 import { TaskRecorder, TaskScheduler, createTask, formatTaskList, formatWib, listTasks, parseTaskRecordingArgs, updateTaskState } from './tasks.js';
 import { PdfSessions, parsePdfOrderText, parsePdfStartArgs } from './pdf.js';
 import { pdfToImages } from './pdfImages.js';
@@ -65,6 +67,8 @@ import {
   getSaved,
   listSaved,
   parseSaveStart,
+  parseSaveUpdate,
+  prepareSavedUpdate,
   renameSaved,
   sendSaved
 } from './saved.js';
@@ -73,7 +77,7 @@ import { ReminderScheduler, createReminder, formatCountdown, listReminders } fro
 import { handleWolCommand, listWol } from './wol.js';
 import { DailyBackupScheduler, sendDataBackupToWhatsApp } from './backup.js';
 import { RestoreSessions } from './restore.js';
-import { PendingConfirmStore, parseSecretMediaTriggerText } from './confirm.js';
+import { PendingConfirmStore } from './confirm.js';
 import { CommandAccessStore, PUBLIC_COMMANDS, parseAllowArgs } from './commandAccess.js';
 import { BotStateStore } from './botState.js';
 import { ReactionActionStore, reactionIntent } from './reactionActions.js';
@@ -230,6 +234,7 @@ const state = {
   scheduler: null,
   reminderScheduler: null,
   pdfSessions: null,
+  qrSessions: null,
   restoreSessions: null,
   saveRecorder: null,
   taskRecorder: null,
@@ -349,6 +354,7 @@ const HELP_SECTIONS = [
       { name: 's', text: ',s        Buat stiker dari gambar/video' },
       { name: 'smeme', text: ',smeme    Buat stiker meme dari gambar' },
       { name: 'resend', text: ',resend   Kirim ulang media/view-once' },
+      { name: 'qr', text: ',qr       Buat QR dari pesan' },
       { name: 'topdf', text: ',topdf    Gabung gambar/dokumen jadi PDF' },
       { name: 'toimg', text: ',toimg    Ubah PDF jadi gambar' }
     ]
@@ -418,17 +424,18 @@ const HELP_ALIASES = {
 
 const HELP_DETAILS = {
   help: ['Format: ,help <command>', 'Contoh: ,help s, ,help task.'],
-  s: ['Format: ,s', 'Format: ,s <title>', 'Format: ,s <title>,<author>', 'Kirim/reply media atau sertakan URL media.'],
+  s: ['Format: ,s [q=1-100]', 'Format: ,s <title>,<author> [q=1-100]', 'Default q=100. Kualitas/resolusi hanya diturunkan jika perlu agar ukuran sticker bisa dikirim.', 'Kirim/reply media atau sertakan URL media.'],
   smeme: ['Format: ,smeme up <teks>', 'Format: ,smeme down <teks>', 'Advanced: tambah kualitas 1-99 di akhir.'],
   resend: ['Format: ,resend', 'Legacy: ,rs', 'Reply media/view-once. Sticker statis dikirim sebagai PNG, sticker bergerak sebagai GIF.'],
+  qr: ['Format langsung: ,qr [style=square|dot|rounded] [bg=warna|#RRGGBB] <pesan>', 'Format sesi: ,qr [style=square|dot|rounded] [bg=warna|#RRGGBB], lalu kirim pesan terpisah dan akhiri dengan ,end.', 'Background: white, black, red, blue, green, yellow, purple, orange. Default style=square dan bg=white.', 'Lampirkan gambar/GIF pada pesan untuk menjadikannya ikon tengah QR. Caption tetap menjadi isi QR.'],
   status: ['Format: ,status atau ,status bot', ',status menampilkan server ringkas. ,status bot menampilkan destination, scheduler, changedmsg, statussave, dan warning nama grup duplikat.'],
   serverinfo: ['Format: ,serverinfo', 'Menampilkan spesifikasi server lengkap: OS, CPU, RAM, disk, network, Node.js, dan proses bot.'],
   topdf: ['Format: ,topdf', 'Format: ,topdf <nama>', 'Format: ,topdf split <nama>', 'Format: ,topdf <nama> max <size>', 'Format: ,topdf split <nama> max <size>', 'Legacy: ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
   toimg: ['Format: ,toimg', 'Reply/kirim dokumen PDF, lalu bot mengirim tiap halaman sebagai gambar.'],
   note: ['Format: ,note list', 'Format: ,note add <judul> <teks>', 'Format: ,note get <id|judul>', 'Format: ,note del <id|judul>', 'Format: ,note rename <id|judul> <judul-baru>', 'Legacy: ,note <judul> <teks> dan ,note change tetap didukung.'],
   link: ['Format: ,link list', 'Format: ,link add <nama> <https://link>', 'Format: ,link get <id|nama>', 'Format: ,link del <id|nama>', 'Format: ,link rename <id|nama> <nama-baru>', 'Legacy: ,link <nama> <url> dan ,link change tetap didukung.'],
-  save: ['Format: ,save <judul> [teks awal]', 'Mulai rekam teks/media sampai ,end atau ,cancel.'],
-  load: ['Format: ,load', 'Format: ,load <id|judul>', 'Format: ,load del <id|judul>', 'Format: ,load change <id|judul> <judul-baru>'],
+  save: ['Format: ,save <judul> [teks awal]', 'Format: ,save update <id|"judul lama"> ["judul baru"]', 'Mulai rekam teks/media sampai ,end atau ,cancel. Update yang selesai mendapat ID baru dan muncul paling bawah.'],
+  load: ['Format: ,load', 'Format: ,load <id|judul>', 'Format: ,load del <id|judul>', 'Format: ,load rename <id|"judul lama"> <judul-baru>', 'Legacy: ,load change tetap didukung.'],
   remindme: ['Format: ,remindme <teks> <durasi>', 'Unit: s = detik, m = menit, h = jam, d = hari.', 'Contoh: ,remindme cek server 1h30m'],
   task: ['Format: ,task list', 'Format: ,task add <teks> at <HH:MM>', 'Format: ,task add <teks> at <HH:MM> <DD/MM/YYYY>', 'Format: ,task loop <teks> at <HH:MM>', 'Format: ,task repeat <jumlah> <teks> at <HH:MM>', 'Format: ,task record [loop|repeat <jumlah>] <nomor|nama kontak|nama grup> at <HH:MM> [DD/MM/YYYY]', 'Setelah record, kirim pesan bebas/media lalu ,end. ,cancel atau reaction ❌/👎/❎ membatalkan rekaman.', 'Format: ,task pause|stop <id>', 'Format: ,task resume <id>', 'Format: ,task del <id>', 'Legacy: ,ltask true|false|del <id> tetap didukung.'],
   wol: ['Format: ,wol list', 'Format: ,wol add <mac>', 'Format: ,wol wake <id|mac>', 'Format: ,wol del <id|mac>', 'Legacy: ,won, ,won save <mac>, ,won <id|mac>, dan ,won del <id|mac> tetap didukung.'],
@@ -450,7 +457,7 @@ const HELP_DETAILS = {
   restartbot: ['Format: ,restartbot', 'Keluar dari proses bot dengan konfirmasi agar supervisor bisa menyalakan ulang.'],
   clear: ['Format: ,clear', 'Membersihkan temp/ dengan konfirmasi.'],
   button: ['Format: ,button <pesan>', 'Tes tombol interaktif.'],
-  end: ['Format: ,end', 'Selesaikan sesi aktif seperti save, PDF, anticall, atau restore.'],
+  end: ['Format: ,end', 'Selesaikan sesi aktif seperti save, PDF, QR, anticall, atau restore.'],
   cancel: ['Format: ,cancel', 'Batalkan sesi aktif atau konfirmasi pending.'],
   confirm: ['Format: ,confirm', 'Jalankan aksi yang sedang menunggu konfirmasi.']
 };
@@ -706,6 +713,7 @@ function activeSessionType(jid) {
   if (state.taskRecorder?.has(jid)) return 'rekam task';
   if (state.anticall?.has(jid)) return 'anticall';
   if (state.pdfSessions?.has(jid)) return 'PDF';
+  if (state.qrSessions?.has(jid)) return 'QR';
   if (state.restoreSessions?.has(jid)) return 'restore';
   return null;
 }
@@ -715,6 +723,7 @@ function activeSessionActorMatches(jid, actorJid) {
   if (state.taskRecorder?.has(jid)) return state.taskRecorder.isActor(jid, actorJid);
   if (state.anticall?.has(jid)) return state.anticall.isActor(jid, actorJid);
   if (state.pdfSessions?.has(jid)) return state.pdfSessions.isActor(jid, actorJid);
+  if (state.qrSessions?.has(jid)) return state.qrSessions.isActor(jid, actorJid);
   if (state.restoreSessions?.has(jid)) return state.restoreSessions.isActor(jid, actorJid);
   return true;
 }
@@ -730,6 +739,7 @@ function hasAnyTempSession() {
     || state.taskRecorder?.sessions?.size
     || state.anticall?.sessions?.size
     || state.pdfSessions?.count()
+    || state.qrSessions?.count()
     || state.restoreSessions?.count()
   );
 }
@@ -933,7 +943,7 @@ async function handleHealth(jid) {
     `Disk: ${diskText}`,
     `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, office=${Boolean(state.tools.office)}, pdftoppm=${Boolean(state.tools.pdftoppm)}, magick=${Boolean(state.tools.magick)}`,
     `Data counts: save=${saved.length}, note=${notes.length}, link=${links.length}, task=${tasks.length}, remind=${reminders.length}, wol=${wolItems.length}`,
-    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, confirm=${state.confirmStore.count()}`,
+    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, qr=${state.qrSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, confirm=${state.confirmStore.count()}`,
     `Anticall: ${anticall.enabled ? 'aktif' : 'nonaktif'}, pesan=${anticall.hasMessage ? `${anticall.entryCount} item` : 'belum ada'}, exception=${anticall.exceptionCount || 0}`,
     `Public command access: all=${Boolean(access.all)}, chats=${access.chatCount || 0}, admins=${access.adminCount || 0}`,
     `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
@@ -946,8 +956,7 @@ async function handleHealth(jid) {
 
 async function handleSticker(message, command) {
   const jid = message.key.remoteJid;
-  const metaText = command.args.filter((arg) => !/^https?:\/\//i.test(arg)).join(' ');
-  const meta = parseStickerMeta(metaText, {
+  const options = parseStickerArgs(command.rawArgs, {
     defaultAuthor: DEFAULT_STICKER_AUTHOR,
     defaultTitle: DEFAULT_STICKER_TITLE
   });
@@ -957,11 +966,64 @@ async function handleSticker(message, command) {
     if (!media) media = await downloadUrlMedia(command.rawArgs, 'sticker-url');
     if (!media) throw new Error('Kirim/reply media atau sertakan URL media yang valid.');
     const animated = await isAnimatedMedia(media);
-    const sticker = await makeSticker(media, { author: meta.author, title: meta.title, tools: state.tools });
+    const sticker = await makeSticker(media, {
+      author: options.author,
+      title: options.title,
+      quality: options.quality,
+      tools: state.tools
+    });
     await state.sock.sendMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
   } finally {
     await cleanupFiles([media?.path]);
   }
+}
+
+async function handleQr(message, command, actorJid) {
+  const jid = message.key.remoteJid;
+  const options = parseQrArgs(command.rawArgs);
+  if (!options.text) {
+    assertNoActiveSession(jid);
+    if (mediaNode(message)) {
+      throw new Error('Untuk memakai gambar/GIF sebagai ikon, sertakan isi pesan: ,qr <pesan>. Media pada pembuka sesi tidak menjadi ikon global.');
+    }
+    const session = state.qrSessions.start(jid, { ...options, actorJid });
+    const sent = await sendText(jid, formatQrProgressMessage(session));
+    session.progressKey = sent.key;
+    registerSessionPrompt(sent.key, jid, actorJid);
+    return;
+  }
+
+  let iconMedia = null;
+  try {
+    iconMedia = await downloadQrIcon(state.sock, message, 'qr-direct-icon');
+    const image = await makeQrCode(options.text, {
+      ...options,
+      iconMedia,
+      tools: state.tools
+    });
+    await sendBotMessage(jid, { image, mimetype: 'image/png' }, { quoted: message });
+  } finally {
+    await cleanupFiles([iconMedia?.path]);
+  }
+}
+
+function formatQrProgressMessage(session) {
+  const style = session.style;
+  const background = session.background;
+  return [
+    `Sesi QR aktif (style=${style}, bg=${background}).`,
+    `Pesan diterima: ${session.items.length}.`,
+    'Kirim setiap teks/caption sebagai pesan terpisah. Gambar/GIF pada pesan akan menjadi ikon tengah QR.',
+    'Selesai: ,end atau reaction ✅/👍/❤️. Batal: ,cancel atau reaction ❌/👎/❎.'
+  ].join('\n');
+}
+
+async function maybeCollectQrItem(message, text) {
+  const session = state.qrSessions.get(message.key.remoteJid);
+  if (!session) return false;
+  await state.qrSessions.add(state.sock, message, text);
+  await editText(message.key.remoteJid, session.progressKey, formatQrProgressMessage(session));
+  return true;
 }
 
 async function handleSmeme(message, command) {
@@ -1053,17 +1115,20 @@ async function sendReversedSticker(jid, media) {
   });
 }
 
-async function maybeHandleSecretMediaTrigger(message, text) {
-  const trigger = parseSecretMediaTriggerText(text);
-  if (!trigger) return false;
+async function maybeForwardRepliedViewOnce(message, text) {
+  const quoted = extractQuotedViewOnceMessage(message);
+  if (!quoted) return false;
   const destinationJid = state.chatDirectory.findByName(PRIMARY_TARGET_NAME);
   if (!destinationJid) throw new Error(`Grup target "${PRIMARY_TARGET_NAME}" tidak ditemukan di cache chat bot.`);
 
   let media = null;
   try {
-    media = await downloadQuotedOrOwnMedia(state.sock, message, 'secret-media');
-    if (!media) return false;
-    await sendDownloadedMedia(destinationJid, media, { caption: trigger.caption });
+    media = await downloadMessageMedia(state.sock, quoted, 'view-once-reply');
+    if (!media) throw new Error('Reply mengarah ke view-once, tapi medianya tidak bisa dibaca.');
+    const replyCaption = String(text || '').trim();
+    await sendDownloadedMedia(destinationJid, media, {
+      caption: replyCaption || media.node?.caption || undefined
+    });
     return true;
   } finally {
     await cleanupFiles([media?.path]);
@@ -1526,6 +1591,16 @@ async function handleEndPdfByJid(jid, actorJid) {
 }
 
 async function handleSave(message, command, actorJid) {
+  const update = parseSaveUpdate(command);
+  if (update) {
+    const jid = message.key.remoteJid;
+    assertNoActiveSession(jid);
+    const { item, title } = await prepareSavedUpdate(update.query, update.newTitle);
+    const session = state.saveRecorder.startUpdate(jid, item, title, actorJid);
+    const sent = await sendText(jid, `Mulai update save #${item.id} "${item.title}"${title !== item.title ? ` menjadi "${title}"` : ''}. Kirim isi pengganti lalu ,end untuk simpan atau ,cancel untuk batal. Save lama tetap aman sampai update selesai.`);
+    registerSessionPrompt(sent.key, jid, actorJid);
+    return;
+  }
   const { title, firstText } = parseSaveStart(command);
   assertNoActiveSession(message.key.remoteJid);
   await assertSavedTitleAvailable(title);
@@ -1621,10 +1696,10 @@ async function handleLoad(message, command, actorJid) {
     await sendSavedList(jid, actorJid);
     return;
   }
-  if (command.args[0].toLowerCase() === 'change') {
+  if (['change', 'rename'].includes(command.args[0].toLowerCase())) {
     const query = command.args[1];
     const newTitle = command.args.slice(2).join(' ').trim();
-    if (!query || !newTitle) throw new Error('Format: ,load change <id|judul-lama> <judul-baru>');
+    if (!query || !newTitle) throw new Error('Format: ,load rename <id|"judul-lama"> <judul-baru>');
     const item = await renameSaved(query, newTitle);
     invalidateListKind('saved');
     await sendText(jid, `Save #${item.id} diganti judul menjadi "${item.title}".`);
@@ -1701,7 +1776,8 @@ async function finishSaveByJid(jid, actorJid) {
   const item = await state.saveRecorder.finish(jid, actorJid);
   if (!item) return false;
   invalidateListKind('saved');
-  await sendText(jid, `Save #${item.id} "${item.title}" tersimpan (${item.entries.length} item).`);
+  const action = item.replacedId ? `diupdate dari #${item.replacedId} menjadi` : 'tersimpan sebagai';
+  await sendText(jid, `Save ${action} #${item.id} "${item.title}" (${item.entries.length} item).`);
   return true;
 }
 
@@ -1756,6 +1832,11 @@ async function cancelActiveSessionByJid(jid, actorJid) {
     return true;
   }
 
+  if (await state.qrSessions.cancel(jid, actorJid)) {
+    await sendText(jid, 'Sesi QR dibatalkan.');
+    return true;
+  }
+
   if (await state.restoreSessions.cancel(jid, actorJid)) {
     await sendText(jid, 'Sesi restore dibatalkan.');
     return true;
@@ -1783,6 +1864,7 @@ async function handleEndSession(jid, actorJid) {
     return true;
   }
   if (await finishAnticallByJid(jid, actorJid)) return true;
+  if (await finishQrByJid(jid, actorJid)) return true;
   if (state.restoreSessions.has(jid)) {
     if (!activeSessionActorMatches(jid, actorJid)) return false;
     await requestConfirmation(jid, actorJid, {
@@ -1793,6 +1875,45 @@ async function handleEndSession(jid, actorJid) {
     return true;
   }
   return handleEndPdfByJid(jid, actorJid);
+}
+
+async function finishQrByJid(jid, actorJid) {
+  const session = state.qrSessions.end(jid, actorJid);
+  if (!session) return false;
+  const failures = [];
+  let sentCount = 0;
+  try {
+    if (!session.items.length) {
+      await sendText(jid, 'Sesi QR selesai, tetapi belum ada pesan yang diterima.');
+      return true;
+    }
+    for (const [index, item] of session.items.entries()) {
+      try {
+        const image = await makeQrCode(item.text, {
+          style: session.style,
+          background: session.background,
+          iconMedia: item.iconMedia,
+          tools: state.tools
+        });
+        await sendBotMessage(jid, { image, mimetype: 'image/png' }, { quoted: item.sourceMessage });
+        sentCount += 1;
+      } catch (error) {
+        failures.push(`#${index + 1}: ${error.message}`);
+        await logger.warn('QR session item failed', {
+          jid,
+          actorJid,
+          item: index + 1,
+          error: error.message
+        });
+      }
+    }
+    const summary = [`Sesi QR selesai: ${sentCount}/${session.items.length} QR berhasil dikirim.`];
+    if (failures.length) summary.push('Gagal:', ...failures);
+    await sendText(jid, summary.join('\n'));
+    return true;
+  } finally {
+    await state.qrSessions.cleanup(session);
+  }
 }
 
 async function finishRestore(message, actorJid = messageActorJid(message)) {
@@ -1842,7 +1963,7 @@ async function handleReminder(message, command) {
 }
 
 async function handleClear(jid) {
-  if (hasAnyTempSession()) throw new Error('Tidak bisa clear temp saat ada sesi save/anticall/PDF/restore aktif.');
+  if (hasAnyTempSession()) throw new Error('Tidak bisa clear temp saat ada sesi save/anticall/PDF/QR/restore aktif.');
   await cleanupStartupTemp();
   await sendText(jid, 'Temp dibersihkan.');
 }
@@ -1988,7 +2109,7 @@ async function handleButton(message, command) {
 async function handleAllow(message, command) {
   const jid = message.key.remoteJid;
   const { scope, enabled } = parseAllowArgs(command.args);
-  const commands = ['help', 's', 'smeme', 'resend']
+  const commands = ['help', 's', 'smeme', 'resend', 'qr']
     .filter((name) => PUBLIC_COMMANDS.has(name))
     .map((name) => `${COMMAND_PREFIX}${name}`)
     .join(', ');
@@ -2413,6 +2534,9 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'resend':
       await handleReverseSticker(message, command);
       break;
+    case 'qr':
+      await handleQr(message, command, context.actorJid);
+      break;
     case 'task':
       await handleTask(message, command, context.actorJid);
       break;
@@ -2561,7 +2685,11 @@ async function onMessageUpsert(event) {
         await maybeCollectRestorePart(message);
         continue;
       }
-      if (!command && !state.pdfSessions.has(jid) && context.isOwner && await maybeHandleSecretMediaTrigger(message, text)) {
+      if (sessionActorMatches && state.qrSessions.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
+        await maybeCollectQrItem(message, text);
+        continue;
+      }
+      if (!command && !state.pdfSessions.has(jid) && context.isOwner && await maybeForwardRepliedViewOnce(message, text)) {
         continue;
       }
       if (command) {
@@ -2793,6 +2921,7 @@ async function main() {
   await state.statusSave.load();
   state.tools = await detectTools();
   state.pdfSessions = new PdfSessions(state.tools);
+  state.qrSessions = new QrSessions();
   state.restoreSessions = new RestoreSessions();
   state.saveRecorder = new SaveRecorder();
   state.taskRecorder = new TaskRecorder();

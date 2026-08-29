@@ -10,7 +10,8 @@ import { parseDurationMs } from '../src/reminders.js';
 import { normalizeMac } from '../src/wol.js';
 import { parseTaskArgs, parseTaskRecordingArgs } from '../src/tasks.js';
 import { extractZipBuffer, zipDirectory } from '../src/zip.js';
-import { PendingConfirmStore, parseSecretMediaTriggerText } from '../src/confirm.js';
+import { PendingConfirmStore } from '../src/confirm.js';
+import { extractQuotedViewOnceMessage } from '../src/media.js';
 import { CommandAccessStore, parseAllowArgs } from '../src/commandAccess.js';
 import { ReactionActionStore, reactionIntent } from '../src/reactionActions.js';
 import { normalizePhoneNumber, normalizePhoneToJid } from '../src/phone.js';
@@ -23,16 +24,25 @@ import {
   makeSmemeSticker,
   makeSticker,
   parseSmemeArgs,
+  parseStickerArgs,
   parseStickerMeta,
   reverseSticker,
   splitSmemeTextRuns
 } from '../src/sticker.js';
-import { detectTools } from '../src/tools.js';
+import { detectTools, runTool } from '../src/tools.js';
 import { AnticallStore, formatAnticallStatus } from '../src/anticall.js';
 import { RuntimeConfigStore } from '../src/runtimeConfig.js';
 import { ChangedMessageStore, messageIndexKey } from '../src/changedMessages.js';
 import { StatusSaveStore } from '../src/statusSave.js';
 import { formatServices, listOpenServices, parseSsOutput } from '../src/services.js';
+import { deleteSaved, SaveRecorder, parseSaveUpdate } from '../src/saved.js';
+import {
+  QrSessions,
+  makeQrCode,
+  parseQrArgs,
+  qrForegroundForBackground,
+  qrIconSupport
+} from '../src/qr.js';
 
 test('services parser classifies open web, SSH, and Samba ports', async () => {
   const sockets = parseSsOutput([
@@ -50,6 +60,118 @@ test('services parser classifies open web, SSH, and Samba ports', async () => {
   });
   assert.equal(result.sockets[0].service, 'SSH');
   assert.match(result.sockets[0].access.join(' '), /ssh:\/\/minipc\.nyala-duck\.ts\.net:22/);
+});
+
+test('QR args support direct/session modes, styles, named colors, and hex backgrounds', () => {
+  assert.deepEqual(parseQrArgs(''), {
+    style: 'square',
+    background: '#ffffff',
+    text: ''
+  });
+  assert.deepEqual(parseQrArgs('style=dot bg=blue halo dunia'), {
+    style: 'dot',
+    background: '#0000ff',
+    text: 'halo dunia'
+  });
+  assert.deepEqual(parseQrArgs('bg=#Aa22Ff style=rounded pesan style=dot'), {
+    style: 'rounded',
+    background: '#aa22ff',
+    text: 'pesan style=dot'
+  });
+  assert.throws(() => parseQrArgs('style=diamond pesan'), /square, dot, rounded/);
+  assert.throws(() => parseQrArgs('bg=cyan pesan'), /Background QR/);
+  assert.throws(() => parseQrArgs('style=dot style=square pesan'), /satu kali/);
+});
+
+test('QR foreground automatically maximizes contrast', () => {
+  assert.equal(qrForegroundForBackground('white'), '#000000');
+  assert.equal(qrForegroundForBackground('yellow'), '#000000');
+  assert.equal(qrForegroundForBackground('black'), '#ffffff');
+  assert.equal(qrForegroundForBackground('blue'), '#ffffff');
+});
+
+test('QR renderer creates 1024px PNG variants and a centered image icon', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'qr-render-test-'));
+  const iconPath = path.join(work, 'icon.png');
+  try {
+    await sharp({ create: { width: 40, height: 24, channels: 3, background: '#ff00ff' } })
+      .png()
+      .toFile(iconPath);
+    const square = await makeQrCode('IrOBot QR test', { style: 'square', background: 'white' });
+    const dot = await makeQrCode('IrOBot QR test', { style: 'dot', background: 'blue' });
+    const roundedWithIcon = await makeQrCode('IrOBot QR test', {
+      style: 'rounded',
+      background: '#ffaa00',
+      iconMedia: { path: iconPath, type: 'imageMessage', mimetype: 'image/png' }
+    });
+    for (const output of [square, dot, roundedWithIcon]) {
+      const metadata = await sharp(output).metadata();
+      assert.equal(metadata.format, 'png');
+      assert.equal(metadata.width, 1024);
+      assert.equal(metadata.height, 1024);
+    }
+    assert.notDeepEqual(square, dot);
+    assert.notDeepEqual(square, roundedWithIcon);
+    await assert.rejects(() => makeQrCode('x'.repeat(20_000)), /terlalu panjang/i);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+test('QR renderer extracts the first frame from WhatsApp GIF playback video', async () => {
+  const tools = await detectTools();
+  if (!tools.ffmpeg) return;
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'qr-video-icon-test-'));
+  const videoPath = path.join(work, 'gif-playback.mp4');
+  try {
+    await runTool(tools.ffmpeg, [
+      '-y',
+      '-f', 'lavfi',
+      '-i', 'color=c=red:s=64x64:d=0.2',
+      '-pix_fmt', 'yuv420p',
+      videoPath
+    ]);
+    const output = await makeQrCode('QR dengan GIF', {
+      iconMedia: { path: videoPath, type: 'videoMessage', mimetype: 'video/mp4' },
+      tools
+    });
+    const metadata = await sharp(output).metadata();
+    assert.equal(metadata.format, 'png');
+    assert.equal(metadata.width, 1024);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+test('QR icon support accepts images and WhatsApp GIF playback but rejects regular video', () => {
+  const wrap = (node) => ({ key: { remoteJid: 'chat@test' }, message: node });
+  assert.equal(qrIconSupport(wrap({ imageMessage: { mimetype: 'image/jpeg' } })).supported, true);
+  assert.equal(qrIconSupport(wrap({ videoMessage: { mimetype: 'video/mp4', gifPlayback: true } })).supported, true);
+  assert.equal(qrIconSupport(wrap({ videoMessage: { mimetype: 'video/mp4' } })).supported, false);
+  assert.equal(qrIconSupport(wrap({ conversation: 'teks' })).hasMedia, false);
+});
+
+test('QR sessions enforce actor ownership and clean temporary icons on cancel', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const iconPath = path.join(tempRoot, `qr-session-${Date.now()}.png`);
+  await fs.writeFile(iconPath, Buffer.from('temporary'));
+  const sessions = new QrSessions({ timeoutMs: 60_000 });
+  const session = sessions.start('chat@test', {
+    actorJid: 'actor-a@test',
+    style: 'dot',
+    background: 'red'
+  });
+  session.items.push({ text: 'satu', iconMedia: { path: iconPath } });
+  assert.equal(sessions.isActor('chat@test', 'actor-a@test'), true);
+  assert.equal(sessions.isActor('chat@test', 'actor-b@test'), false);
+  assert.equal(await sessions.cancel('chat@test', 'actor-b@test'), false);
+  assert.equal(await sessions.cancel('chat@test', 'actor-a@test'), true);
+  await assert.rejects(() => fs.access(iconPath));
 });
 
 test('parseDurationMs supports compact countdown formats', () => {
@@ -223,12 +345,31 @@ test('PdfSessions split mode builds one PDF per media item', async () => {
   }
 });
 
-test('parseSecretMediaTriggerText detects text ending with space dot', () => {
-  assert.deepEqual(parseSecretMediaTriggerText('halo .'), { caption: 'halo' });
-  assert.deepEqual(parseSecretMediaTriggerText(' .'), { caption: '' });
-  assert.equal(parseSecretMediaTriggerText('halo.'), null);
-  assert.equal(parseSecretMediaTriggerText('halo . terus'), null);
-  assert.equal(parseSecretMediaTriggerText('halo . '), null);
+test('extractQuotedViewOnceMessage only accepts quoted view-once media', () => {
+  const reply = {
+    key: { remoteJid: 'chat@test', id: 'reply-1' },
+    message: {
+      extendedTextMessage: {
+        text: 'kirim ulang',
+        contextInfo: {
+          stanzaId: 'source-1',
+          participant: 'owner@test',
+          quotedMessage: {
+            viewOnceMessageV2: {
+              message: {
+                imageMessage: { mimetype: 'image/jpeg', mediaKey: Buffer.from('key') }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+  assert.equal(extractQuotedViewOnceMessage(reply)?.key.id, 'source-1');
+  reply.message.extendedTextMessage.contextInfo.quotedMessage = {
+    imageMessage: { mimetype: 'image/jpeg' }
+  };
+  assert.equal(extractQuotedViewOnceMessage(reply), null);
 });
 
 test('PendingConfirmStore takes and expires pending actions', async () => {
@@ -294,6 +435,156 @@ test('parseStickerMeta supports title comma author and URL media text', () => {
   });
 });
 
+test('parseStickerArgs supports explicit quality without changing pack metadata or URL', () => {
+  assert.deepEqual(parseStickerArgs('', { defaultAuthor: 'Author', defaultTitle: 'Title' }), {
+    author: 'Author',
+    title: 'Title',
+    quality: 100
+  });
+  assert.deepEqual(parseStickerArgs('judul saya,author saya q=80 https://example.com/a.png', {
+    defaultAuthor: 'Author',
+    defaultTitle: 'Title'
+  }), {
+    author: 'author saya',
+    title: 'judul saya',
+    quality: 80
+  });
+  assert.throws(() => parseStickerArgs('q=0'), /1-100/);
+  assert.throws(() => parseStickerArgs('q=tinggi'), /q=1-100/);
+  assert.throws(() => parseStickerArgs('q=80 q=70'), /satu kali/);
+});
+
+test('makeSticker enlarges small images to 512px and preserves transparent pixels', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'static-sticker-test-'));
+  const source = path.join(work, 'source.png');
+  try {
+    const pixels = Buffer.alloc(16 * 16 * 4);
+    for (let y = 4; y < 12; y += 1) {
+      for (let x = 4; x < 12; x += 1) {
+        const offset = (y * 16 + x) * 4;
+        pixels[offset] = 255;
+        pixels[offset + 3] = 255;
+      }
+    }
+    await sharp(pixels, { raw: { width: 16, height: 16, channels: 4 } }).png().toFile(source);
+    const sticker = await makeSticker({
+      path: source,
+      mimetype: 'image/png',
+      fileName: 'source.png',
+      node: {}
+    }, { author: 'A', title: 'T', quality: 100, tools: {} });
+    const rendered = sharp(sticker);
+    const metadata = await rendered.metadata();
+    const { data, info } = await rendered.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    assert.equal(metadata.width, 512);
+    assert.equal(metadata.height, 512);
+    assert.equal(metadata.hasAlpha, true);
+    assert.equal(data[3], 0);
+    const center = ((Math.floor(info.height / 2) * info.width) + Math.floor(info.width / 2)) * 4;
+    assert.equal(data[center + 3], 255);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+test('makeSticker ffmpeg path keeps transparent animated-media pixels', async () => {
+  const tools = await detectTools();
+  if (!tools.ffmpeg) return;
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'animated-alpha-test-'));
+  const source = path.join(work, 'source.gif');
+  try {
+    const pixels = Buffer.alloc(16 * 16 * 4);
+    for (let y = 4; y < 12; y += 1) {
+      for (let x = 4; x < 12; x += 1) {
+        const offset = (y * 16 + x) * 4;
+        pixels[offset + 1] = 255;
+        pixels[offset + 3] = 255;
+      }
+    }
+    await sharp(pixels, { raw: { width: 16, height: 16, channels: 4 } }).gif().toFile(source);
+    const sticker = await makeSticker({
+      path: source,
+      mimetype: 'image/gif',
+      fileName: 'source.gif',
+      node: {}
+    }, { author: 'A', title: 'T', quality: 100, tools });
+    const { data, info } = await sharp(sticker).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    assert.equal(info.width, 512);
+    assert.equal(info.height, 512);
+    assert.equal(data[3], 0);
+    const center = ((Math.floor(info.height / 2) * info.width) + Math.floor(info.width / 2)) * 4;
+    assert.equal(data[center + 3], 255);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+test('SaveRecorder update replaces content with a new ID at the bottom', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'saved-update-test-'));
+  const file = path.join(work, 'saved.json');
+  const mediaDir = path.join(work, 'media');
+  const recorder = new SaveRecorder({ file, mediaDir });
+  try {
+    recorder.start('chat@test', 'Satu', 'isi lama', 'owner@test');
+    const first = await recorder.finish('chat@test', 'owner@test');
+    recorder.start('chat@test', 'Dua', 'isi kedua', 'owner@test');
+    await recorder.finish('chat@test', 'owner@test');
+
+    const session = recorder.startUpdate('chat@test', first, 'Satu Baru', 'owner@test');
+    session.entries.push({ kind: 'text', text: 'isi baru' });
+    const updated = await recorder.finish('chat@test', 'owner@test');
+    const store = JSON.parse(await fs.readFile(file, 'utf8'));
+
+    assert.equal(updated.replacedId, 1);
+    assert.deepEqual(store.items.map((item) => [item.id, item.title]), [[2, 'Dua'], [3, 'Satu Baru']]);
+    assert.equal(store.items[1].entries[0].text, 'isi baru');
+    assert.equal(store.nextId, 4);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+test('deleted saves keep remaining IDs stable and do not reuse media IDs', async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'saved-delete-id-test-'));
+  const file = path.join(work, 'saved.json');
+  const recorder = new SaveRecorder({ file, mediaDir: path.join(work, 'media') });
+  try {
+    recorder.start('chat@test', 'Satu', 'isi satu', 'owner@test');
+    await recorder.finish('chat@test', 'owner@test');
+    recorder.start('chat@test', 'Dua', 'isi dua', 'owner@test');
+    await recorder.finish('chat@test', 'owner@test');
+    await deleteSaved('1', { file });
+    recorder.start('chat@test', 'Tiga', 'isi tiga', 'owner@test');
+    const third = await recorder.finish('chat@test', 'owner@test');
+    const store = JSON.parse(await fs.readFile(file, 'utf8'));
+    assert.equal(third.id, 3);
+    assert.deepEqual(store.items.map((item) => [item.id, item.title]), [[2, 'Dua'], [3, 'Tiga']]);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+test('parseSaveUpdate supports an optional replacement title', () => {
+  assert.equal(parseSaveUpdate({ args: ['laporan'], rawArgs: 'laporan' }), null);
+  assert.deepEqual(parseSaveUpdate({ args: ['update', '2'], rawArgs: 'update 2' }), {
+    query: '2',
+    newTitle: ''
+  });
+  assert.deepEqual(parseSaveUpdate({ args: ['update', 'judul lama', 'judul', 'baru'] }), {
+    query: 'judul lama',
+    newTitle: 'judul baru'
+  });
+  assert.throws(() => parseSaveUpdate({ args: ['update'] }), /Format/);
+});
+
 test('smeme text keeps emoji as colored emoji run', async () => {
   assert.deepEqual(splitSmemeTextRuns('halo 🐫 ok').map((run) => run.type), ['text', 'emoji', 'text']);
   assert.equal(splitSmemeTextRuns('halo 🐫 ok')[1].codepoint, '1f42b');
@@ -346,6 +637,7 @@ test('CommandAccessStore gates public commands', async () => {
     assert.equal(store.canUse('smeme', 'chat-a'), true);
     assert.equal(store.canUse('help', 'chat-a'), true);
     assert.equal(store.canUse('resend', 'chat-a'), true);
+    assert.equal(store.canUse('qr', 'chat-a'), true);
     assert.equal(store.canUseAs('save', 'chat-a', '628111@s.whatsapp.net'), false);
     assert.equal(store.canUse('s', 'chat-b'), false);
 

@@ -19,7 +19,8 @@
     "port": 9
   },
   "sessions": {
-    "restoreTimeoutMs": 1800000
+    "restoreTimeoutMs": 1800000,
+    "qrTimeoutMs": 1800000
   },
   "backup": {
     "partSizeMb": 45,

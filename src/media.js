@@ -44,6 +44,11 @@ export function quotedMediaNode(message) {
   return quoted ? mediaNode(quoted) : null;
 }
 
+export function extractQuotedViewOnceMessage(message) {
+  const quoted = extractQuotedMessage(message);
+  return quoted && isViewOnceMediaMessage(quoted) ? quoted : null;
+}
+
 export function isViewOnceMediaMessage(message) {
   const raw = message?.message;
   const found = mediaNode(message);

@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { SAVED_MESSAGES_DIR, SAVED_MESSAGES_FILE } from './config.js';
 import { cleanupFiles } from './media.js';
-import { assertUniqueTitle, renumberCollection } from './namedStore.js';
+import { assertUniqueTitle } from './namedStore.js';
 import {
   persistRecordedEntries,
   recordMessageEntry,
@@ -14,17 +14,23 @@ function emptyStore() {
   return { nextId: 1, items: [] };
 }
 
-async function readStore() {
+async function readStore(file = SAVED_MESSAGES_FILE) {
   try {
-    return JSON.parse(await fs.readFile(SAVED_MESSAGES_FILE, 'utf8'));
+    const parsed = JSON.parse(await fs.readFile(file, 'utf8'));
+    const items = Array.isArray(parsed.items) ? parsed.items : [];
+    const maxId = items.reduce((highest, item) => Math.max(highest, Number(item.id) || 0), 0);
+    return {
+      nextId: Math.max(Number(parsed.nextId) || 1, maxId + 1),
+      items
+    };
   } catch {
     return emptyStore();
   }
 }
 
-async function writeStore(store) {
-  await fs.mkdir(path.dirname(SAVED_MESSAGES_FILE), { recursive: true });
-  await fs.writeFile(SAVED_MESSAGES_FILE, `${JSON.stringify(store, null, 2)}\n`);
+async function writeStore(store, file = SAVED_MESSAGES_FILE) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, `${JSON.stringify(store, null, 2)}\n`);
 }
 
 function slug(value) {
@@ -54,12 +60,22 @@ export function parseSaveStart(command) {
   return { title, firstText };
 }
 
+export function parseSaveUpdate(command) {
+  if ((command.args[0] || '').toLowerCase() !== 'update') return null;
+  const query = command.args[1];
+  const newTitle = command.args.slice(2).join(' ').trim();
+  if (!query) throw new Error('Format: ,save update <id|"judul lama"> ["judul baru"]');
+  return { query, newTitle };
+}
+
 export class SaveRecorder {
-  constructor() {
+  constructor({ file = SAVED_MESSAGES_FILE, mediaDir = SAVED_MESSAGES_DIR } = {}) {
     this.sessions = new Map();
+    this.file = file;
+    this.mediaDir = mediaDir;
   }
 
-  start(jid, title, firstText = '', actorJid = jid) {
+  start(jid, title, firstText = '', actorJid = jid, options = {}) {
     this.cancel(jid);
     const session = {
       jid,
@@ -67,11 +83,17 @@ export class SaveRecorder {
       title,
       entries: [],
       tempFiles: [],
+      replaceId: options.replaceId || null,
       startedAt: Date.now()
     };
     if (firstText) session.entries.push({ kind: 'text', text: firstText });
     this.sessions.set(jid, session);
     return session;
+  }
+
+  startUpdate(jid, saved, title = saved?.title, actorJid = jid) {
+    if (!saved?.id) throw new Error('Save yang akan diupdate tidak valid.');
+    return this.start(jid, title, '', actorJid, { replaceId: saved.id });
   }
 
   has(jid) {
@@ -98,24 +120,35 @@ export class SaveRecorder {
     if (!session) return null;
     if (actorJid && session.actorJid !== actorJid) return null;
     if (!session.entries.length) throw new Error('Belum ada isi yang direkam.');
-    const store = await readStore();
-    assertUniqueTitle(store, session.title);
+    const store = await readStore(this.file);
+    const replaced = session.replaceId ? findSaved(store, session.replaceId) : null;
+    if (session.replaceId && !replaced) throw new Error(`Save #${session.replaceId} yang akan diupdate sudah tidak ditemukan.`);
+    assertUniqueTitle(store, session.title, replaced?.id || null);
     const id = store.nextId++;
-    const dir = path.join(SAVED_MESSAGES_DIR, `${id}-${slug(session.title)}`);
+    const dir = path.join(this.mediaDir, `${id}-${slug(session.title)}`);
     await fs.mkdir(dir, { recursive: true });
-
-    const entries = await persistRecordedEntries(session.entries, dir);
-
-    const item = {
-      id,
-      title: session.title,
-      entries,
-      createdAt: new Date().toISOString()
-    };
-    store.items.push(item);
-    await writeStore(store);
+    let result;
+    try {
+      const entries = await persistRecordedEntries(session.entries, dir);
+      const now = new Date().toISOString();
+      const item = {
+        id,
+        title: session.title,
+        entries,
+        createdAt: now,
+        ...(replaced ? { updatedAt: now } : {})
+      };
+      if (replaced) store.items = store.items.filter((saved) => saved.id !== replaced.id);
+      store.items.push(item);
+      await writeStore(store, this.file);
+      result = replaced ? { ...item, replacedId: replaced.id } : item;
+    } catch (error) {
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
     await this.cancel(jid);
-    return item;
+    if (replaced) await cleanupSavedMedia(replaced).catch(() => {});
+    return result;
   }
 
   async cancel(jid, actorJid = null) {
@@ -138,20 +171,27 @@ export async function assertSavedTitleAvailable(title) {
   assertUniqueTitle(store, title);
 }
 
+export async function prepareSavedUpdate(query, newTitle = '') {
+  const store = await readStore();
+  const item = findSaved(store, query);
+  if (!item) throw new Error(`Save "${query}" tidak ditemukan.`);
+  const title = String(newTitle || item.title).trim();
+  assertUniqueTitle(store, title, item.id);
+  return { item, title };
+}
+
 export function formatSavedList(items) {
   if (!items.length) return 'Belum ada pesan tersimpan.';
   return items.map((item) => `#${item.id} - ${item.title} (${visibleEntries(item).length} item)`).join('\n');
 }
 
-export async function deleteSaved(query) {
-  const store = await readStore();
+export async function deleteSaved(query, { file = SAVED_MESSAGES_FILE } = {}) {
+  const store = await readStore(file);
   const item = findSaved(store, query);
   if (!item) throw new Error(`Save "${query}" tidak ditemukan.`);
   store.items = store.items.filter((saved) => saved.id !== item.id);
-  renumberCollection(store);
-  await writeStore(store);
-  const dirs = new Set(item.entries.filter((entry) => entry.path).map((entry) => path.dirname(entry.path)));
-  await Promise.all([...dirs].map((dir) => fs.rm(dir, { recursive: true, force: true })));
+  await writeStore(store, file);
+  await cleanupSavedMedia(item);
   return item;
 }
 
@@ -173,4 +213,9 @@ export async function renameSaved(query, newTitle) {
 
 export async function sendSaved(sock, jid, item) {
   await sendRecordedEntries(sock, jid, visibleEntries(item));
+}
+
+async function cleanupSavedMedia(item) {
+  const dirs = new Set((item.entries || []).filter((entry) => entry.path).map((entry) => path.dirname(entry.path)));
+  await Promise.all([...dirs].map((dir) => fs.rm(dir, { recursive: true, force: true })));
 }

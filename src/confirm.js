@@ -57,11 +57,3 @@ export class PendingConfirmStore {
 function confirmKey(jid, actorJid) {
   return `${jid}:${actorJid || jid}`;
 }
-
-export function parseSecretMediaTriggerText(text) {
-  const value = String(text || '');
-  if (!value.endsWith(' .')) return null;
-  return {
-    caption: value.slice(0, -2).trim()
-  };
-}

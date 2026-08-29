@@ -3,7 +3,7 @@ import path from 'node:path';
 import { COMMAND_ACCESS_FILE } from './config.js';
 import { displayPhoneFromJid, normalizePhoneToJid, sameJid, tryNormalizeJid } from './phone.js';
 
-export const PUBLIC_COMMANDS = new Set(['help', 's', 'smeme', 'rs', 'resend']);
+export const PUBLIC_COMMANDS = new Set(['help', 's', 'smeme', 'rs', 'resend', 'qr']);
 export const ADMIN_RESTRICTED_COMMANDS = new Set([
   'allow',
   'admin',

@@ -94,6 +94,7 @@ export const DEFAULT_STICKER_TITLE = APP_CONFIG.sticker?.defaultTitle || ':3';
 export const PDF_DEFAULT_FILE_NAME = APP_CONFIG.pdf?.defaultFileName || BOT_NAME;
 export const PDF_SESSION_TIMEOUT_MS = numberOr(APP_CONFIG.pdf?.sessionTimeoutMs, 30 * 60 * 1000);
 export const RESTORE_SESSION_TIMEOUT_MS = numberOr(APP_CONFIG.sessions?.restoreTimeoutMs, 30 * 60 * 1000);
+export const QR_SESSION_TIMEOUT_MS = numberOr(APP_CONFIG.sessions?.qrTimeoutMs, 30 * 60 * 1000);
 export const BACKUP_PART_SIZE_BYTES = Math.max(
   1024 * 1024,
   Math.floor(numberOr(process.env.BACKUP_PART_SIZE_MB, APP_CONFIG.backup?.partSizeMb || 45) * 1024 * 1024)
