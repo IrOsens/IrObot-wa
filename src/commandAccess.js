@@ -12,6 +12,7 @@ export const ADMIN_RESTRICTED_COMMANDS = new Set([
   'changedmsg',
   'config',
   'statussave',
+  'typing',
   'backup',
   'restore',
   'clear',

@@ -137,7 +137,7 @@ systemctl --user disable --now irobot-wa
 - Reminder/task: `,task list|add|loop|repeat|record|pause|stop|resume|del`, `,remindme <teks> <durasi>`
 - Save: `,save`, `,save update`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load rename <id|judul> <judul-baru>`
 - Note/link: `,note list|add|get|del|rename`, `,link list|add|get|del|rename`
-- Utility: `,info`, `,status`, `,status bot`, `,health`, `,wol`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
+- Utility: `,info`, `,typing`, `,status`, `,status bot`, `,health`, `,wol`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
 - Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
@@ -170,6 +170,8 @@ QR code:
 Operasional:
 
 - Owner adalah akun WhatsApp yang sedang login.
+- `,typing <nomor|nama-grup|jid>` menyalakan indikator sedang mengetik terus-menerus pada target. Nomor menerima format `08...`, `8...`, `62...`, `+62...`, spasi, dan tanda hubung.
+- Beberapa target bisa aktif sekaligus. `,typing` menampilkan target aktif dan `,typing stop` menghentikan semuanya. Target disimpan dan dilanjutkan setelah reconnect/restart sampai dihentikan manual.
 - `,allow here on|off` membuka/menutup akses publik di chat/grup tempat command dikirim.
 - `,allow all on|off` membuka/menutup akses publik di semua chat/grup.
 - Legacy `true|false` tetap didukung untuk `,allow`.

@@ -100,6 +100,7 @@ import {
 } from './phone.js';
 import { AnticallStore, formatAnticallStatus } from './anticall.js';
 import { formatServices, listOpenServices } from './services.js';
+import { TypingController } from './typing.js';
 
 class ChatDirectory {
   constructor() {
@@ -247,6 +248,7 @@ const state = {
   commandAccess: null,
   botState: null,
   anticall: null,
+  typing: null,
   rejectedCallIds: new Set(),
   ignoredOwnMessageIds: new Set(),
   reconnecting: false
@@ -403,7 +405,8 @@ const HELP_SECTIONS = [
       { name: 'changedmsg', text: ',changedmsg Pantau pesan edit/hapus' },
       { name: 'statussave', text: ',statussave Simpan status WA' },
       { name: 'clear', text: ',clear    Bersihkan temp' },
-      { name: 'button', text: ',button   Tes tombol command' }
+      { name: 'button', text: ',button   Tes tombol command' },
+      { name: 'typing', text: ',typing   Tampilkan typing terus-menerus' }
     ]
   },
   {
@@ -444,6 +447,7 @@ const HELP_DETAILS = {
   services: ['Format: ,services', 'Menampilkan listener TCP/UDP yang terbuka, klasifikasi web/SSH/Samba/dll, IP lokal, dan URL Tailscale.'],
   health: ['Format: ,health', 'Status teknis proses, tool, data count, scheduler, dan runtime file.'],
   info: ['Format: ,info <nomor>', 'Contoh: ,info 08123431212'],
+  typing: ['Format: ,typing <nomor|nama-grup|jid>', 'Format: ,typing stop', 'Bisa aktif di beberapa target sekaligus. Status typing diperbarui terus dan dipulihkan setelah reconnect/restart sampai dihentikan manual.'],
   changedmsg: ['Format: ,changedmsg list|allow|del <id|nama-grup|jid>', 'DM dipantau default. Grup harus di-allow. Nama grup duplikat ditolak; pakai JID agar aman.'],
   config: ['Format: ,config, ,config get <key>, ,config set <key> <value>', 'Destination key menerima nama grup, JID, atau nomor. Grup disimpan sebagai JID + nama.'],
   statussave: ['Format: ,statussave list|add|del <nomor|id>', 'Nomor menerima 081..., +62 123-1234-1234, atau +6212312341234. Status teks dan media dikirim ke dest.saved.'],
@@ -1413,6 +1417,41 @@ async function handleInfo(message, command) {
   } else {
     await sendText(jid, caption);
   }
+}
+
+async function handleTyping(message, command, context) {
+  if (!context.isOwner) throw new Error('Command ,typing hanya bisa dipakai nomor yang terhubung ke session bot.');
+  const replyJid = message.key.remoteJid;
+  const input = command.rawArgs.trim();
+  if (!input) {
+    const targets = state.typing.snapshot();
+    await sendText(replyJid, targets.length
+      ? ['Typing aktif:', ...targets.map((target) => `- ${target.name} (${target.jid})`), '', 'Matikan semua: ,typing stop'].join('\n')
+      : 'Typing tidak aktif.\nFormat: ,typing <nomor|nama-grup|jid>');
+    return;
+  }
+  if (input.toLowerCase() === 'stop') {
+    const stopped = await state.typing.stopAll();
+    await sendText(replyJid, stopped.length
+      ? `Semua typing dihentikan (${stopped.length} target).`
+      : 'Tidak ada typing yang sedang aktif.');
+    return;
+  }
+
+  const destination = resolveDestinationInput(input, context.actorJid);
+  const name = destination.savedName || state.chatDirectory.nameFor(destination.jid) || destination.jid;
+  const result = await state.typing.add({
+    jid: destination.jid,
+    name,
+    type: destination.type,
+    addedAt: new Date().toISOString()
+  });
+  await sendText(replyJid, [
+    `Typing ${result.added ? 'diaktifkan' : 'tetap aktif'} untuk ${name}.`,
+    `Target: ${destination.jid}`,
+    `Total target aktif: ${state.typing.snapshot().length}.`,
+    'Typing akan terus diperbarui sampai ,typing stop.'
+  ].join('\n'));
 }
 
 async function handleTask(message, command, actorJid = messageActorJid(message)) {
@@ -2467,6 +2506,9 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'info':
       await handleInfo(message, command);
       break;
+    case 'typing':
+      await handleTyping(message, command, context);
+      break;
     case 'save':
       await handleSave(message, command, context.actorJid);
       break;
@@ -2871,9 +2913,11 @@ async function connect() {
       await logger.info('WhatsApp connected');
       await loadGroups(sock);
       await hydrateConfiguredDestinations();
+      state.typing?.attach(sock);
       applyBotRuntimeState();
     }
     if (connection === 'close') {
+      state.typing?.detach();
       state.scheduler?.stop();
       state.reminderScheduler?.stop();
       state.backupScheduler?.stop();
@@ -2927,6 +2971,8 @@ async function main() {
   state.taskRecorder = new TaskRecorder();
   state.anticall = new AnticallStore();
   await state.anticall.load();
+  state.typing = new TypingController({ logger });
+  await state.typing.load();
   state.backupScheduler = new DailyBackupScheduler(
     logger,
     async () => sendDataBackupToWhatsApp(botSender(), destinationJid('backup'), {
@@ -2954,6 +3000,7 @@ process.on('SIGINT', async () => {
   state.scheduler?.stop();
   state.reminderScheduler?.stop();
   state.backupScheduler?.stop();
+  state.typing?.detach();
   process.exit(0);
 });
 

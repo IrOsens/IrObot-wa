@@ -16,6 +16,7 @@ export const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 export const COMMAND_ACCESS_FILE = path.join(DATA_DIR, 'command-access.json');
 export const BOT_STATE_FILE = path.join(DATA_DIR, 'bot-state.json');
+export const TYPING_STATE_FILE = path.join(DATA_DIR, 'typing-state.json');
 export const CHANGED_MESSAGES_FILE = path.join(DATA_DIR, 'changed-messages.json');
 export const STATUS_SAVE_FILE = path.join(DATA_DIR, 'status-save.json');
 export const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
@@ -124,6 +125,7 @@ export async function ensureRuntimeDirs() {
     ensureJsonFile(CONFIG_FILE, DEFAULT_APP_CONFIG),
     ensureJsonFile(COMMAND_ACCESS_FILE, { all: false, chats: {}, admins: [], nextAdminId: 1 }),
     ensureJsonFile(BOT_STATE_FILE, { enabled: true, updatedAt: null }),
+    ensureJsonFile(TYPING_STATE_FILE, { targets: [], updatedAt: null }),
     ensureJsonFile(CHANGED_MESSAGES_FILE, { allowedChats: [], nextAllowedId: 1, index: [], updatedAt: null }),
     ensureJsonFile(STATUS_SAVE_FILE, { nextId: 1, items: [], updatedAt: null }),
     ensureJsonFile(ANTICALL_FILE, { enabled: false, entries: [], updatedAt: null }),
