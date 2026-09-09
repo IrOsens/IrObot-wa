@@ -1,3 +1,5 @@
+import { UserInputError } from './errors.js';
+import { atomicJson } from './storage.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ANTICALL_FILE, ANTICALL_MEDIA_DIR } from './config.js';
@@ -122,9 +124,11 @@ export class AnticallStore {
     const session = this.sessions.get(jid);
     if (!session) return null;
     if (actorJid && session.actorJid !== actorJid) return null;
-    if (!session.entries.length) throw new Error('Belum ada isi pesan anticall yang direkam.');
+    if (!session.entries.length) throw new UserInputError('Belum ada isi pesan anticall yang direkam.');
 
+    const previousStore = this.store;
     const oldEntries = this.store.entries;
+    let committed = false;
     const now = new Date().toISOString();
     const dir = path.join(this.mediaDir, `response-${Date.now()}`);
     let entries = null;
@@ -139,12 +143,16 @@ export class AnticallStore {
         updatedAt: now
       };
       await this.save();
+      committed = true;
       this.sessions.delete(jid);
       await cleanupFiles(session.tempFiles);
       await removeEntryDirs(oldEntries);
       return this.snapshot();
     } catch (error) {
-      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+      if (!committed) {
+        this.store = previousStore;
+        await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+      }
       throw error;
     }
   }
@@ -159,7 +167,7 @@ export class AnticallStore {
   }
 
   async setEnabled(enabled) {
-    if (enabled && !this.hasMessage()) throw new Error('Pesan anticall belum ada. Buat dulu dengan ,anticall new.');
+    if (enabled && !this.hasMessage()) throw new UserInputError('Pesan anticall belum ada. Buat dulu dengan ,anticall new.');
     this.store.enabled = Boolean(enabled);
     await this.save();
     return this.snapshot();
@@ -178,7 +186,7 @@ export class AnticallStore {
   async addException(input) {
     const jid = normalizePhoneToJid(input);
     const existing = this.store.exceptions.find((item) => sameJid(item.jid, jid));
-    if (existing) throw new Error(`Exception ${existing.title} sudah tersimpan sebagai #${existing.id}.`);
+    if (existing) throw new UserInputError(`Exception ${existing.title} sudah tersimpan sebagai #${existing.id}.`);
     const item = {
       id: this.store.nextExceptionId++,
       title: displayPhoneFromJid(jid),
@@ -193,7 +201,7 @@ export class AnticallStore {
 
   async deleteException(query) {
     const item = findException(this.store.exceptions, query);
-    if (!item) throw new Error(`Exception "${query}" tidak ditemukan.`);
+    if (!item) throw new UserInputError(`Exception "${query}" tidak ditemukan.`);
     this.store.exceptions = this.store.exceptions.filter((candidate) => candidate.id !== item.id);
     renumberExceptions(this.store);
     await this.save();
@@ -207,7 +215,7 @@ export class AnticallStore {
   async save() {
     await fs.mkdir(path.dirname(this.file), { recursive: true });
     await fs.mkdir(this.mediaDir, { recursive: true });
-    await fs.writeFile(this.file, `${JSON.stringify(this.store, null, 2)}\n`);
+    await atomicJson(this.file, this.store);
   }
 }
 

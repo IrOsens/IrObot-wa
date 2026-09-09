@@ -3,7 +3,10 @@
   "commandPrefix": ",",
   "targets": {
     "primaryGroup": "IrOBot",
-    "taskChats": ["dev", "IrOBot"],
+    "taskChats": [
+      "dev",
+      "IrOBot"
+    ],
     "reminderChat": "IrOBot"
   },
   "sticker": {
@@ -31,7 +34,8 @@
     "logs": "logs",
     "changedmsg": "changedmsg",
     "saved": "saved",
-    "backup": "backup"
+    "backup": "backup",
+    "errors": "errormsg"
   },
   "changedmsg": {
     "enabled": true,
@@ -47,5 +51,9 @@
     "systemdService": "irobot-wa.service",
     "remote": "origin",
     "branch": "main"
+  },
+  "storage": {
+    "root": "",
+    "features": {}
   }
 }

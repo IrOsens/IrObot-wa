@@ -1,3 +1,4 @@
+import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { SAVED_MESSAGES_DIR, SAVED_MESSAGES_FILE } from './config.js';
@@ -54,7 +55,7 @@ function visibleEntries(item) {
 }
 
 export function parseSaveStart(command) {
-  if (!command.args.length) throw new Error('Format: ,save <judul> [teks awal]');
+  if (!command.args.length) throw new UserInputError('Format: ,save <judul> [teks awal]');
   const title = command.args[0];
   const firstText = command.args.slice(1).join(' ').trim();
   return { title, firstText };
@@ -64,7 +65,7 @@ export function parseSaveUpdate(command) {
   if ((command.args[0] || '').toLowerCase() !== 'update') return null;
   const query = command.args[1];
   const newTitle = command.args.slice(2).join(' ').trim();
-  if (!query) throw new Error('Format: ,save update <id|"judul lama"> ["judul baru"]');
+  if (!query) throw new UserInputError('Format: ,save update <id|"judul lama"> ["judul baru"]');
   return { query, newTitle };
 }
 
@@ -92,7 +93,7 @@ export class SaveRecorder {
   }
 
   startUpdate(jid, saved, title = saved?.title, actorJid = jid) {
-    if (!saved?.id) throw new Error('Save yang akan diupdate tidak valid.');
+    if (!saved?.id) throw new UserInputError('Save yang akan diupdate tidak valid.');
     return this.start(jid, title, '', actorJid, { replaceId: saved.id });
   }
 
@@ -119,10 +120,10 @@ export class SaveRecorder {
     const session = this.sessions.get(jid);
     if (!session) return null;
     if (actorJid && session.actorJid !== actorJid) return null;
-    if (!session.entries.length) throw new Error('Belum ada isi yang direkam.');
+    if (!session.entries.length) throw new UserInputError('Belum ada isi yang direkam.');
     const store = await readStore(this.file);
     const replaced = session.replaceId ? findSaved(store, session.replaceId) : null;
-    if (session.replaceId && !replaced) throw new Error(`Save #${session.replaceId} yang akan diupdate sudah tidak ditemukan.`);
+    if (session.replaceId && !replaced) throw new UserInputError(`Save #${session.replaceId} yang akan diupdate sudah tidak ditemukan.`);
     assertUniqueTitle(store, session.title, replaced?.id || null);
     const id = store.nextId++;
     const dir = path.join(this.mediaDir, `${id}-${slug(session.title)}`);
@@ -174,7 +175,7 @@ export async function assertSavedTitleAvailable(title) {
 export async function prepareSavedUpdate(query, newTitle = '') {
   const store = await readStore();
   const item = findSaved(store, query);
-  if (!item) throw new Error(`Save "${query}" tidak ditemukan.`);
+  if (!item) throw new UserInputError(`Save "${query}" tidak ditemukan.`);
   const title = String(newTitle || item.title).trim();
   assertUniqueTitle(store, title, item.id);
   return { item, title };
@@ -188,7 +189,7 @@ export function formatSavedList(items) {
 export async function deleteSaved(query, { file = SAVED_MESSAGES_FILE } = {}) {
   const store = await readStore(file);
   const item = findSaved(store, query);
-  if (!item) throw new Error(`Save "${query}" tidak ditemukan.`);
+  if (!item) throw new UserInputError(`Save "${query}" tidak ditemukan.`);
   store.items = store.items.filter((saved) => saved.id !== item.id);
   await writeStore(store, file);
   await cleanupSavedMedia(item);
@@ -203,7 +204,7 @@ export async function getSaved(query) {
 export async function renameSaved(query, newTitle) {
   const store = await readStore();
   const item = findSaved(store, query);
-  if (!item) throw new Error(`Save "${query}" tidak ditemukan.`);
+  if (!item) throw new UserInputError(`Save "${query}" tidak ditemukan.`);
   assertUniqueTitle(store, newTitle, item.id);
   item.title = String(newTitle || '').trim();
   item.updatedAt = new Date().toISOString();

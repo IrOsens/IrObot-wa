@@ -12,3 +12,7 @@ temp/
 .env
 .DS_Store
 Thumbs.db
+
+# Runtime fonts and configuration migration backups
+data/fonts/
+data/config.json.before-storage-*

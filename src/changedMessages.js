@@ -1,3 +1,4 @@
+import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { jidNormalizedUser } from 'baileys';
@@ -45,7 +46,7 @@ export class ChangedMessageStore {
   async addAllowed(destination) {
     const jid = normalizeChatJid(destination?.jid);
     const existing = this.store.allowedChats.find((item) => sameJid(item.jid, jid));
-    if (existing) throw new Error(`Chat "${existing.savedName}" sudah ada sebagai #${existing.id}.`);
+    if (existing) throw new UserInputError(`Chat "${existing.savedName}" sudah ada sebagai #${existing.id}.`);
     const item = {
       id: this.store.nextAllowedId++,
       jid,
@@ -62,7 +63,7 @@ export class ChangedMessageStore {
 
   async deleteAllowed(query) {
     const item = findAllowed(this.store.allowedChats, query);
-    if (!item) throw new Error(`Allowlist changedmsg "${query}" tidak ditemukan.`);
+    if (!item) throw new UserInputError(`Allowlist changedmsg "${query}" tidak ditemukan.`);
     this.store.allowedChats = this.store.allowedChats.filter((candidate) => candidate.id !== item.id);
     renumberAllowed(this.store);
     await this.save();
@@ -218,6 +219,7 @@ function normalizeIndexEntry(raw) {
     latestText: raw?.latestText == null ? String(raw?.text || '') : String(raw.latestText),
     logJid: normalizeLooseJid(raw?.logJid),
     logMessageId: String(raw?.logMessageId || '').trim(),
+    logPath: raw?.logPath || null,
     timestamp: Number(raw?.timestamp) || Date.now(),
     createdAt: raw?.createdAt || new Date().toISOString(),
     updatedAt: raw?.updatedAt || null,

@@ -1,3 +1,4 @@
+import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
@@ -128,13 +129,13 @@ export class PdfSessions {
   }
 
   async build(session) {
-    if (!session?.files?.length) throw new Error('Belum ada file untuk dibuat PDF.');
+    if (!session?.files?.length) throw new UserInputError('Belum ada file untuk dibuat PDF.');
     if (session.maxSizeBytes) return this.buildWithinSize(session);
     return this.buildPdfBuffer(session);
   }
 
   async buildSplit(session) {
-    if (!session?.files?.length) throw new Error('Belum ada file untuk dibuat PDF.');
+    if (!session?.files?.length) throw new UserInputError('Belum ada file untuk dibuat PDF.');
     const ordered = orderedSessionFiles(session);
     const files = [];
     for (const [index, item] of ordered.entries()) {
@@ -192,7 +193,7 @@ export class PdfSessions {
           pdfPaths.push(out);
           continue;
         }
-        throw new Error(`Format file belum didukung untuk PDF: ${item.fileName}`);
+        throw new UserInputError(`Format file belum didukung untuk PDF: ${item.fileName}`);
       }
 
       const merged = await PDFDocument.create();
@@ -255,9 +256,9 @@ export function parsePdfStartArgs(rawArgs) {
 
 export function parsePdfSizeLimit(input) {
   const match = String(input || '').trim().match(/^(\d+(?:\.\d+)?)\s*([kmgt]?b)$/i);
-  if (!match) throw new Error('Format maksimal ukuran PDF tidak valid. Contoh: 1MB.');
+  if (!match) throw new UserInputError('Format maksimal ukuran PDF tidak valid. Contoh: 1MB.');
   const value = Number(match[1]);
-  if (!Number.isFinite(value) || value <= 0) throw new Error('Maksimal ukuran PDF harus angka positif.');
+  if (!Number.isFinite(value) || value <= 0) throw new UserInputError('Maksimal ukuran PDF harus angka positif.');
   const unit = match[2].toLowerCase();
   const multipliers = {
     b: 1,

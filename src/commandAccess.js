@@ -1,9 +1,10 @@
+import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { COMMAND_ACCESS_FILE } from './config.js';
 import { displayPhoneFromJid, normalizePhoneToJid, sameJid, tryNormalizeJid } from './phone.js';
 
-export const PUBLIC_COMMANDS = new Set(['help', 's', 'smeme', 'rs', 'resend', 'qr']);
+export const PUBLIC_COMMANDS = new Set(['help', 'stext', 's', 'smeme', 'rs', 'resend', 'qr']);
 export const ADMIN_RESTRICTED_COMMANDS = new Set([
   'allow',
   'admin',
@@ -11,6 +12,7 @@ export const ADMIN_RESTRICTED_COMMANDS = new Set([
   'bot',
   'changedmsg',
   'config',
+  'setup',
   'statussave',
   'typing',
   'backup',
@@ -70,7 +72,7 @@ export class CommandAccessStore {
   }
 
   async setHere(jid, enabled) {
-    if (!jid) throw new Error('Chat target tidak valid.');
+    if (!jid) throw new UserInputError('Chat target tidak valid.');
     if (enabled) this.data.chats[jid] = true;
     else delete this.data.chats[jid];
     await this.save();
@@ -101,7 +103,7 @@ export class CommandAccessStore {
   async addAdmin(input) {
     const jid = normalizePhoneToJid(input);
     const existing = findAdmin(this.data.admins, jid);
-    if (existing) throw new Error(`Admin ${existing.title} sudah tersimpan sebagai #${existing.id}.`);
+    if (existing) throw new UserInputError(`Admin ${existing.title} sudah tersimpan sebagai #${existing.id}.`);
     const item = {
       id: this.data.nextAdminId++,
       title: displayPhoneFromJid(jid),
@@ -116,7 +118,7 @@ export class CommandAccessStore {
 
   async deleteAdmin(query) {
     const item = findAdmin(this.data.admins, query);
-    if (!item) throw new Error(`Admin "${query}" tidak ditemukan.`);
+    if (!item) throw new UserInputError(`Admin "${query}" tidak ditemukan.`);
     this.data.admins = this.data.admins.filter((admin) => admin.id !== item.id);
     renumberAdmins(this.data);
     await this.save();
@@ -132,9 +134,9 @@ export class CommandAccessStore {
 export function parseAllowArgs(args) {
   const [scopeRaw, enabledRaw] = args;
   const scope = String(scopeRaw || '').toLowerCase();
-  if (!['here', 'all'].includes(scope)) throw new Error('Format: ,allow here|all on|off');
+  if (!['here', 'all'].includes(scope)) throw new UserInputError('Format: ,allow here|all on|off');
   const enabledText = String(enabledRaw || '').toLowerCase();
-  if (!['on', 'off', 'true', 'false'].includes(enabledText)) throw new Error('Format: ,allow here|all on|off');
+  if (!['on', 'off', 'true', 'false'].includes(enabledText)) throw new UserInputError('Format: ,allow here|all on|off');
   return {
     scope,
     enabled: ['on', 'true'].includes(enabledText)

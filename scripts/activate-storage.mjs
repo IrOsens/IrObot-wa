@@ -1,0 +1,17 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { RuntimeConfigStore } from '../src/runtimeConfig.js';
+import { CONFIG_FILE, UPDATE_SYSTEMD_SERVICE } from '../src/config.js';
+const root = process.argv[2];
+if (!root || !path.isAbsolute(root)) throw new Error('Format: npm run activate:storage -- <root-server-absolut>');
+const backup = `${CONFIG_FILE}.before-storage-${Date.now()}`;
+await fs.copyFile(CONFIG_FILE, backup);
+const config = new RuntimeConfigStore(); await config.load();
+await config.set('storage.root', root);
+await config.setStorage('statussave', 'local', path.join(root, 'statussave'));
+console.log(`Statussave: ${path.join(root, 'statussave')}`);
+console.log(`Backup konfigurasi: ${backup}`);
+console.log('Tujuan fitur lain tetap memakai pengaturan sebelumnya.');
+execFileSync('systemctl', ['restart', UPDATE_SYSTEMD_SERVICE], { stdio: 'inherit' });
+execFileSync('systemctl', ['is-active', UPDATE_SYSTEMD_SERVICE], { stdio: 'inherit' });

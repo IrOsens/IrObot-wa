@@ -37,22 +37,22 @@ async function installWindows() {
 async function installLinux() {
   if (await commandExists('apt-get')) {
     await run('sudo', ['apt-get', 'update']);
-    await run('sudo', ['apt-get', 'install', '-y', 'ffmpeg', 'libreoffice']);
+    await run('sudo', ['apt-get', 'install', '-y', 'ffmpeg', 'libreoffice', 'cabextract', 'fontconfig']);
     return;
   }
 
   if (await commandExists('dnf')) {
-    await run('sudo', ['dnf', 'install', '-y', 'ffmpeg', 'libreoffice']);
+    await run('sudo', ['dnf', 'install', '-y', 'ffmpeg', 'libreoffice', 'cabextract', 'fontconfig']);
     return;
   }
 
   if (await commandExists('pacman')) {
-    await run('sudo', ['pacman', '-Sy', '--noconfirm', 'ffmpeg', 'libreoffice-fresh']);
+    await run('sudo', ['pacman', '-Sy', '--noconfirm', 'ffmpeg', 'libreoffice-fresh', 'cabextract', 'fontconfig']);
     return;
   }
 
   if (await commandExists('zypper')) {
-    await run('sudo', ['zypper', 'install', '-y', 'ffmpeg', 'libreoffice']);
+    await run('sudo', ['zypper', 'install', '-y', 'ffmpeg', 'libreoffice', 'cabextract', 'fontconfig']);
     return;
   }
 

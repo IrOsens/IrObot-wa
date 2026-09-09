@@ -1,3 +1,4 @@
+import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { STATUS_SAVE_FILE } from './config.js';
@@ -45,7 +46,7 @@ export class StatusSaveStore {
   async add(input, addedBy = null) {
     const jid = normalizePhoneToJid(input);
     const existing = this.store.items.find((item) => sameJid(item.jid, jid));
-    if (existing) throw new Error(`Nomor ${existing.title} sudah tersimpan sebagai #${existing.id}.`);
+    if (existing) throw new UserInputError(`Nomor ${existing.title} sudah tersimpan sebagai #${existing.id}.`);
     const item = {
       id: this.store.nextId++,
       title: displayPhoneFromJid(jid),
@@ -61,7 +62,7 @@ export class StatusSaveStore {
 
   async delete(query) {
     const item = findStatusItem(this.store.items, query);
-    if (!item) throw new Error(`Statussave "${query}" tidak ditemukan.`);
+    if (!item) throw new UserInputError(`Statussave "${query}" tidak ditemukan.`);
     this.store.items = this.store.items.filter((candidate) => candidate.id !== item.id);
     renumberCollection(this.store);
     await this.save();

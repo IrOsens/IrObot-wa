@@ -1,3 +1,11 @@
+import { presentStatus, statusCaption } from './statusViewer.js';
+import { pathToFileURL } from 'node:url';
+import { UserInputError, SetupRequiredError } from './errors.js';
+import { LocalArchive, STORAGE_FEATURES, destinationAlias, atomicJson, prepareLocalPath } from './storage.js';
+import { StatusInbox } from './statusInbox.js';
+import { ErrorReporter } from './errorReporter.js';
+import { reviveValue } from './recordedMessages.js';
+import { makeTextSticker, parseTextSticker } from './textSticker.js';
 import os from 'node:os';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -10,6 +18,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   getKeyAuthor,
   generateWAMessageFromContent,
+  generateMessageIDV2,
   jidNormalizedUser,
   proto,
   WAMessageStubType,
@@ -40,9 +49,9 @@ import {
   cleanupStartupTemp,
   ensureRuntimeDirs
 } from './config.js';
-import { cleanupOldLogs, logger } from './logger.js';
+import { cleanupOldLogs, logger, setErrorSink } from './logger.js';
 import { detectTools, fileExists, formatBytes, formatDuration, getDiskInfo, getLoadAverageText, runTool, runToolWithInput } from './tools.js';
-import { getMessageText, parseCommand } from './text.js';
+import { getMessageText, parseCommand, extractQuotedMessage, unwrapMessage } from './text.js';
 import {
   cleanupFiles,
   downloadMessageMedia,
@@ -73,9 +82,9 @@ import {
   sendSaved
 } from './saved.js';
 import { handleLinkCommand, handleNoteCommand, listLinks, listNotes } from './notes.js';
-import { ReminderScheduler, createReminder, formatCountdown, listReminders } from './reminders.js';
+import { ReminderScheduler, parseDurationMs, createReminder, formatCountdown, listReminders } from './reminders.js';
 import { handleWolCommand, listWol } from './wol.js';
-import { DailyBackupScheduler, sendDataBackupToWhatsApp } from './backup.js';
+import { DailyBackupScheduler, sendDataBackupToWhatsApp, createDataBackupFiles } from './backup.js';
 import { RestoreSessions } from './restore.js';
 import { PendingConfirmStore } from './confirm.js';
 import { CommandAccessStore, PUBLIC_COMMANDS, parseAllowArgs } from './commandAccess.js';
@@ -229,6 +238,14 @@ class ViewOnceCache {
 
 const state = {
   sock: null,
+  connected: false,
+  groups: new Map(),
+  contactNames: new Map(),
+  setupNotices: new Set(),
+  localArchive: new LocalArchive(),
+  statusInbox: null,
+  errorReporter: null,
+  sessionPrompts: new Map(),
   tools: null,
   chatDirectory: new ChatDirectory(),
   viewOnceCache: new ViewOnceCache(),
@@ -323,8 +340,10 @@ async function editText(jid, messageKey, text) {
   return sendBotMessage(jid, { text, edit: messageKey });
 }
 
-async function sendBotMessage(jid, content, options) {
-  const sent = await state.sock.sendMessage(jid, content, options);
+async function sendBotMessage(jid, content, options = {}) {
+  const messageId = options.messageId || generateMessageIDV2(ownUserJid());
+  rememberOwnOutput({ key: { id: messageId } });
+  const sent = await state.sock.sendMessage(jid, content, { ...options, messageId });
   rememberOwnOutput(sent);
   return sent;
 }
@@ -345,7 +364,6 @@ function botSender() {
 function isIgnoredOwnOutput(message) {
   const id = message?.key?.id;
   if (!id || !state.ignoredOwnMessageIds.has(id)) return false;
-  state.ignoredOwnMessageIds.delete(id);
   return true;
 }
 
@@ -353,6 +371,7 @@ const HELP_SECTIONS = [
   {
     title: 'Media',
     items: [
+      { name: 'stext', text: ',stext Stiker teks' },
       { name: 's', text: ',s        Buat stiker dari gambar/video' },
       { name: 'smeme', text: ',smeme    Buat stiker meme dari gambar' },
       { name: 'resend', text: ',resend   Kirim ulang media/view-once' },
@@ -396,6 +415,7 @@ const HELP_SECTIONS = [
       { name: 'bot', text: ',bot      On/off bot' },
       { name: 'allow', text: ',allow    Atur akses chat' },
       { name: 'admin', text: ',admin    Atur admin' },
+      { name: 'setup', text: ',setup Tujuan grup/server' },
       { name: 'config', text: ',config   Atur config' },
       { name: 'backup', text: ',backup   Backup data' },
       { name: 'restore', text: ',restore  Restore data' },
@@ -426,6 +446,8 @@ const HELP_ALIASES = {
 };
 
 const HELP_DETAILS = {
+  setup: ['Format: ,setup [statussave|backup|logs|changedmsg|errors]', ',setup root <path-server>', ',setup <fitur> group <nama-grup|jid>', ',setup <fitur> local [path]', 'Satu tujuan aktif per fitur. Error teknis selalu memakai grup.'],
+  stext: ['Format: ,stext [align=justify|left|right|center] <teks>', 'Default rata kiri dengan jarak huruf normal; alias: kiri, kanan, tengah, kiri-kanan.', 'Stiker 512×512, Arial hitam, panel putih membulat, low quality sedikit buram. Ukuran font otomatis menyesuaikan isi.', 'Contoh: ,stext align=center Halo dunia'],
   help: ['Format: ,help <command>', 'Contoh: ,help s, ,help task.'],
   s: ['Format: ,s [q=1-100]', 'Format: ,s <title>,<author> [q=1-100]', 'Default q=100. Kualitas/resolusi hanya diturunkan jika perlu agar ukuran sticker bisa dikirim.', 'Kirim/reply media atau sertakan URL media.'],
   smeme: ['Format: ,smeme up <teks>', 'Format: ,smeme down <teks>', 'Advanced: tambah kualitas 1-99 di akhir.'],
@@ -439,8 +461,8 @@ const HELP_DETAILS = {
   link: ['Format: ,link list', 'Format: ,link add <nama> <https://link>', 'Format: ,link get <id|nama>', 'Format: ,link del <id|nama>', 'Format: ,link rename <id|nama> <nama-baru>', 'Legacy: ,link <nama> <url> dan ,link change tetap didukung.'],
   save: ['Format: ,save <judul> [teks awal]', 'Format: ,save update <id|"judul lama"> ["judul baru"]', 'Mulai rekam teks/media sampai ,end atau ,cancel. Update yang selesai mendapat ID baru dan muncul paling bawah.'],
   load: ['Format: ,load', 'Format: ,load <id|judul>', 'Format: ,load del <id|judul>', 'Format: ,load rename <id|"judul lama"> <judul-baru>', 'Legacy: ,load change tetap didukung.'],
-  remindme: ['Format: ,remindme <teks> <durasi>', 'Unit: s = detik, m = menit, h = jam, d = hari.', 'Contoh: ,remindme cek server 1h30m'],
-  task: ['Format: ,task list', 'Format: ,task add <teks> at <HH:MM>', 'Format: ,task add <teks> at <HH:MM> <DD/MM/YYYY>', 'Format: ,task loop <teks> at <HH:MM>', 'Format: ,task repeat <jumlah> <teks> at <HH:MM>', 'Format: ,task record [loop|repeat <jumlah>] <nomor|nama kontak|nama grup> at <HH:MM> [DD/MM/YYYY]', 'Setelah record, kirim pesan bebas/media lalu ,end. ,cancel atau reaction ❌/👎/❎ membatalkan rekaman.', 'Format: ,task pause|stop <id>', 'Format: ,task resume <id>', 'Format: ,task del <id>', 'Legacy: ,ltask true|false|del <id> tetap didukung.'],
+  remindme: [',remindme <durasi> membuka listening teks/media/VN/lokasi.', 'Format: ,remindme <teks> <durasi>', 'Unit: s = detik, m = menit, h = jam, d = hari.', 'Contoh: ,remindme cek server 1h30m'],
+  task: [',task record <target> every <durasi> count <jumlah>', ',task record <target> every <durasi> forever', 'Tambahkan at <HH:MM> [DD/MM/YYYY] untuk waktu mulai WIB.', 'Pengiriman pertama setelah interval dari ,end; count adalah total kiriman.', 'Task gagal/hasil ambigu dipause; periksa sebelum ,task resume <id>. Resume melanjutkan item belum terkonfirmasi, yang mungkin sudah terkirim.', 'Format: ,task list', 'Format: ,task add <teks> at <HH:MM>', 'Format: ,task add <teks> at <HH:MM> <DD/MM/YYYY>', 'Format: ,task loop <teks> at <HH:MM>', 'Format: ,task repeat <jumlah> <teks> at <HH:MM>', 'Format: ,task record [loop|repeat <jumlah>] <nomor|nama kontak|nama grup> at <HH:MM> [DD/MM/YYYY]', 'Setelah record, kirim pesan bebas/media lalu ,end. ,cancel atau reaction ❌/👎/❎ membatalkan rekaman.', 'Format: ,task pause|stop <id>', 'Format: ,task resume <id>', 'Format: ,task del <id>', 'Legacy: ,ltask true|false|del <id> tetap didukung.'],
   wol: ['Format: ,wol list', 'Format: ,wol add <mac>', 'Format: ,wol wake <id|mac>', 'Format: ,wol del <id|mac>', 'Legacy: ,won, ,won save <mac>, ,won <id|mac>, dan ,won del <id|mac> tetap didukung.'],
   log: ['Format: ,log [baris]', 'Default 30 baris, maksimal 80 baris.'],
   net: ['Format: ,net', 'Cek IP publik, DNS, HTTP latency, IP lokal, dan estimasi download kecil.'],
@@ -450,10 +472,16 @@ const HELP_DETAILS = {
   typing: ['Format: ,typing <nomor|nama-grup|jid>', 'Format: ,typing stop', 'Bisa aktif di beberapa target sekaligus. Status typing diperbarui terus dan dipulihkan setelah reconnect/restart sampai dihentikan manual.'],
   changedmsg: ['Format: ,changedmsg list|allow|del <id|nama-grup|jid>', 'DM dipantau default. Grup harus di-allow. Nama grup duplikat ditolak; pakai JID agar aman.'],
   config: ['Format: ,config, ,config get <key>, ,config set <key> <value>', 'Destination key menerima nama grup, JID, atau nomor. Grup disimpan sebagai JID + nama.'],
-  statussave: ['Format: ,statussave list|add|del <nomor|id>', 'Nomor menerima 081..., +62 123-1234-1234, atau +6212312341234. Status teks dan media dikirim ke dest.saved.'],
-  backup: ['Format: ,backup', 'Backup data/ dikirim sebagai dokumen WhatsApp ke dest.backup. Ubah tujuan dengan ,config set dest.backup <group|nomor>.'],
+  statussave: ['Tambahkan nomor sekali: ,statussave add <nomor>. Status baru tersimpan otomatis ke tujuan aktif.',
+    ',statussave — ringkasan auto-save dan tujuan', ',statussave list — daftar nomor dipantau',
+    ',statussave list <nomor> atau ,statussave show <nomor> — tampilkan seluruh isi status aktif beserta caption asli di chat ini',
+    ',statussave on / off — aktifkan/nonaktifkan auto-save', ',statussave del <nomor|id> — hapus nomor pemantauan',
+    ',statussave setup — pilih tujuan grup atau server',
+    'Lanjutan: ,statussave active [kontak] [page=2] untuk daftar metadata; ,statussave dump <id-status>|all <kontak> untuk arsip manual.',
+    'Menampilkan status tidak mengubah tujuan arsip. Hanya status aktif yang diterima bot yang tersedia.'],
+  backup: ['Format: ,backup', 'Backup data/ ke satu tujuan aktif. Pilih grup/server dengan ,setup backup.'],
   restore: ['Format: ,restore', 'Mulai sesi restore ZIP lewat WhatsApp. Kirim part ZIP, lalu ,end dan ,confirm.'],
-  anticall: ['Format: ,anticall', 'Format: ,anticall new|on|off', 'Format: ,anticall except list|add|del <nomor|id>'],
+  anticall: ['Listening: ,anticall new, kirim teks/media/VN/lokasi, lalu ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.', 'Format: ,anticall', 'Format: ,anticall new|on|off', 'Format: ,anticall except list|add|del <nomor|id>'],
   allow: ['Format: ,allow here on|off', 'Format: ,allow all on|off', 'Legacy true|false tetap didukung.'],
   admin: ['Format: ,admin list', 'Format: ,admin add <nomor>', 'Format: ,admin del <nomor|id>'],
   bot: ['Format: ,bot, ,bot on, ,bot off', ',bot off mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall.'],
@@ -474,24 +502,23 @@ async function handleHelp(jid, command, context) {
     await handleHelpDetail(jid, query, context);
     return;
   }
-  const lines = [
-    `${BOT_NAME} Help`,
-    '',
-    'Pakai:',
-    `${COMMAND_PREFIX}help <command>`,
-    `Contoh: ${COMMAND_PREFIX}help s`
-  ];
+  const lines = [`*${BOT_NAME}*`, 'Pilih command atau lihat detail: ,help <command>'];
   for (const section of HELP_SECTIONS) {
     const items = section.items.filter((item) => canShowHelpItem(item.name, jid, context));
-    if (!items.length) continue;
-    lines.push('', `${section.title}:`, ...items.map((item) => item.text));
+    if (items.length) lines.push('', `*${section.title}*`, items.map((item) => `${COMMAND_PREFIX}${item.name}`).join(' · '));
   }
-  const detailExamples = ['note', 'task', 'topdf'].filter((name) => canShowHelpItem(name, jid, context));
-  if (detailExamples.length) lines.push('', 'Detail:', ...detailExamples.map((name) => `${COMMAND_PREFIX}help ${name}`));
+  lines.push('', 'Contoh: ,help task • ,help Media');
   await sendText(jid, lines.join('\n'));
 }
 
 async function handleHelpDetail(jid, query, context) {
+  const section = HELP_SECTIONS.find((item) => item.title.toLowerCase() === query);
+  if (section) {
+    const items = section.items.filter((item) => canShowHelpItem(item.name, jid, context));
+    await sendText(jid, [`*${section.title}*`, ...items.map((item) => item.text.replace(/\s{2,}/g, ' — ')), '', 'Detail: ,help <command>'].join('\n'));
+    return;
+  }
+
   const allNames = [...new Set([
     ...HELP_SECTIONS.flatMap((section) => section.items.map((item) => item.name)),
     ...Object.keys(HELP_DETAILS),
@@ -662,6 +689,7 @@ async function handleStatusBot(jid) {
     `Dest changedmsg: ${formatDestinationLine('changedmsg')}`,
     `Dest saved: ${formatDestinationLine('saved')}`,
     `Dest backup: ${formatDestinationLine('backup')}`,
+    `Dest errors: ${formatDestinationLine('errors')}`,
     `Changedmsg: ${changedSettings.enabled ? 'aktif' : 'nonaktif'}, group allowlist=${changed.allowedCount || 0}, index=${changed.indexCount || 0}`,
     `Statussave: ${statusSettings.enabled ? 'aktif' : 'nonaktif'}, nomor=${statusSave.count || 0}`,
     warnings.length ? '' : null,
@@ -678,6 +706,7 @@ async function botStatusWarnings() {
 
   for (const name of ['logs', 'changedmsg', 'saved', 'backup']) {
     try {
+      if (state.runtimeConfig.storageTarget(name === 'saved' ? 'statussave' : name).mode === 'local') continue;
       const destination = resolveConfiguredDestination(name);
       if (destination.jid.endsWith('@g.us') && !state.chatDirectory.hasJid(destination.jid)) {
         warnings.push(`Destination ${name} belum ada di cache grup: ${shortJid(destination.jid)}`);
@@ -696,7 +725,7 @@ async function botStatusWarnings() {
   if (changedSettings.enabled) {
     for (const name of ['logs', 'changedmsg']) {
       try {
-        resolveConfiguredDestination(name);
+        storageTarget(name);
       } catch {
         warnings.push(`Changedmsg aktif tapi dest.${name} belum valid.`);
       }
@@ -704,7 +733,7 @@ async function botStatusWarnings() {
   }
   if (statusSettings.enabled) {
     try {
-      resolveConfiguredDestination('saved');
+      storageTarget('statussave');
     } catch {
       warnings.push('Statussave aktif tapi dest.saved belum valid.');
     }
@@ -734,7 +763,7 @@ function activeSessionActorMatches(jid, actorJid) {
 
 function assertNoActiveSession(jid) {
   const active = activeSessionType(jid);
-  if (active) throw new Error(`Masih ada sesi ${active} aktif. Selesaikan dengan ,end atau batalkan dengan ,cancel.`);
+  if (active) throw new UserInputError(`Masih ada sesi ${active} aktif. Selesaikan dengan ,end atau batalkan dengan ,cancel.`);
 }
 
 function hasAnyTempSession() {
@@ -761,7 +790,15 @@ async function requestConfirmation(jid, actorOrAction, maybeAction = null) {
   registerConfirmationPrompt(sent.key, jid, actorJid);
 }
 
+let promptSaveQueue = Promise.resolve();
+function rememberPromptKey(key) {
+  if (!key?.remoteJid || !key?.id) return;
+  state.reactionActions.prompts.add(`${key.remoteJid}:${key.id}`);
+  promptSaveQueue = promptSaveQueue.then(() => atomicJson(path.join(ROOT_DIR, 'data', 'prompt-keys.json'), [...state.reactionActions.prompts])).catch((error) => logger.error('Prompt persistence failed', { error: error.message }));
+}
+
 function registerConfirmationPrompt(messageKey, jid, actorJid) {
+  rememberPromptKey(messageKey);
   state.reactionActions.register(messageKey, {
     actorJid,
     scope: `confirm:${jid}:${actorJid}`,
@@ -783,12 +820,34 @@ async function handleConfirm(jid, actorJid = jid) {
 }
 
 function registerSessionPrompt(messageKey, jid, actorJid) {
+  state.sessionPrompts.set(jid, { key: messageKey, actorJid, lastActivity: Date.now() });
+  rememberPromptKey(messageKey);
   state.reactionActions.register(messageKey, {
     actorJid,
     scope: `session:${jid}:${actorJid}`,
+    ttlMs: 30 * 60 * 1000,
     onConfirm: async () => handleEndSession(jid, actorJid),
     onCancel: async () => handleCancelByJid(jid, actorJid)
   });
+}
+
+async function listeningProgress(jid, recorded) {
+  const prompt = state.sessionPrompts.get(jid);
+  if (!prompt || !recorded) return;
+  prompt.lastActivity = Date.now();
+  const action = state.reactionActions.get(prompt.key, prompt.actorJid);
+  if (action) action.expiresAt = Date.now() + 30 * 60 * 1000;
+  await editText(jid, prompt.key, `*Listening • ${recorded.count} item*\nTerbaru: ${recorded.type}\nSelesai: ,end atau ✅/👍/❤️\nBatal: ,cancel atau ❌/👎/❎`);
+}
+
+async function expireListeningSessions() {
+  for (const [jid, prompt] of state.sessionPrompts) {
+    if (!activeSessionType(jid)) { state.sessionPrompts.delete(jid); continue; }
+    if (Date.now() - prompt.lastActivity < 30 * 60 * 1000) continue;
+    await cancelActiveSessionByJid(jid, prompt.actorJid);
+    state.reactionActions.clearScope(`session:${jid}:${prompt.actorJid}`);
+    state.sessionPrompts.delete(jid);
+  }
 }
 
 function listScope(kind) {
@@ -807,6 +866,7 @@ async function sendReactionList(jid, actorJid, kind, items, options) {
   }
   for (const item of items) {
     const sent = await sendText(jid, `${options.formatItem(item)}\nReact ❌/👎/❎ untuk hapus.`);
+    rememberPromptKey(sent.key);
     state.reactionActions.register(sent.key, {
       actorJid,
       scope: listScope(kind),
@@ -827,15 +887,15 @@ function resolveDestinationInput(input, actorJid = null, options = {}) {
   const result = state.chatDirectory.resolve(input);
   if (!result.ok) {
     if (result.reason === 'ambiguous') {
-      throw new Error([
+      throw new UserInputError([
         `Nama "${input}" cocok ke lebih dari satu chat. Pakai JID salah satu target:`,
         ...result.candidates.map((item) => `- ${item.currentName || item.savedName} (${item.jid})`)
       ].join('\n'));
     }
-    throw new Error(`Target "${input}" tidak ditemukan di cache chat bot. Kirim pesan di chat target dulu atau pakai JID/nomor.`);
+    throw new UserInputError(`Target "${input}" tidak ditemukan di cache chat bot. Kirim pesan di chat target dulu atau pakai JID/nomor.`);
   }
   if (options.requireGroup && !result.item.jid.endsWith('@g.us')) {
-    throw new Error('Target harus grup. Pakai nama grup atau JID grup.');
+    throw new UserInputError('Target harus grup. Pakai nama grup atau JID grup.');
   }
   return {
     jid: result.item.jid,
@@ -850,7 +910,8 @@ function resolveDestinationInput(input, actorJid = null, options = {}) {
 
 function resolveConfiguredDestination(name) {
   const value = state.runtimeConfig?.destination(name);
-  if (!value) throw new Error(`Destination ${name} belum diset. Gunakan ,config set dest.${name} <group|nomor>.`);
+  if (name === 'errors' && typeof value !== 'object') throw new SetupRequiredError('errors');
+  if (!value) throw new UserInputError(`Destination ${name} belum diset. Gunakan ,config set dest.${name} <group|nomor>.`);
   if (typeof value === 'object' && value.jid) return value;
   return resolveDestinationInput(String(value || name), null);
 }
@@ -861,6 +922,7 @@ function destinationJid(name) {
 
 function formatDestinationLine(name) {
   try {
+    if (name !== 'errors') { const target = state.runtimeConfig.storageTarget(name === 'saved' ? 'statussave' : name); if (target.mode === 'local') return `${name}: local ${target.path}`; }
     const destination = resolveConfiguredDestination(name);
     const currentName = state.chatDirectory.nameFor(destination.jid);
     const renameWarning = currentName && destination.savedName && currentName !== destination.savedName
@@ -968,7 +1030,7 @@ async function handleSticker(message, command) {
   try {
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'sticker-source');
     if (!media) media = await downloadUrlMedia(command.rawArgs, 'sticker-url');
-    if (!media) throw new Error('Kirim/reply media atau sertakan URL media yang valid.');
+    if (!media) throw new UserInputError('Kirim/reply media atau sertakan URL media yang valid.');
     const animated = await isAnimatedMedia(media);
     const sticker = await makeSticker(media, {
       author: options.author,
@@ -976,7 +1038,7 @@ async function handleSticker(message, command) {
       quality: options.quality,
       tools: state.tools
     });
-    await state.sock.sendMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
+    await sendBotMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
   } finally {
     await cleanupFiles([media?.path]);
   }
@@ -988,7 +1050,7 @@ async function handleQr(message, command, actorJid) {
   if (!options.text) {
     assertNoActiveSession(jid);
     if (mediaNode(message)) {
-      throw new Error('Untuk memakai gambar/GIF sebagai ikon, sertakan isi pesan: ,qr <pesan>. Media pada pembuka sesi tidak menjadi ikon global.');
+      throw new UserInputError('Untuk memakai gambar/GIF sebagai ikon, sertakan isi pesan: ,qr <pesan>. Media pada pembuka sesi tidak menjadi ikon global.');
     }
     const session = state.qrSessions.start(jid, { ...options, actorJid });
     const sent = await sendText(jid, formatQrProgressMessage(session));
@@ -1036,10 +1098,10 @@ async function handleSmeme(message, command) {
   let media = null;
   try {
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'smeme-source');
-    if (!media) throw new Error('Reply image, GIF, video, atau sticker untuk memakai ,smeme.');
+    if (!media) throw new UserInputError('Reply image, GIF, video, atau sticker untuk memakai ,smeme.');
     const supportedDocument = media.type === 'documentMessage' && /^(image|video)\//i.test(media.mimetype || '');
     if (!['imageMessage', 'videoMessage', 'stickerMessage'].includes(media.type) && !supportedDocument) {
-      throw new Error('Smeme hanya mendukung image, GIF, video, atau sticker.');
+      throw new UserInputError('Smeme hanya mendukung image, GIF, video, atau sticker.');
     }
     const animated = await isAnimatedMedia(media);
     const sticker = await makeSmemeSticker(media, {
@@ -1048,7 +1110,7 @@ async function handleSmeme(message, command) {
       tools: state.tools,
       smeme
     });
-    await state.sock.sendMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
+    await sendBotMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: animated || undefined });
   } finally {
     await cleanupFiles([media?.path]);
   }
@@ -1058,9 +1120,9 @@ async function handleReverseSticker(message, command) {
   const jid = message.key.remoteJid;
   let media = null;
   try {
-    if (command.rawArgs.trim()) throw new Error('Format: reply media/view-once lalu ketik ,resend tanpa parameter. Legacy ,rs tetap didukung.');
+    if (command.rawArgs.trim()) throw new UserInputError('Format: reply media/view-once lalu ketik ,resend tanpa parameter. Legacy ,rs tetap didukung.');
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'reverse-source');
-    if (!media) throw new Error('Reply media/view-once untuk memakai ,resend. Legacy ,rs tetap didukung.');
+    if (!media) throw new UserInputError('Reply media/view-once untuk memakai ,resend. Legacy ,rs tetap didukung.');
     if (media.type === 'stickerMessage') {
       await sendReversedSticker(jid, media);
       return;
@@ -1077,16 +1139,16 @@ async function handleToImg(message) {
   let images = [];
   try {
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'toimg-source');
-    if (!media) throw new Error('Kirim/reply dokumen PDF untuk memakai ,toimg.');
+    if (!media) throw new UserInputError('Kirim/reply dokumen PDF untuk memakai ,toimg.');
     if (!isPdfFile(media.path, media.mimetype) && !isPdfFile(media.fileName, media.mimetype)) {
-      throw new Error('Untuk sekarang ,toimg hanya mendukung file PDF.');
+      throw new UserInputError('Untuk sekarang ,toimg hanya mendukung file PDF.');
     }
     await sendText(jid, 'Mengubah PDF menjadi image...');
     images = await pdfToImages(media.path, state.tools);
     if (!images.length) throw new Error('Tidak ada halaman PDF yang berhasil diubah menjadi image.');
     for (const image of images) {
       const buffer = await fs.readFile(image.path);
-      await state.sock.sendMessage(jid, {
+      await sendBotMessage(jid, {
         image: buffer,
         mimetype: image.mimetype,
         caption: `Halaman ${image.page}`
@@ -1101,18 +1163,18 @@ async function handleToImg(message) {
 async function sendReversedSticker(jid, media) {
   const converted = await reverseSticker(media, state.tools);
   if (converted.mimetype === 'image/png') {
-    await state.sock.sendMessage(jid, { image: converted.buffer, mimetype: converted.mimetype });
+    await sendBotMessage(jid, { image: converted.buffer, mimetype: converted.mimetype });
     return;
   }
   if (converted.gifPlayback) {
-    await state.sock.sendMessage(jid, {
+    await sendBotMessage(jid, {
       video: converted.buffer,
       mimetype: converted.mimetype,
       gifPlayback: true
     });
     return;
   }
-  await state.sock.sendMessage(jid, {
+  await sendBotMessage(jid, {
     document: converted.buffer,
     mimetype: converted.mimetype,
     fileName: converted.fileName
@@ -1141,9 +1203,9 @@ async function maybeForwardRepliedViewOnce(message, text) {
 
 async function sendLatestViewOnce(destinationJid, targetQuery) {
   const targetJid = state.chatDirectory.findByName(targetQuery);
-  if (!targetJid) throw new Error(`Target "${targetQuery}" tidak ditemukan di cache chat/kontak bot.`);
+  if (!targetJid) throw new UserInputError(`Target "${targetQuery}" tidak ditemukan di cache chat/kontak bot.`);
   const source = state.viewOnceCache.latest(targetJid);
-  if (!source) throw new Error(`Belum ada view-once terbaru dari "${targetQuery}" selama bot aktif.`);
+  if (!source) throw new UserInputError(`Belum ada view-once terbaru dari "${targetQuery}" selama bot aktif.`);
 
   let media = null;
   try {
@@ -1163,7 +1225,7 @@ async function sendDownloadedMedia(jid, media, options = {}) {
   } else if (media.type === 'videoMessage') {
     return sendBotMessage(jid, { video: buffer, mimetype: media.mimetype, caption });
   } else if (media.type === 'audioMessage') {
-    return sendBotMessage(jid, { audio: buffer, mimetype: media.mimetype });
+    return sendBotMessage(jid, { audio: buffer, mimetype: media.mimetype, ptt: Boolean(media.node?.ptt) });
   } else if (media.type === 'stickerMessage') {
     return sendBotMessage(jid, { sticker: buffer, isAnimated: media.node?.isAnimated || undefined });
   } else {
@@ -1183,8 +1245,9 @@ async function maybeMirrorChangedMessage(message) {
   if (!state.changedMessages?.shouldWatchChat(jid)) return false;
   if (isDestinationChat(jid)) return false;
 
-  const logsJid = safeDestinationJid('logs');
-  if (!logsJid) return false;
+  let target;
+  try { target = storageTarget('logs'); } catch (error) { await handleFailure(error); return false; }
+  const logsJid = target.jid;
   const summary = summarizeMessage(message);
   const actorJid = messageActorJid(message);
   const metaText = changedMessageMetaText('LOG', message, {
@@ -1194,8 +1257,19 @@ async function maybeMirrorChangedMessage(message) {
   });
 
   let logContentMessage = null;
+  let logPath = null;
   let media = null;
   try {
+    if (target.mode === 'local') {
+      const node = mediaNode(message);
+      const maxBytes = state.runtimeConfig.changedmsgSettings().maxMediaBytes;
+      if (node && Number(node.node.fileLength || 0) <= maxBytes) {
+        media = await downloadMessageMedia(state.sock, message, 'log-archive');
+        if (media && (await fs.stat(media.path)).size > maxBytes) { await cleanupFiles([media.path]); media = null; }
+      }
+      const archived = await state.localArchive.write(target.path, { identity: jid, name: state.chatDirectory.nameFor(jid), timestamp: summary.timestamp, id: message.key.id, text: metaText, media, metadata: { sourceKey: message.key, type: summary.type } });
+      logPath = archived.path;
+    } else {
     await sendText(logsJid, metaText);
     if (isViewOnceMediaMessage(message)) {
       media = await downloadMessageMedia(state.sock, message, 'changed-viewonce');
@@ -1210,6 +1284,7 @@ async function maybeMirrorChangedMessage(message) {
       }
     } else {
       logContentMessage = await sendBotMessage(logsJid, { forward: message, force: true });
+    }
     }
   } catch (error) {
     await logger.warn('Changedmsg mirror failed', { jid, messageId: message.key?.id, error: error.message });
@@ -1230,6 +1305,7 @@ async function maybeMirrorChangedMessage(message) {
     text: summary.text,
     latestText: summary.text,
     logJid: logsJid,
+    logPath,
     logMessageId: logContentMessage?.key?.id || '',
     timestamp: summary.timestamp
   }, state.runtimeConfig.changedmsgSettings().indexMaxItems);
@@ -1241,15 +1317,15 @@ async function handleChangedDelete(messageKey) {
   const existing = state.changedMessages.findByKey(messageKey);
   if (!existing && !state.changedMessages.shouldWatchChat(messageKey?.remoteJid)) return;
   if (existing?.deletedAt) return;
-  const item = existing ? await state.changedMessages.markDeleted(messageKey) : null;
-  const changedJid = safeDestinationJid('changedmsg');
-  if (!changedJid) return;
+  const item = existing;
+
   const lines = [
     'Pesan dihapus:',
     ...formatChangedIndexLines(item, messageKey),
-    item?.logMessageId ? `Referensi logs: ${shortJid(item.logJid)} / ${item.logMessageId}` : 'Referensi logs: tidak tersedia'
+    item?.logPath ? `Referensi lokal: ${item.logPath}` : item?.logMessageId ? `Referensi logs: ${shortJid(item.logJid)} / ${item.logMessageId}` : 'Referensi logs: tidak tersedia'
   ];
-  await sendText(changedJid, lines.join('\n'));
+  await writeChangedReport(messageKey, lines.join('\n'), 'delete');
+  if (existing) await state.changedMessages.markDeleted(messageKey);
 }
 
 async function handleChangedEdit(update) {
@@ -1269,8 +1345,7 @@ async function handleChangedEdit(update) {
     latestText: summary.text,
     type: summary.type
   });
-  const changedJid = safeDestinationJid('changedmsg');
-  if (!changedJid) return;
+
   const lines = [
     'Pesan diedit:',
     ...formatChangedIndexLines(item || old, update.key),
@@ -1281,7 +1356,7 @@ async function handleChangedEdit(update) {
     'Sesudah:',
     summary.text || '(tidak tersedia)'
   ];
-  await sendText(changedJid, lines.join('\n'));
+  await writeChangedReport(update.key, lines.join('\n'), 'edit');
 }
 
 function formatChangedIndexLines(item, messageKey) {
@@ -1299,7 +1374,8 @@ function formatChangedIndexLines(item, messageKey) {
     `Pengirim JID: ${item.actorJid || item.participant || '-'}`,
     `Waktu: ${new Date(item.timestamp || Date.now()).toLocaleString()}`,
     `Tipe: ${item.type || 'unknown'}`,
-    `Message ID: ${item.id || '-'}`
+    `Message ID: ${item.id || '-'}`,
+    ...(item.logPath ? [`Arsip lokal: ${item.logPath}`] : item.logMessageId ? [`Arsip grup: ${item.logJid} / ${item.logMessageId}`] : [])
   ];
 }
 
@@ -1320,48 +1396,239 @@ function changedMessageMetaText(label, message, extra = {}) {
   return lines.join('\n');
 }
 
-async function maybeSaveStatusMessage(message) {
-  if (message.key?.remoteJid !== 'status@broadcast') return false;
-  if (!state.runtimeConfig?.statussaveSettings?.().enabled) return true;
-  const actorJid = statusAuthorJid(message);
-  if (!state.statusSave?.isWatched(actorJid)) return true;
-  const savedJid = safeDestinationJid('saved');
-  if (!savedJid) return true;
-  const summary = summarizeMessage(message);
-  const caption = [
-    'Status WhatsApp tersimpan:',
-    `Nomor: ${displayPhoneFromJid(actorJid)}`,
-    `JID: ${actorJid}`,
-    `Waktu: ${new Date(summary.timestamp).toLocaleString()}`,
-    `Tipe: ${summary.type}`,
-    summary.text ? `Teks: ${summary.text}` : null
-  ].filter(Boolean).join('\n');
-
-  let media = null;
-  try {
-    if (mediaNode(message)) {
-      media = await downloadMessageMedia(state.sock, message, 'status-save');
-      const stat = await fs.stat(media.path).catch(() => null);
-      const maxBytes = state.runtimeConfig.statussaveSettings().maxMediaBytes;
-      if (stat?.size && stat.size > maxBytes) {
-        await sendText(savedJid, `${caption}\n\nMedia dilewati karena ${formatBytes(stat.size)} melebihi batas ${formatBytes(maxBytes)}.`);
-      } else {
-        await sendDownloadedMedia(savedJid, media, { caption });
-      }
-    } else {
-      await sendText(savedJid, caption);
-    }
-  } catch (error) {
-    await logger.warn('Status save failed', { actorJid, error: error.message });
-  } finally {
-    await cleanupFiles([media?.path]);
+function storageTarget(feature) {
+  const target = state.runtimeConfig.storageTarget(feature);
+  if (target.mode === 'local') {
+    if (!target.path) throw new SetupRequiredError(feature);
+    return { ...target, key: `local:${target.path}` };
   }
+  try {
+    const destination = resolveConfiguredDestination(destinationAlias(feature));
+    return { mode: 'group', jid: destination.jid, key: `group:${destination.jid}` };
+  } catch { throw new SetupRequiredError(feature); }
+}
+
+async function setupMenu(jid, feature = '') {
+  if (!feature) {
+    const lines = ['*Setup tujuan*', `Root lokal: ${state.runtimeConfig.get('storage.root') || 'belum diset (opsional)'}`, ',setup root <path-server>'];
+    for (const name of [...STORAGE_FEATURES, 'errors']) {
+      let label = 'belum siap';
+      try { const target = name === 'errors' ? { mode: 'group', jid: destinationJid('errors') } : storageTarget(name); label = `${target.mode}: ${target.path || state.chatDirectory.nameFor(target.jid) || target.jid}`; } catch {}
+      lines.push(`\n*${name}*: ${label}`, `,setup ${name}`);
+    }
+    return sendText(jid, lines.join('\n'));
+  }
+  if (![...STORAGE_FEATURES, 'errors'].includes(feature)) throw new UserInputError('Fitur setup: statussave, backup, logs, changedmsg, errors.');
+  return sendText(jid, [`*Setup ${feature}*`, 'Pilih satu tujuan aktif:', `• Grup: ,setup ${feature} group <nama-grup|jid>`, feature !== 'errors' ? `• Server: ,setup ${feature} local [path-absolut]\nTanpa path memakai root lokal/${feature}.` : 'Tujuan error: grup errormsg dalam community dev.', 'Tujuan lama tetap aktif sampai pilihan baru berhasil disimpan.'].filter(Boolean).join('\n'));
+}
+
+async function handleSetup(message, command, context) {
+  if (!context.isOwner) throw new UserInputError('Setup hanya untuk owner.');
+  const [feature, mode, ...rest] = command.args;
+  const jid = message.key.remoteJid;
+  if (!feature || !mode) return setupMenu(jid, feature);
+  if (feature === 'root') {
+    await state.runtimeConfig.set('storage.root', command.args.slice(1).join(' '));
+    return sendText(jid, 'Root penyimpanan lokal disimpan. Tujuan aktif tiap fitur tidak berubah.');
+  }
+  const input = rest.join(' ');
+  if (feature === 'errors') {
+    if (mode !== 'group') throw new UserInputError('Error teknis memakai tujuan grup.');
+    await state.runtimeConfig.setDestination('dest.errors', resolveDestinationInput(input, context.actorJid, { requireGroup: true }));
+  } else if (mode === 'group') {
+    await state.runtimeConfig.setStorage(feature, mode, resolveDestinationInput(input, context.actorJid, { requireGroup: true }));
+  } else if (mode === 'local') await state.runtimeConfig.setStorage(feature, mode, input);
+  else throw new UserInputError('Mode tujuan: group atau local.');
+  state.setupNotices.delete(feature);
+  applyBotRuntimeState();
+  await sendText(jid, `Tujuan ${feature} disimpan. Hanya ${mode} yang aktif.`);
+}
+
+async function notifyMissingSetup(feature) {
+  if (!state.connected || state.setupNotices.has(feature)) return;
+  state.setupNotices.add(feature);
+  try { await setupMenu(ownUserJid(), feature); } catch { state.setupNotices.delete(feature); }
+}
+
+async function handleFailure(error, { jid, text, messageId } = {}) {
+  if (error instanceof SetupRequiredError) {
+    if (jid) await setupMenu(jid, error.feature);
+    else await notifyMissingSetup(error.feature);
+    return;
+  }
+  if (error instanceof UserInputError && jid) {
+    await sendText(jid, error.message);
+    return;
+  }
+  await logger.error('Operation failed', { jid, messageId, command: parseCommand(text || '')?.name, error: error.message, stack: error.stack });
+}
+
+async function archiveStatus(item, reply = null) {
+  const target = storageTarget('statussave');
+  const options = {
+    sock: state.sock, targetKey: target.key,
+    maxMediaBytes: state.runtimeConfig.statussaveSettings().maxMediaBytes,
+    write: async (entry, message, media) => {
+      const name = state.contactNames.get(entry.author) || '';
+      const text = statusCaption(message);
+      const caption = ['Status WhatsApp', `Kontak: ${name || displayPhoneFromJid(entry.author)}`, `Nomor: ${displayPhoneFromJid(entry.author)}`, `${entry.timestampSource === 'reply-received' ? 'Waktu diterima (waktu publikasi tidak tersedia)' : 'Waktu'}: ${formatWib(new Date(entry.timestamp).toISOString())}`, text].filter(Boolean).join('\n');
+      if (target.mode === 'local') {
+        return await state.localArchive.write(target.path, { identity: entry.author, name, timestamp: entry.timestamp, id: message.key.id, text,
+          media, metadata: { type: messageTypeName(message), caption, sourceKey: message.key, timestampSource: entry.timestampSource || 'published' } });
+      } else if (media) {
+        if (media.type === 'audioMessage' || media.type === 'stickerMessage') await sendText(target.jid, caption);
+        await sendDownloadedMedia(target.jid, media, { caption });
+      } else await sendText(target.jid, caption);
+    }
+  };
+  return reply ? state.statusInbox.archiveReply(reply, options) : state.statusInbox.archive(item.id, options);
+}
+
+async function maybeSaveStatusMessage(message) {
+  try {
+    const item = await state.statusInbox.receive(message, state.sock);
+    if (item && state.runtimeConfig.statussaveSettings().enabled && state.statusSave.isWatched(item.author)) await archiveStatus(item);
+  } catch (error) { await handleFailure(error); }
   return true;
 }
 
-function statusAuthorJid(message) {
-  const raw = message.key?.participant || message.participant || message.key?.remoteJid || '';
-  return raw ? jidNormalizedUser(raw) : '';
+async function resumeStatusAutoSave(author = null) {
+  if (!isBotEnabled() || !state.runtimeConfig.statussaveSettings().enabled) return;
+  for (const item of state.statusInbox.list(author)) {
+    if (!state.statusSave.isWatched(item.author)) continue;
+    try { await archiveStatus(item); } catch (error) { await handleFailure(error); }
+  }
+}
+
+async function showStatusContact(jid, input) {
+  if (!input) throw new UserInputError('Format: ,statussave list <nomor> atau ,statussave show <nomor>.');
+  const author = resolveStatusContact(input);
+  const items = state.statusInbox.list(author).sort((a, b) => a.timestamp - b.timestamp);
+  if (!items.length) return sendText(jid, 'Belum ada status aktif nomor ini yang diterima bot.');
+  const name = state.contactNames.get(author) || displayPhoneFromJid(author);
+  await sendText(jid, `*Status ${name}*\n${items.length} status aktif, dari paling lama ke terbaru.`);
+  const target = state.runtimeConfig.storageTarget('statussave');
+  const counts = { success: 0, expired: 0, failed: 0 };
+  for (const item of items) {
+    try {
+      const current = state.statusInbox.list(author).find((candidate) => candidate.id === item.id);
+      const result = await presentStatus(current, {
+        sock: state.sock, localRoot: target.mode === 'local' ? target.path : undefined,
+        maxMediaBytes: state.runtimeConfig.statussaveSettings().maxMediaBytes,
+        sendText: (text) => sendText(jid, text),
+        sendMedia: (media, caption) => sendDownloadedMedia(jid, media, { caption })
+      });
+      counts[result]++;
+    } catch (error) { counts.failed++; await handleFailure(error); }
+  }
+  await sendText(jid, `Status ditampilkan: ${counts.success} berhasil, ${counts.expired} kedaluwarsa/terhapus, ${counts.failed} gagal.`);
+}
+
+function resolveStatusContact(input) {
+  const watched = state.statusSave.list().find((item) => String(item.id) === String(input));
+  if (watched) return watched.jid;
+  return resolveDestinationInput(input).jid;
+}
+
+async function handleStatusBrowse(message, command) {
+  const jid = message.key.remoteJid;
+  const [action, ...args] = command.args;
+  if (action === 'active') {
+    let page = 1;
+    const last = args.at(-1)?.match(/^page=(\d+)$/);
+    if (last) { page = Math.max(1, Number(last[1])); args.pop(); }
+    const author = args.length ? resolveStatusContact(args.join(' ')) : null;
+    const items = state.statusInbox.list(author).sort((a, b) => a.author.localeCompare(b.author) || a.timestamp - b.timestamp);
+    let target; try { target = storageTarget('statussave'); } catch {}
+    const pages = Math.max(1, Math.ceil(items.length / 10));
+    page = Math.min(page, pages);
+    const lines = [`*Status aktif • ${page}/${pages}*`];
+    for (const item of items.slice((page - 1) * 10, page * 10)) {
+      const msg = reviveValue(item.message);
+      lines.push(`\n#${item.id} • ${state.contactNames.get(item.author) || displayPhoneFromJid(item.author)}`, `${messageTypeName(msg)} • ${formatWib(new Date(item.timestamp).toISOString())}`, target && item.saved.includes(target.key) ? 'Sudah tersimpan' : 'Belum tersimpan');
+    }
+    if (!items.length) lines.push('Belum ada status aktif yang diterima bot.');
+    lines.push('\n,statussave dump <id-status>', ',statussave dump all <nomor|nama-kontak>', ',statussave active [kontak] page=2');
+    return sendText(jid, lines.join('\n'));
+  }
+  storageTarget('statussave');
+  let items;
+  if (!args.length) {
+    const quoted = extractQuotedMessage(message);
+    if (!quoted?.message) throw new UserInputError('Reply status atau gunakan ,statussave dump <id-status>|all <kontak>.');
+    quoted.key.remoteJid = 'status@broadcast';
+    const existing = state.statusInbox.list().find((item) => reviveValue(item.message).key.id === quoted.key.id && (!quoted.key.participant || reviveValue(item.message).key.participant === quoted.key.participant));
+    // A reply without publication time is archived separately, never advertised as an active status.
+    if (!existing) {
+      const content = unwrapMessage(message.message);
+      const context = Object.values(content || {}).find((node) => node?.contextInfo?.quotedMessage)?.contextInfo;
+      if (context?.remoteJid !== 'status@broadcast') throw new UserInputError('Reply ini tidak dikenali sebagai status. Gunakan ,statussave active dan pilih ID status.');
+      const result = await archiveStatus(null, quoted);
+      return sendText(jid, result === 'saved' ? 'Status reply sudah tersimpan.' : 'Status dari reply tersimpan. Waktu publikasi/kedaluwarsa tidak tersedia dari reply.');
+    }
+    items = [existing];
+  } else if (args[0] === 'all') {
+    if (args.length < 2) throw new UserInputError('Format: ,statussave dump all <nomor|nama-kontak>.');
+    items = state.statusInbox.list(resolveStatusContact(args.slice(1).join(' ')));
+  } else {
+    const item = state.statusInbox.list().find((entry) => entry.id === Number(args[0]));
+    items = item ? [item] : [];
+  }
+  if (!items.length) return sendText(jid, 'Status aktif tidak tersedia atau sudah kedaluwarsa. Bot hanya dapat dump status yang diterimanya.');
+  const counts = { success: 0, saved: 0, expired: 0, failed: 0 };
+  for (const item of items) {
+    try { counts[await archiveStatus(item)]++; }
+    catch (error) { counts.failed++; await handleFailure(error); }
+  }
+  await sendText(jid, `Dump selesai: ${counts.success} berhasil, ${counts.saved} sudah tersimpan, ${counts.expired} kedaluwarsa, ${counts.failed} gagal.`);
+}
+
+async function runConfiguredBackup() {
+  const target = storageTarget('backup');
+  if (target.mode === 'group') return sendDataBackupToWhatsApp(botSender(), target.jid, { partSizeBytes: state.runtimeConfig.backupPartSizeBytes() });
+  const files = await createDataBackupFiles(state.runtimeConfig.backupPartSizeBytes());
+  await fs.mkdir(target.path, { recursive: true });
+  for (const file of files) {
+    const dest = path.join(target.path, file.fileName);
+    await fs.writeFile(`${dest}.tmp`, file.buffer);
+    await fs.rename(`${dest}.tmp`, dest);
+  }
+  return files.map((file) => file.fileName);
+}
+
+async function writeChangedReport(messageKey, text, kind) {
+  const target = storageTarget('changedmsg');
+  if (target.mode === 'group') return sendText(target.jid, text);
+  const jid = messageKey.remoteJid;
+  return state.localArchive.write(target.path, { identity: jid, name: state.chatDirectory.nameFor(jid), timestamp: Date.now(), id: `${messageKey.id}-${kind}-${Date.now()}`, text, metadata: { sourceKey: messageKey, kind } });
+}
+
+let contactQueue = Promise.resolve();
+function rememberContacts(contacts) {
+  const task = contactQueue.then(() => rememberContactsUnlocked(contacts));
+  contactQueue = task.catch(() => {});
+  return task;
+}
+async function rememberContactsUnlocked(contacts) {
+  for (const contact of contacts || []) {
+    const raw = contact.id;
+    if (!raw) continue;
+    const name = contact.name || contact.verifiedName;
+    const pn = contact.phoneNumber || (raw.endsWith('@s.whatsapp.net') ? raw : await state.sock?.signalRepository?.lidMapping?.getPNForLID(raw));
+    for (const jid of [raw, pn].filter(Boolean)) {
+      state.chatDirectory.remember(jid, name || contact.notify);
+      if (name) state.contactNames.set(jidNormalizedUser(jid), name);
+    }
+  }
+  await atomicJson(path.join(ROOT_DIR, 'data', 'contact-names.json'), Object.fromEntries(state.contactNames));
+}
+
+async function resolveErrorGroup() {
+  const configured = state.runtimeConfig.destination('errors');
+  if (configured && typeof configured === 'object' && configured.jid) return;
+  const candidates = [...state.groups.values()].filter((group) => normalizeLookupText(group.subject) === 'errormsg' && normalizeLookupText(state.groups.get(group.linkedParent)?.subject) === 'dev');
+  if (candidates.length === 1) await state.runtimeConfig.setDestination('dest.errors', { jid: candidates[0].id, savedName: candidates[0].subject, updatedBy: 'community-dev' });
+  else await notifyMissingSetup('errors');
 }
 
 function safeDestinationJid(name) {
@@ -1374,21 +1641,17 @@ function safeDestinationJid(name) {
 }
 
 function isDestinationChat(jid) {
-  for (const name of ['logs', 'changedmsg', 'saved', 'backup']) {
-    try {
-      if (sameJid(jid, destinationJid(name))) return true;
-    } catch {
-      // Destination may not be resolvable yet; ignore here.
-    }
+  for (const feature of STORAGE_FEATURES) {
+    try { const target = storageTarget(feature); if (target.mode === 'group' && sameJid(jid, target.jid)) return true; } catch {}
   }
-  return false;
+  try { return sameJid(jid, destinationJid('errors')); } catch { return false; }
 }
 
 function normalizePhoneToJid(input) {
   try {
     return normalizePhoneToWhatsAppJid(input);
   } catch {
-    throw new Error('Format: ,info <nomor telepon>');
+    throw new UserInputError('Format: ,info <nomor telepon>');
   }
 }
 
@@ -1413,14 +1676,14 @@ async function handleInfo(message, command) {
   ].join('\n');
 
   if (pictureUrl) {
-    await state.sock.sendMessage(jid, { image: { url: pictureUrl }, caption });
+    await sendBotMessage(jid, { image: { url: pictureUrl }, caption });
   } else {
     await sendText(jid, caption);
   }
 }
 
 async function handleTyping(message, command, context) {
-  if (!context.isOwner) throw new Error('Command ,typing hanya bisa dipakai nomor yang terhubung ke session bot.');
+  if (!context.isOwner) throw new UserInputError('Command ,typing hanya bisa dipakai nomor yang terhubung ke session bot.');
   const replyJid = message.key.remoteJid;
   const input = command.rawArgs.trim();
   if (!input) {
@@ -1502,7 +1765,7 @@ function normalizeTaskStateAction(action) {
 async function handleTaskStateChange(jid, actorJid, actionRaw, idRaw, formatHint) {
   const action = normalizeTaskStateAction(actionRaw);
   const id = Number(idRaw);
-  if (!action || !Number.isInteger(id)) throw new Error(`Format: ${formatHint}`);
+  if (!action || !Number.isInteger(id)) throw new UserInputError(`Format: ${formatHint}`);
   if (action === 'del') {
     await requestConfirmation(jid, actorJid, {
       title: `Hapus task #${id}`,
@@ -1609,7 +1872,7 @@ async function handleEndPdfByJid(jid, actorJid) {
     if (session.split) {
       const pdfs = await state.pdfSessions.buildSplit(session);
       for (const file of pdfs) {
-        await state.sock.sendMessage(jid, {
+        await sendBotMessage(jid, {
           document: file.buffer,
           mimetype: 'application/pdf',
           fileName: file.fileName
@@ -1617,7 +1880,7 @@ async function handleEndPdfByJid(jid, actorJid) {
       }
     } else {
       const pdf = await state.pdfSessions.build(session);
-      await state.sock.sendMessage(jid, {
+      await sendBotMessage(jid, {
         document: pdf,
         mimetype: 'application/pdf',
         fileName: session.fileName || `${PDF_DEFAULT_FILE_NAME}-${Date.now()}.pdf`
@@ -1681,7 +1944,7 @@ async function handleAnticall(message, command, actorJid) {
     return;
   }
 
-  throw new Error('Format: ,anticall [new|on|off|except]');
+  throw new UserInputError('Format: ,anticall [new|on|off|except]');
 }
 
 async function startAnticallRecording(jid, actorJid) {
@@ -1699,7 +1962,7 @@ async function handleAnticallException(jid, command, actorJid) {
   }
   if (subaction === 'add') {
     const input = command.args.slice(2).join(' ').trim();
-    if (!input) throw new Error('Format: ,anticall except add <nomor>');
+    if (!input) throw new UserInputError('Format: ,anticall except add <nomor>');
     const item = await state.anticall.addException(input);
     invalidateListKind('anticall-exceptions');
     await sendText(jid, `Exception anticall #${item.id} ${item.title} ditambahkan.`);
@@ -1707,13 +1970,13 @@ async function handleAnticallException(jid, command, actorJid) {
   }
   if (subaction === 'del') {
     const query = command.args.slice(2).join(' ').trim();
-    if (!query) throw new Error('Format: ,anticall except del <nomor|id>');
+    if (!query) throw new UserInputError('Format: ,anticall except del <nomor|id>');
     const item = await state.anticall.deleteException(query);
     invalidateListKind('anticall-exceptions');
     await sendText(jid, `Exception anticall #${item.id} ${item.title} dihapus.`);
     return;
   }
-  throw new Error('Format: ,anticall except list|add|del <nomor|id>');
+  throw new UserInputError('Format: ,anticall except list|add|del <nomor|id>');
 }
 
 async function sendAnticallExceptionList(jid, actorJid) {
@@ -1738,7 +2001,7 @@ async function handleLoad(message, command, actorJid) {
   if (['change', 'rename'].includes(command.args[0].toLowerCase())) {
     const query = command.args[1];
     const newTitle = command.args.slice(2).join(' ').trim();
-    if (!query || !newTitle) throw new Error('Format: ,load rename <id|"judul-lama"> <judul-baru>');
+    if (!query || !newTitle) throw new UserInputError('Format: ,load rename <id|"judul-lama"> <judul-baru>');
     const item = await renameSaved(query, newTitle);
     invalidateListKind('saved');
     await sendText(jid, `Save #${item.id} diganti judul menjadi "${item.title}".`);
@@ -1746,7 +2009,7 @@ async function handleLoad(message, command, actorJid) {
   }
   if (command.args[0].toLowerCase() === 'del') {
     const query = command.args.slice(1).join(' ').trim();
-    if (!query) throw new Error('Format: ,load del <id|judul>');
+    if (!query) throw new UserInputError('Format: ,load del <id|judul>');
     await requestConfirmation(jid, actorJid, {
       title: `Hapus save "${query}"`,
       description: 'Save ini akan dihapus permanen.',
@@ -1760,7 +2023,7 @@ async function handleLoad(message, command, actorJid) {
   }
   const query = command.rawArgs.trim();
   const item = await getSaved(query);
-  if (!item) throw new Error(`Save "${query}" tidak ditemukan.`);
+  if (!item) throw new UserInputError(`Save "${query}" tidak ditemukan.`);
   await sendSaved(botSender(), jid, item);
 }
 
@@ -1885,6 +2148,7 @@ async function cancelActiveSessionByJid(jid, actorJid) {
 }
 
 async function handleCancelByJid(jid, actorJid) {
+  if (activeSessionActorMatches(jid, actorJid)) { state.reactionActions.clearScope(`session:${jid}:${actorJid}`); state.sessionPrompts.delete(jid); }
   let cancelled = false;
   if (state.confirmStore.cancel(jid, actorJid)) {
     cancelled = true;
@@ -1896,6 +2160,14 @@ async function handleCancelByJid(jid, actorJid) {
 }
 
 async function handleEndSession(jid, actorJid) {
+  const result = await finishActiveSession(jid, actorJid);
+  if (result && !activeSessionType(jid)) {
+    state.sessionPrompts.delete(jid);
+    state.reactionActions.clearScope(`session:${jid}:${actorJid}`);
+  }
+  return result;
+}
+async function finishActiveSession(jid, actorJid) {
   if (await finishSaveByJid(jid, actorJid)) return true;
   const task = await state.taskRecorder.finish(jid, actorJid);
   if (task) {
@@ -1937,7 +2209,7 @@ async function finishQrByJid(jid, actorJid) {
         await sendBotMessage(jid, { image, mimetype: 'image/png' }, { quoted: item.sourceMessage });
         sentCount += 1;
       } catch (error) {
-        failures.push(`#${index + 1}: ${error.message}`);
+        failures.push(`#${index + 1}: ${error instanceof UserInputError ? error.message : 'Gagal diproses.'}`);
         await logger.warn('QR session item failed', {
           jid,
           actorJid,
@@ -1997,23 +2269,32 @@ async function maybeCollectPdfItem(message, text) {
 }
 
 async function handleReminder(message, command) {
+  if (command.args.length === 1) {
+    const jid = message.key.remoteJid;
+    assertNoActiveSession(jid);
+    const intervalMs = parseDurationMs(command.args[0]);
+    const actorJid = messageActorJid(message);
+    const target = resolveDestinationInput(PRIMARY_TARGET_NAME, actorJid);
+    state.taskRecorder.start(jid, { targetInput: PRIMARY_TARGET_NAME, intervalMs, count: 1, loop: false }, actorJid, target);
+    const sent = await sendText(jid, 'Listening reminder. Kirim teks/media/VN/lokasi. Selesai: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.');
+    registerSessionPrompt(sent.key, jid, actorJid);
+    return;
+  }
   const reminder = await createReminder(command.args);
   await sendText(message.key.remoteJid, `Reminder #${reminder.id} dibuat. Terkirim dalam ${formatCountdown(new Date(reminder.dueAt).getTime() - Date.now())} ke ${PRIMARY_TARGET_NAME}.`);
 }
 
 async function handleClear(jid) {
-  if (hasAnyTempSession()) throw new Error('Tidak bisa clear temp saat ada sesi save/anticall/PDF/QR/restore aktif.');
+  if (hasAnyTempSession()) throw new UserInputError('Tidak bisa clear temp saat ada sesi save/anticall/PDF/QR/restore aktif.');
   await cleanupStartupTemp();
   await sendText(jid, 'Temp dibersihkan.');
 }
 
 async function handleBackup(jid) {
-  await sendText(jid, 'Membuat backup data/ dan mengirim ke destination backup WhatsApp...');
-  const destination = destinationJid('backup');
-  const files = await sendDataBackupToWhatsApp(botSender(), destination, {
-    partSizeBytes: state.runtimeConfig.backupPartSizeBytes()
-  });
-  await sendText(jid, `Backup terkirim ke ${formatDestinationLine('backup')}:\n${files.join('\n')}`);
+  storageTarget('backup');
+  await sendText(jid, 'Membuat backup data/...');
+  const files = await runConfiguredBackup();
+  await sendText(jid, `Backup selesai ke ${formatDestinationLine('backup')}:\n${files.join('\n')}`);
 }
 
 async function handleLog(jid, command) {
@@ -2046,7 +2327,7 @@ function formatLogLine(line) {
 async function handleNet(jid) {
   const started = Date.now();
   const [publicIp, trace, dnsInfo, latency, download] = await Promise.all([
-    fetchText('https://api.ipify.org?format=text', 5000).catch((error) => `gagal: ${error.message}`),
+    fetchText('https://api.ipify.org?format=text', 5000).catch(async (error) => { await logger.warn('Network probe failed', { error: error.message }); return 'gagal'; }),
     fetchText('https://www.cloudflare.com/cdn-cgi/trace', 5000).catch(() => ''),
     getDnsInfo(),
     measureHttpLatency('https://www.cloudflare.com/cdn-cgi/trace'),
@@ -2083,7 +2364,8 @@ async function getDnsInfo() {
     const addresses = await dns.resolve4('cloudflare.com');
     return `${Date.now() - start}ms (${addresses.slice(0, 3).join(', ')})`;
   } catch (error) {
-    return `gagal: ${error.message}`;
+    await logger.warn('Network probe failed', { error: error.message });
+    return 'gagal';
   }
 }
 
@@ -2093,7 +2375,8 @@ async function measureHttpLatency(url) {
     const response = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(5000), cache: 'no-store' });
     return `${Date.now() - start}ms (HTTP ${response.status})`;
   } catch (error) {
-    return `gagal: ${error.message}`;
+    await logger.warn('Network probe failed', { error: error.message });
+    return 'gagal';
   }
 }
 
@@ -2107,7 +2390,8 @@ async function measureDownloadSpeed(url) {
     const mbps = (buffer.length * 8) / seconds / 1_000_000;
     return `${formatBytes(buffer.length)} in ${seconds.toFixed(2)}s (${mbps.toFixed(2)} Mbps)`;
   } catch (error) {
-    return `gagal: ${error.message}`;
+    await logger.warn('Network probe failed', { error: error.message });
+    return 'gagal';
   }
 }
 
@@ -2123,7 +2407,7 @@ function parseCloudflareTrace(text) {
 async function handleButton(message, command) {
   const jid = message.key.remoteJid;
   const text = command.rawArgs.trim();
-  if (!text) throw new Error('Format: ,button <pesan>');
+  if (!text) throw new UserInputError('Format: ,button <pesan>');
   const buttonId = text.startsWith(COMMAND_PREFIX) ? text : `${COMMAND_PREFIX}${text}`;
   const content = proto.Message.fromObject({
     buttonsMessage: {
@@ -2171,7 +2455,7 @@ async function handleAllow(message, command) {
 }
 
 async function handleBotCommand(message, command, context) {
-  if (!context.isOwner) throw new Error('Command ,bot hanya bisa dipakai nomor yang terhubung ke session bot.');
+  if (!context.isOwner) throw new UserInputError('Command ,bot hanya bisa dipakai nomor yang terhubung ke session bot.');
   const jid = message.key.remoteJid;
   const action = (command.args[0] || '').toLowerCase();
   if (!action) {
@@ -2179,14 +2463,14 @@ async function handleBotCommand(message, command, context) {
     await sendText(jid, `Bot: ${snapshot.enabled ? 'on' : 'off'}.`);
     return;
   }
-  if (!['on', 'off'].includes(action)) throw new Error('Format: ,bot [on|off]');
+  if (!['on', 'off'].includes(action)) throw new UserInputError('Format: ,bot [on|off]');
   const snapshot = await state.botState.setEnabled(action === 'on');
   applyBotRuntimeState();
   await sendText(jid, `Bot sekarang ${snapshot.enabled ? 'on' : 'off'}.`);
 }
 
 async function handleAdminCommand(message, command, context) {
-  if (!context.isOwner) throw new Error('Command ,admin hanya bisa dipakai nomor yang terhubung ke session bot.');
+  if (!context.isOwner) throw new UserInputError('Command ,admin hanya bisa dipakai nomor yang terhubung ke session bot.');
   const jid = message.key.remoteJid;
   const action = (command.args[0] || 'list').toLowerCase();
   if (action === 'list') {
@@ -2195,7 +2479,7 @@ async function handleAdminCommand(message, command, context) {
   }
   if (action === 'add') {
     const input = command.args.slice(1).join(' ').trim();
-    if (!input) throw new Error('Format: ,admin add <nomor>');
+    if (!input) throw new UserInputError('Format: ,admin add <nomor>');
     const adminJid = normalizePhoneToWhatsAppJid(input);
     await requestConfirmation(jid, context.actorJid, {
       title: `Tambah admin ${displayPhoneFromJid(adminJid)}`,
@@ -2210,7 +2494,7 @@ async function handleAdminCommand(message, command, context) {
   }
   if (action === 'del') {
     const query = command.args.slice(1).join(' ').trim();
-    if (!query) throw new Error('Format: ,admin del <nomor|id>');
+    if (!query) throw new UserInputError('Format: ,admin del <nomor|id>');
     await requestConfirmation(jid, context.actorJid, {
       title: `Hapus admin "${query}"`,
       description: 'Nomor ini tidak lagi bisa memakai akses admin tambahan.',
@@ -2222,7 +2506,7 @@ async function handleAdminCommand(message, command, context) {
     });
     return;
   }
-  throw new Error('Format: ,admin list|add|del <nomor|id>');
+  throw new UserInputError('Format: ,admin list|add|del <nomor|id>');
 }
 
 async function sendAdminList(jid, actorJid) {
@@ -2239,7 +2523,7 @@ async function sendAdminList(jid, actorJid) {
 }
 
 async function handleConfigCommand(message, command, context) {
-  if (!context.isOwner) throw new Error('Command ,config hanya bisa dipakai nomor yang terhubung ke session bot.');
+  if (!context.isOwner) throw new UserInputError('Command ,config hanya bisa dipakai nomor yang terhubung ke session bot.');
   const jid = message.key.remoteJid;
   const action = (command.args[0] || '').toLowerCase();
   if (!action) {
@@ -2253,19 +2537,21 @@ async function handleConfigCommand(message, command, context) {
   }
   if (action === 'get') {
     const key = command.args[1];
-    if (!key) throw new Error('Format: ,config get <key>');
+    if (!key) throw new UserInputError('Format: ,config get <key>');
     await sendText(jid, `${key} = ${formatConfigValue(state.runtimeConfig.get(key))}`);
     return;
   }
   if (action === 'set') {
     const key = command.args[1];
     const value = command.args.slice(2).join(' ').trim();
-    if (!key || !value) throw new Error('Format: ,config set <key> <value>');
+    if (!key || !value) throw new UserInputError('Format: ,config set <key> <value>');
     const def = configKeyList().find((item) => item.key === key);
-    if (!def) throw new Error(`Config "${key}" tidak bisa diubah. Ketik ,config untuk daftar key.`);
+    if (!def) throw new UserInputError(`Config "${key}" tidak bisa diubah. Ketik ,config untuk daftar key.`);
     let saved;
     if (def.type === 'destination') {
-      saved = await state.runtimeConfig.setDestination(key, resolveDestinationInput(value, context.actorJid));
+      saved = await state.runtimeConfig.setDestination(key, resolveDestinationInput(value, context.actorJid, { requireGroup: key === 'dest.errors' }));
+      const feature = key === 'dest.saved' ? 'statussave' : key.slice(5);
+      if (STORAGE_FEATURES.includes(feature)) await state.runtimeConfig.setStorage(feature, 'group', saved);
     } else {
       saved = await state.runtimeConfig.set(key, value);
     }
@@ -2273,11 +2559,11 @@ async function handleConfigCommand(message, command, context) {
     await sendText(jid, `Config ${key} disimpan: ${formatConfigValue(saved)}`);
     return;
   }
-  throw new Error('Format: ,config [get|set] <key> <value>');
+  throw new UserInputError('Format: ,config [get|set] <key> <value>');
 }
 
 async function handleChangedMsgCommand(message, command, context) {
-  if (!context.isOwner) throw new Error('Command ,changedmsg hanya bisa dipakai nomor yang terhubung ke session bot.');
+  if (!context.isOwner) throw new UserInputError('Command ,changedmsg hanya bisa dipakai nomor yang terhubung ke session bot.');
   const jid = message.key.remoteJid;
   const action = (command.args[0] || 'list').toLowerCase();
   if (action === 'list') {
@@ -2286,7 +2572,7 @@ async function handleChangedMsgCommand(message, command, context) {
   }
   if (action === 'allow' || action === 'add') {
     const input = command.args.slice(1).join(' ').trim();
-    if (!input) throw new Error('Format: ,changedmsg allow <nama-grup|jid>');
+    if (!input) throw new UserInputError('Format: ,changedmsg allow <nama-grup|jid>');
     const destination = resolveDestinationInput(input, context.actorJid, { requireGroup: true });
     const item = await state.changedMessages.addAllowed(destination);
     invalidateListKind('changedmsg-allow');
@@ -2295,7 +2581,7 @@ async function handleChangedMsgCommand(message, command, context) {
   }
   if (action === 'del' || action === 'delete') {
     const query = command.args.slice(1).join(' ').trim();
-    if (!query) throw new Error('Format: ,changedmsg del <id|nama-grup|jid>');
+    if (!query) throw new UserInputError('Format: ,changedmsg del <id|nama-grup|jid>');
     await requestConfirmation(jid, context.actorJid, {
       title: `Hapus allowlist changedmsg "${query}"`,
       description: 'Grup ini tidak lagi dipantau untuk logs/changedmsg.',
@@ -2307,7 +2593,7 @@ async function handleChangedMsgCommand(message, command, context) {
     });
     return;
   }
-  throw new Error('Format: ,changedmsg list|allow|del <group|id>');
+  throw new UserInputError('Format: ,changedmsg list|allow|del <group|id>');
 }
 
 async function sendChangedMsgAllowList(jid, actorJid) {
@@ -2324,24 +2610,50 @@ async function sendChangedMsgAllowList(jid, actorJid) {
 }
 
 async function handleStatusSaveCommand(message, command, context) {
-  if (!context.isOwner) throw new Error('Command ,statussave hanya bisa dipakai nomor yang terhubung ke session bot.');
+  if (!context.isOwner) throw new UserInputError('Command ,statussave hanya bisa dipakai nomor yang terhubung ke session bot.');
   const jid = message.key.remoteJid;
-  const action = (command.args[0] || 'list').toLowerCase();
+  const action = (command.args[0] || '').toLowerCase();
+  if (!action) {
+    const enabled = state.runtimeConfig.statussaveSettings().enabled;
+    return sendText(jid, [`*Statussave • ${enabled ? 'otomatis aktif' : 'otomatis nonaktif'}*`,
+      `Tujuan: ${formatDestinationLine('saved')}`, `Nomor dipantau: ${state.statusSave.list().length}`,
+      '', '1. Tambahkan sekali: ,statussave add <nomor>',
+      '2. Status berikutnya tersimpan otomatis ke tujuan di atas.',
+      '3. Lihat seluruh status aktif di chat ini: ,statussave list <nomor>',
+      '', ',statussave list — daftar nomor', ',statussave on / off — atur auto-save',
+      ',statussave setup — ubah tujuan', 'Detail/command lanjutan: ,help statussave'].join('\n'));
+  }
+  if (action === 'on' || action === 'off') {
+    await state.runtimeConfig.set('statussave.enabled', action === 'on');
+    await sendText(jid, `Penyimpanan status otomatis ${action === 'on' ? 'diaktifkan' : 'dinonaktifkan'}. Tujuan: ${formatDestinationLine('saved')}`);
+    if (action === 'on') await resumeStatusAutoSave();
+    return;
+  }
+  if (action === 'show' || (action === 'list' && command.args.length > 1)) return showStatusContact(jid, command.args.slice(1).join(' '));
+  if (action === 'active' || action === 'dump') return handleStatusBrowse(message, command);
+  if (action === 'setup') return handleSetup(message, { args: ['statussave', ...command.args.slice(1)] }, context);
   if (action === 'list') {
     await sendStatusSaveList(jid, context.actorJid);
     return;
   }
   if (action === 'add') {
     const input = command.args.slice(1).join(' ').trim();
-    if (!input) throw new Error('Format: ,statussave add <nomor>');
-    const item = await state.statusSave.add(input, context.actorJid);
+    if (!input) throw new UserInputError('Format: ,statussave add <nomor>');
+    const phoneJid = normalizePhoneToWhatsAppJid(input);
+    const existing = state.statusSave.list().find((item) => sameJid(item.jid, phoneJid));
+    const item = existing || await state.statusSave.add(input, context.actorJid);
     invalidateListKind('statussave');
-    await sendText(jid, `Statussave #${item.id} ${item.title} ditambahkan.`);
+    const enabled = state.runtimeConfig.statussaveSettings().enabled;
+    await sendText(jid, [`Nomor ${item.title} ${existing ? 'sudah terdaftar' : 'ditambahkan'}.`,
+      `Auto-save: ${enabled ? 'aktif; status baru tersimpan tanpa save manual' : 'nonaktif; ketik ,statussave on untuk mengaktifkan'}.`,
+      `Tujuan: ${formatDestinationLine('saved')}`, `Lihat isinya di WhatsApp: ,statussave list ${item.title}`].join('\n'));
+    try { storageTarget('statussave'); } catch { await setupMenu(jid, 'statussave'); }
+    await resumeStatusAutoSave(item.jid);
     return;
   }
   if (action === 'del' || action === 'delete') {
     const query = command.args.slice(1).join(' ').trim();
-    if (!query) throw new Error('Format: ,statussave del <nomor|id>');
+    if (!query) throw new UserInputError('Format: ,statussave del <nomor|id>');
     await requestConfirmation(jid, context.actorJid, {
       title: `Hapus statussave "${query}"`,
       description: 'Status WhatsApp dari nomor ini tidak lagi disimpan otomatis.',
@@ -2353,7 +2665,7 @@ async function handleStatusSaveCommand(message, command, context) {
     });
     return;
   }
-  throw new Error('Format: ,statussave list|add|del <nomor|id>');
+  throw new UserInputError('Format: ,statussave add|list|show|del <nomor|id>, atau ,statussave on|off');
 }
 
 async function sendStatusSaveList(jid, actorJid) {
@@ -2424,37 +2736,13 @@ async function handleUpdateBot(jid) {
 }
 
 async function restartSystemctlWithAuthFallback(jid, systemctlError) {
-  const originalError = commandErrorText(systemctlError);
+  await logger.error('Systemctl restart failed', { jid, error: commandErrorText(systemctlError) });
   if (LINUX_SUDO_PASSWORD && process.platform !== 'win32') {
-    await sendText(jid, 'Systemctl butuh authentication. Mencoba sudo dengan LINUX_SUDO_PASSWORD dari .env...');
     try {
       await runToolWithInput('sudo', ['-S', '-p', '', 'systemctl', '--no-block', 'restart', UPDATE_SYSTEMD_SERVICE], `${LINUX_SUDO_PASSWORD}\n`);
-      await sendText(jid, `Restart service ${UPDATE_SYSTEMD_SERVICE} via sudo dimulai.`);
       return;
-    } catch (sudoError) {
-      await logger.error('sudo systemctl restart failed', {
-        jid,
-        service: UPDATE_SYSTEMD_SERVICE,
-        error: sudoError.message,
-        stderr: sudoError.stderr
-      });
-      await sendText(jid, [
-        'Sudo restart gagal.',
-        commandErrorText(sudoError),
-        '',
-        'Bot akan fallback ke graceful exit; pastikan supervisor menjalankan ulang proses.'
-      ].join('\n'));
-      await handleRestartBot(jid);
-      return;
-    }
+    } catch (error) { await logger.error('Sudo restart failed', { jid, error: error.message, stderr: error.stderr }); }
   }
-
-  await sendText(jid, [
-    'Systemctl butuh authentication, tetapi LINUX_SUDO_PASSWORD belum diisi di .env.',
-    originalError,
-    '',
-    'Bot akan fallback ke graceful exit; pastikan supervisor menjalankan ulang proses.'
-  ].join('\n'));
   await handleRestartBot(jid);
 }
 
@@ -2490,6 +2778,14 @@ function isNamedMutation(command) {
 async function handleCommand(message, command, context = commandContext(message)) {
   const jid = message.key.remoteJid;
   switch (command.name) {
+    case 'setup':
+      await handleSetup(message, command, context);
+      break;
+    case 'stext': {
+      const result = await makeTextSticker(parseTextSticker(command.rawArgs));
+      await sendBotMessage(jid, { sticker: result.buffer });
+      break;
+    }
     case 'help':
       await handleHelp(jid, command, context);
       break;
@@ -2523,7 +2819,7 @@ async function handleCommand(message, command, context = commandContext(message)
         await sendNoteList(jid, context.actorJid);
       } else if (command.args[0]?.toLowerCase() === 'del') {
         const query = command.args.slice(1).join(' ').trim();
-        if (!query) throw new Error(HELP_DETAILS.note.join('\n'));
+        if (!query) throw new UserInputError(HELP_DETAILS.note.join('\n'));
         await requestConfirmation(jid, context.actorJid, {
           title: `Hapus note "${query}"`,
           description: 'Note ini akan dihapus permanen.',
@@ -2544,7 +2840,7 @@ async function handleCommand(message, command, context = commandContext(message)
         await sendLinkList(jid, context.actorJid);
       } else if (command.args[0]?.toLowerCase() === 'del') {
         const query = command.args.slice(1).join(' ').trim();
-        if (!query) throw new Error(HELP_DETAILS.link.join('\n'));
+        if (!query) throw new UserInputError(HELP_DETAILS.link.join('\n'));
         await requestConfirmation(jid, context.actorJid, {
           title: `Hapus link "${query}"`,
           description: 'Link ini akan dihapus permanen.',
@@ -2600,7 +2896,7 @@ async function handleCommand(message, command, context = commandContext(message)
         await sendWolList(jid, context.actorJid);
       } else if (command.args[0]?.toLowerCase() === 'del') {
         const query = command.args.slice(1).join(' ').trim();
-        if (!query) throw new Error(HELP_DETAILS.wol.join('\n'));
+        if (!query) throw new UserInputError(HELP_DETAILS.wol.join('\n'));
         await requestConfirmation(jid, context.actorJid, {
           title: `Hapus WOL "${query}"`,
           description: 'Entry Wake-on-LAN ini akan dihapus permanen.',
@@ -2686,6 +2982,8 @@ async function onMessageUpsert(event) {
   for (const message of event.messages || []) {
     if (!message.message || !message.key?.remoteJid) continue;
     if (message.key.remoteJid === 'status@broadcast') {
+      const revoked = message.message?.protocolMessage?.key;
+      if (revoked) { await state.statusInbox.remove(revoked); continue; }
       if (isBotEnabled()) await maybeSaveStatusMessage(message);
       continue;
     }
@@ -2707,20 +3005,24 @@ async function onMessageUpsert(event) {
 
       const sessionActive = activeSessionType(jid);
       const sessionActorMatches = activeSessionActorMatches(jid, context.actorJid);
+      if (sessionActorMatches && state.sessionPrompts.has(jid)) {
+        const prompt = state.sessionPrompts.get(jid); prompt.lastActivity = Date.now();
+        const action = state.reactionActions.get(prompt.key, prompt.actorJid); if (action) action.expiresAt = Date.now() + 1800000;
+      }
       if (sessionActive && !sessionActorMatches && (!command || ['end', 'cancel', 'confirm'].includes(command.name))) {
         continue;
       }
 
       if (sessionActorMatches && state.saveRecorder.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
-        await state.saveRecorder.record(state.sock, message);
+        await listeningProgress(jid, await state.saveRecorder.record(state.sock, message));
         continue;
       }
       if (sessionActorMatches && state.taskRecorder.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
-        await state.taskRecorder.record(state.sock, message);
+        await listeningProgress(jid, await state.taskRecorder.record(state.sock, message));
         continue;
       }
       if (sessionActorMatches && state.anticall.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
-        await state.anticall.record(state.sock, message);
+        await listeningProgress(jid, await state.anticall.record(state.sock, message));
         continue;
       }
       if (sessionActorMatches && state.restoreSessions.has(jid) && (!command || !['end', 'cancel', 'confirm'].includes(command.name))) {
@@ -2741,8 +3043,7 @@ async function onMessageUpsert(event) {
         if (sessionActorMatches) await maybeCollectPdfItem(message, text);
       }
     } catch (error) {
-      await logger.error('Command error', { jid, error: error.message, text });
-      await sendText(jid, `Error: ${error.message}`);
+      await handleFailure(error, { jid, text, messageId: message.key?.id });
     }
   }
 }
@@ -2751,6 +3052,10 @@ async function onMessagesUpdate(updates) {
   if (!isBotEnabled()) return;
   for (const update of updates || []) {
     try {
+      if (update.key?.remoteJid === 'status@broadcast') {
+        if (update.update?.messageStubType === WAMessageStubType.REVOKE || update.update?.message === null) await state.statusInbox.remove(update.key);
+        continue;
+      }
       if (update?.update?.message?.editedMessage?.message) {
         await handleChangedEdit(update);
         continue;
@@ -2759,11 +3064,7 @@ async function onMessagesUpdate(updates) {
         await handleChangedDelete(update.key);
       }
     } catch (error) {
-      await logger.error('Changed message update error', {
-        jid: update?.key?.remoteJid,
-        id: update?.key?.id,
-        error: error.message
-      });
+      await handleFailure(error);
     }
   }
 }
@@ -2775,9 +3076,12 @@ async function onMessagesDelete(update) {
       await logger.info('Messages delete all event ignored', { jid: update.jid });
       return;
     }
-    for (const key of update?.keys || []) await handleChangedDelete(key);
+    for (const key of update?.keys || []) {
+      if (key.remoteJid === 'status@broadcast') await state.statusInbox.remove(key);
+      else await handleChangedDelete(key);
+    }
   } catch (error) {
-    await logger.error('Messages delete error', { error: error.message });
+    await handleFailure(error);
   }
 }
 
@@ -2788,19 +3092,17 @@ async function onMessagesReaction(updates) {
     if (!intent) continue;
     const actorJid = reactionActorJid(update);
     const action = state.reactionActions.get(update.key, actorJid);
-    if (!action) continue;
     try {
+      if (!action) {
+        if (intent === 'cancel' && update.reaction?.key?.fromMe && update.key?.fromMe && !state.reactionActions.isPrompt(update.key)) await sendBotMessage(update.key.remoteJid, { delete: update.key });
+        continue;
+      }
       const handler = intent === 'confirm' ? action.onConfirm : action.onCancel;
       if (!handler) continue;
-      state.reactionActions.delete(update.key);
       await handler(update);
+      state.reactionActions.delete(update.key);
     } catch (error) {
-      await logger.error('Reaction action error', {
-        jid: update?.key?.remoteJid,
-        actorJid,
-        error: error.message
-      });
-      if (update?.key?.remoteJid) await sendText(update.key.remoteJid, `Error: ${error.message}`);
+      await handleFailure(error, { jid: update?.key?.remoteJid, messageId: update.key?.id });
     }
   }
 }
@@ -2818,6 +3120,7 @@ async function loadGroups(sock) {
     const groups = await sock.groupFetchAllParticipating();
     for (const group of Object.values(groups || {})) {
       state.chatDirectory.remember(group.id, group.subject);
+      state.groups.set(group.id, group);
     }
     await logger.info('Loaded groups', { count: Object.keys(groups || {}).length });
   } catch (error) {
@@ -2884,15 +3187,30 @@ async function connect() {
 
   state.sock = sock;
   state.scheduler?.stop();
-  state.scheduler = new TaskScheduler(sock, state.chatDirectory, logger);
+  state.scheduler = new TaskScheduler(botSender(), state.chatDirectory, logger);
   state.reminderScheduler?.stop();
-  state.reminderScheduler = new ReminderScheduler(sock, state.chatDirectory, logger);
+  state.reminderScheduler = new ReminderScheduler(botSender(), state.chatDirectory, logger);
 
   sock.ev.on('creds.update', saveCreds);
-  sock.ev.on('messages.upsert', onMessageUpsert);
+  sock.ev.on('contacts.upsert', (contacts) => rememberContacts(contacts).catch((error) => handleFailure(error)));
+  sock.ev.on('contacts.update', (contacts) => rememberContacts(contacts).catch((error) => handleFailure(error)));
+  sock.ev.on('messaging-history.set', async ({ messages, contacts }) => {
+    try {
+      await rememberContacts(contacts);
+      if (isBotEnabled()) for (const message of messages || []) if (message.key?.remoteJid === 'status@broadcast') await maybeSaveStatusMessage(message);
+    } catch (error) { await handleFailure(error); }
+  });
+  sock.ev.on('lid-mapping.update', async () => {
+    try {
+      for (const item of state.statusInbox.list()) if (item.author.endsWith('@lid')) await maybeSaveStatusMessage(reviveValue(item.message));
+    } catch (error) { await handleFailure(error); }
+  });
+  let inputQueue = Promise.resolve();
+  const enqueue = (fn) => { inputQueue = inputQueue.then(fn).catch((error) => handleFailure(error)); };
+  sock.ev.on('messages.upsert', (event) => enqueue(() => onMessageUpsert(event)));
   sock.ev.on('messages.update', onMessagesUpdate);
   sock.ev.on('messages.delete', onMessagesDelete);
-  sock.ev.on('messages.reaction', onMessagesReaction);
+  sock.ev.on('messages.reaction', (updates) => enqueue(() => onMessagesReaction(updates)));
   sock.ev.on('call', onCallUpdate);
   sock.ev.on('chats.upsert', (chats) => {
     for (const chat of chats || []) state.chatDirectory.remember(chat.id, chat.name || chat.subject);
@@ -2909,14 +3227,19 @@ async function connect() {
       console.log(await QRCode.toString(qr, { type: 'terminal', small: true }));
     }
     if (connection === 'open') {
+      state.connected = true;
       console.log('WhatsApp connected.');
       await logger.info('WhatsApp connected');
       await loadGroups(sock);
       await hydrateConfiguredDestinations();
+      await resolveErrorGroup();
+      await resumeStatusAutoSave();
+      await state.errorReporter.flush();
       state.typing?.attach(sock);
       applyBotRuntimeState();
     }
     if (connection === 'close') {
+      state.connected = false;
       state.typing?.detach();
       state.scheduler?.stop();
       state.reminderScheduler?.stop();
@@ -2963,6 +3286,27 @@ async function main() {
   await state.changedMessages.load();
   state.statusSave = new StatusSaveStore();
   await state.statusSave.load();
+  state.statusInbox = await new StatusInbox(path.join(ROOT_DIR, 'data', 'status-inbox.json')).load();
+  try { state.contactNames = new Map(Object.entries(JSON.parse(await fs.readFile(path.join(ROOT_DIR, 'data', 'contact-names.json'), 'utf8')))); } catch {}
+  for (const [jid, name] of state.contactNames) state.chatDirectory.remember(jid, name);
+  state.errorReporter = new ErrorReporter(path.join(ROOT_DIR, 'data', 'error-outbox.json'));
+  await state.errorReporter.load();
+  setErrorSink((message, meta) => state.errorReporter.report(message, meta));
+  state.errorReporter.send = async (text) => {
+    if (!state.connected) throw new Error('WhatsApp disconnected');
+    let jid; try { jid = destinationJid('errors'); } catch { await notifyMissingSetup('errors'); throw new Error('Error destination unavailable'); }
+    await sendText(jid, text);
+  };
+  setInterval(() => state.errorReporter.flush().catch(() => {}), 30000).unref();
+  for (const feature of STORAGE_FEATURES) {
+    const target = state.runtimeConfig.storageTarget(feature);
+    if (target.mode === 'local') {
+      try { await prepareLocalPath(target.path); } catch (error) { await logger.error('Local storage unavailable', { feature, error: error.message }); }
+    }
+  }
+  setInterval(() => expireListeningSessions().catch((error) => handleFailure(error)), 30000).unref();
+  setInterval(() => state.statusInbox.serial(() => state.statusInbox.save()).catch((error) => handleFailure(error)), 60000).unref();
+  try { state.reactionActions.prompts = new Set(JSON.parse(await fs.readFile(path.join(ROOT_DIR, 'data', 'prompt-keys.json'), 'utf8'))); } catch {}
   state.tools = await detectTools();
   state.pdfSessions = new PdfSessions(state.tools);
   state.qrSessions = new QrSessions();
@@ -2975,11 +3319,9 @@ async function main() {
   await state.typing.load();
   state.backupScheduler = new DailyBackupScheduler(
     logger,
-    async () => sendDataBackupToWhatsApp(botSender(), destinationJid('backup'), {
-      partSizeBytes: state.runtimeConfig.backupPartSizeBytes()
-    }),
+    async () => { try { return await runConfiguredBackup(); } catch (error) { await handleFailure(error); throw error; } },
     {
-      shouldRun: () => state.runtimeConfig.isBackupAutoDaily(),
+      shouldRun: () => state.connected && state.runtimeConfig.isBackupAutoDaily(),
       dailyTimeWib: () => state.runtimeConfig.dailyBackupTimeWib()
     }
   );
@@ -3008,7 +3350,9 @@ process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled rejection', { error: reason?.message || String(reason) });
 });
 
-main().catch(async (error) => {
+export { state, onMessageUpsert, onMessagesReaction, onMessagesUpdate, handleSetup, handleFailure, storageTarget, archiveStatus, handleStatusBrowse, resolveErrorGroup, runConfiguredBackup, expireListeningSessions, rememberContacts };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main().catch(async (error) => {
   await logger.error('Fatal startup error', { error: error.message });
   console.error(error);
   process.exit(1);

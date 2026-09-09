@@ -136,7 +136,10 @@ export async function recordMessageEntry(sock, message, prefix = 'recorded-item'
       fileName: media.fileName || path.basename(media.path),
       messageType: media.type,
       caption: text,
-      isAnimated: Boolean(media.node?.isAnimated)
+      isAnimated: Boolean(media.node?.isAnimated),
+      ptt: Boolean(media.node?.ptt),
+      seconds: numberLike(media.node?.seconds),
+      gifPlayback: Boolean(media.node?.gifPlayback)
     };
     return { entry, tempFile: media.path, type: 'media' };
   }
@@ -164,7 +167,10 @@ export async function persistRecordedEntries(entries, dir) {
       fileName: entry.fileName,
       messageType: entry.messageType,
       caption: entry.caption,
-      isAnimated: entry.isAnimated
+      isAnimated: entry.isAnimated,
+      ptt: entry.ptt,
+      seconds: entry.seconds,
+      gifPlayback: entry.gifPlayback
     });
   }
   return persisted;
@@ -198,9 +204,9 @@ async function sendMediaEntry(sock, jid, entry) {
   if (entry.messageType === 'imageMessage') {
     await sock.sendMessage(jid, { image: buffer, mimetype: entry.mimetype, caption: entry.caption || undefined });
   } else if (entry.messageType === 'videoMessage') {
-    await sock.sendMessage(jid, { video: buffer, mimetype: entry.mimetype, caption: entry.caption || undefined });
+    await sock.sendMessage(jid, { video: buffer, gifPlayback: entry.gifPlayback, mimetype: entry.mimetype, caption: entry.caption || undefined });
   } else if (entry.messageType === 'audioMessage') {
-    await sock.sendMessage(jid, { audio: buffer, mimetype: entry.mimetype });
+    await sock.sendMessage(jid, { audio: buffer, mimetype: entry.mimetype, ptt: Boolean(entry.ptt), seconds: entry.seconds || undefined });
   } else if (entry.messageType === 'stickerMessage') {
     await sock.sendMessage(jid, { sticker: buffer, isAnimated: entry.isAnimated || undefined });
   } else {

@@ -1,3 +1,4 @@
+import { UserInputError } from './errors.js';
 import { REMINDERS_FILE, REMINDER_TARGET_NAMES } from './config.js';
 import { readCollection, writeCollection } from './namedStore.js';
 
@@ -11,18 +12,18 @@ const UNIT_MS = {
 
 export function parseDurationMs(input) {
   const text = String(input || '').trim().toLowerCase();
-  if (!text) throw new Error('Durasi wajib diisi, contoh 10s, 5m, 2h, 1d, 1h30m.');
+  if (!text) throw new UserInputError('Durasi wajib diisi, contoh 10s, 5m, 2h, 1d, 1h30m.');
   let total = 0;
   let consumed = '';
   for (const match of text.matchAll(DURATION_RE)) {
     const value = Number(match[1]);
     const unit = match[2].toLowerCase();
-    if (!Number.isInteger(value) || value <= 0) throw new Error('Durasi harus angka positif.');
+    if (!Number.isInteger(value) || value <= 0) throw new UserInputError('Durasi harus angka positif.');
     total += value * UNIT_MS[unit];
     consumed += match[0];
   }
   if (!total || consumed.replace(/\s+/g, '') !== text.replace(/\s+/g, '')) {
-    throw new Error('Format durasi tidak valid. Contoh: 10s, 5m, 2h, 1d, 1h30m.');
+    throw new UserInputError('Format durasi tidak valid. Contoh: 10s, 5m, 2h, 1d, 1h30m.');
   }
   return total;
 }
@@ -42,11 +43,11 @@ export function formatCountdown(ms) {
 }
 
 export async function createReminder(args) {
-  if (args.length < 2) throw new Error('Format: ,remindme <teks> <durasi>');
+  if (args.length < 2) throw new UserInputError('Format: ,remindme <teks> <durasi>');
   const durationToken = args.at(-1);
   const delayMs = parseDurationMs(durationToken);
   const text = args.slice(0, -1).join(' ').trim();
-  if (!text) throw new Error('Teks reminder wajib diisi.');
+  if (!text) throw new UserInputError('Teks reminder wajib diisi.');
 
   const store = await readCollection(REMINDERS_FILE);
   const item = {

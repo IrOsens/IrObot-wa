@@ -1,8 +1,12 @@
+import { UserInputError } from './errors.js';
+import { atomicJson, destinationAlias, prepareLocalPath, STORAGE_FEATURES } from './storage.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { CONFIG_FILE, DEFAULT_APP_CONFIG } from './config.js';
 
 export const CONFIG_KEY_DEFS = {
+  'dest.errors': { type: 'destination', label: 'Tujuan error teknis' },
+  'storage.root': { type: 'localPath', label: 'Root penyimpanan lokal opsional' },
   'dest.logs': { type: 'destination', label: 'Tujuan mirror logs' },
   'dest.changedmsg': { type: 'destination', label: 'Tujuan pesan terhapus/diedit' },
   'dest.saved': { type: 'destination', label: 'Tujuan save status WhatsApp' },
@@ -18,6 +22,7 @@ export const CONFIG_KEY_DEFS = {
 };
 
 const DESTINATION_ALIASES = {
+  'dest.errors': ['destinations', 'errors'],
   'dest.logs': ['destinations', 'logs'],
   'dest.changedmsg': ['destinations', 'changedmsg'],
   'dest.saved': ['destinations', 'saved'],
@@ -28,6 +33,7 @@ export class RuntimeConfigStore {
   constructor(filePath = CONFIG_FILE) {
     this.filePath = filePath;
     this.data = structuredClone(DEFAULT_APP_CONFIG);
+    this.mutations = Promise.resolve();
   }
 
   async load() {
@@ -50,21 +56,55 @@ export class RuntimeConfigStore {
     return getPath(this.data, keyPath(key));
   }
 
-  async set(key, rawValue) {
-    const def = assertKnownKey(key);
-    const value = normalizeConfigValue(def, rawValue);
-    setPath(this.data, keyPath(key), value);
-    await this.save();
-    return value;
+  mutate(fn) {
+    const task = this.mutations.then(async () => {
+      const previous = this.snapshot();
+      try { const result = await fn(); await this.save(); return result; }
+      catch (error) { this.data = previous; throw error; }
+    });
+    this.mutations = task.catch(() => {});
+    return task;
   }
 
-  async setDestination(key, destination) {
-    const def = assertKnownKey(key);
-    if (def.type !== 'destination') throw new Error(`${key} bukan config destination.`);
-    const value = normalizeDestinationConfig(destination);
-    setPath(this.data, keyPath(key), value);
-    await this.save();
-    return value;
+  set(key, rawValue) {
+    return this.mutate(async () => {
+      const def = assertKnownKey(key);
+      const value = def.type === 'localPath' ? await prepareLocalPath(rawValue) : normalizeConfigValue(def, rawValue);
+      setPath(this.data, keyPath(key), value);
+      return value;
+    });
+  }
+
+  setDestination(key, destination) {
+    return this.mutate(async () => {
+      const def = assertKnownKey(key);
+      if (def.type !== 'destination') throw new UserInputError(`${key} bukan config destination.`);
+      const value = normalizeDestinationConfig(destination);
+      setPath(this.data, keyPath(key), value);
+      return value;
+    });
+  }
+
+  storageTarget(feature) {
+    if (!STORAGE_FEATURES.includes(feature)) throw new UserInputError('Fitur penyimpanan tidak dikenal.');
+    const current = this.data.storage?.features?.[feature];
+    if (current?.mode === 'local') return { mode: 'local', path: current.path };
+    return { mode: 'group', destination: this.destination(destinationAlias(feature)) };
+  }
+
+  setStorage(feature, mode, value) {
+    return this.mutate(async () => {
+      if (!STORAGE_FEATURES.includes(feature) || !['local', 'group'].includes(mode)) throw new UserInputError('Pilih fitur dan mode group/local melalui ,setup.');
+      const local = value || (this.data.storage?.root && path.join(this.data.storage.root, feature));
+      if (mode === 'local' && feature === 'backup' && local) {
+        const relative = path.relative(path.dirname(this.filePath), path.resolve(local));
+        if (!relative.startsWith('..') && !path.isAbsolute(relative)) throw new UserInputError('Tujuan backup lokal harus di luar data/ agar backup tidak memasukkan arsipnya sendiri.');
+      }
+      const target = mode === 'local' ? { mode, path: await prepareLocalPath(local) } : { mode };
+      if (mode === 'group') setPath(this.data, ['destinations', destinationAlias(feature)], normalizeDestinationConfig(value));
+      setPath(this.data, ['storage', 'features', feature], target);
+      return this.storageTarget(feature);
+    });
   }
 
   destination(name) {
@@ -100,7 +140,7 @@ export class RuntimeConfigStore {
 
   async save() {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    await fs.writeFile(this.filePath, `${JSON.stringify(this.data, null, 2)}\n`);
+    await atomicJson(this.filePath, this.data);
   }
 }
 
@@ -120,12 +160,12 @@ export function formatConfigValue(value) {
 export function normalizeDestinationConfig(value) {
   if (typeof value === 'string') {
     const text = value.trim();
-    if (!text) throw new Error('Destination wajib diisi.');
+    if (!text) throw new UserInputError('Destination wajib diisi.');
     return text;
   }
-  if (!value || typeof value !== 'object') throw new Error('Destination tidak valid.');
+  if (!value || typeof value !== 'object') throw new UserInputError('Destination tidak valid.');
   const jid = String(value.jid || '').trim();
-  if (!jid) throw new Error('Destination JID wajib diisi.');
+  if (!jid) throw new UserInputError('Destination JID wajib diisi.');
   return {
     jid,
     savedName: String(value.savedName || value.title || value.input || jid).trim() || jid,
@@ -139,7 +179,7 @@ export function normalizeDestinationConfig(value) {
 function assertKnownKey(key) {
   const clean = String(key || '').trim();
   const def = CONFIG_KEY_DEFS[clean];
-  if (!def) throw new Error(`Config "${key}" tidak bisa diubah. Ketik ,config untuk daftar key.`);
+  if (!def) throw new UserInputError(`Config "${key}" tidak bisa diubah. Ketik ,config untuk daftar key.`);
   return def;
 }
 
@@ -161,28 +201,28 @@ function parseBoolean(value) {
   const text = String(value ?? '').trim().toLowerCase();
   if (['true', 'on', 'yes', '1', 'aktif'].includes(text)) return true;
   if (['false', 'off', 'no', '0', 'nonaktif'].includes(text)) return false;
-  throw new Error('Nilai boolean harus true/false atau on/off.');
+  throw new UserInputError('Nilai boolean harus true/false atau on/off.');
 }
 
 function parseTime(value) {
   const text = String(value ?? '').trim();
   const match = text.match(/^(\d{1,2}):(\d{2})$/);
-  if (!match) throw new Error('Format jam harus HH:mm, contoh 00:00.');
+  if (!match) throw new UserInputError('Format jam harus HH:mm, contoh 00:00.');
   const hour = Number(match[1]);
   const minute = Number(match[2]);
-  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) throw new Error('Jam WIB tidak valid.');
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) throw new UserInputError('Jam WIB tidak valid.');
   return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
 }
 
 function parsePositiveInteger(value) {
   const number = Number(value);
-  if (!Number.isInteger(number) || number <= 0) throw new Error('Nilai harus integer positif.');
+  if (!Number.isInteger(number) || number <= 0) throw new UserInputError('Nilai harus integer positif.');
   return number;
 }
 
 function parsePositiveNumber(value) {
   const number = Number(value);
-  if (!Number.isFinite(number) || number <= 0) throw new Error('Nilai harus angka positif.');
+  if (!Number.isFinite(number) || number <= 0) throw new UserInputError('Nilai harus angka positif.');
   return number;
 }
 

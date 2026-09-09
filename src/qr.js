@@ -1,3 +1,4 @@
+import { UserInputError } from './errors.js';
 import QRCode from 'qrcode';
 import sharp from 'sharp';
 import { QR_SESSION_TIMEOUT_MS, makeTempPath } from './config.js';
@@ -38,11 +39,11 @@ export function parseQrArgs(rawArgs = '') {
     const value = token.slice(separator + 1);
 
     if (key === 'style') {
-      if (styleSeen) throw new Error('Opsi style hanya boleh ditulis satu kali.');
+      if (styleSeen) throw new UserInputError('Opsi style hanya boleh ditulis satu kali.');
       style = normalizeQrStyle(value);
       styleSeen = true;
     } else if (key === 'bg') {
-      if (backgroundSeen) throw new Error('Opsi bg hanya boleh ditulis satu kali.');
+      if (backgroundSeen) throw new UserInputError('Opsi bg hanya boleh ditulis satu kali.');
       background = normalizeQrBackground(value);
       backgroundSeen = true;
     } else {
@@ -61,7 +62,7 @@ export function parseQrArgs(rawArgs = '') {
 export function normalizeQrStyle(value) {
   const style = String(value || '').trim().toLowerCase();
   if (!QR_STYLES.has(style)) {
-    throw new Error(`Style QR harus salah satu: ${[...QR_STYLES].join(', ')}.`);
+    throw new UserInputError(`Style QR harus salah satu: ${[...QR_STYLES].join(', ')}.`);
   }
   return style;
 }
@@ -70,7 +71,7 @@ export function normalizeQrBackground(value) {
   const color = String(value || '').trim().toLowerCase();
   if (QR_BACKGROUND_COLORS[color]) return QR_BACKGROUND_COLORS[color];
   if (/^#[0-9a-f]{6}$/i.test(color)) return color.toLowerCase();
-  throw new Error(`Background QR harus white, black, red, blue, green, yellow, purple, orange, atau #RRGGBB.`);
+  throw new UserInputError(`Background QR harus white, black, red, blue, green, yellow, purple, orange, atau #RRGGBB.`);
 }
 
 export function qrForegroundForBackground(background) {
@@ -86,7 +87,7 @@ export function qrForegroundForBackground(background) {
 
 export async function makeQrCode(text, options = {}) {
   const payload = String(text || '');
-  if (!payload.trim()) throw new Error('Pesan untuk isi QR wajib diisi.');
+  if (!payload.trim()) throw new UserInputError('Pesan untuk isi QR wajib diisi.');
   const style = normalizeQrStyle(options.style || 'square');
   const background = normalizeQrBackground(options.background || 'white');
   const foreground = qrForegroundForBackground(background);
@@ -94,7 +95,7 @@ export async function makeQrCode(text, options = {}) {
   try {
     qr = QRCode.create(payload, { errorCorrectionLevel: 'H' });
   } catch (error) {
-    throw new Error(`Pesan terlalu panjang atau tidak bisa dibuat menjadi QR: ${error.message}`);
+    throw new UserInputError(`Pesan terlalu panjang atau tidak bisa dibuat menjadi QR: ${error.message}`);
   }
 
   const svg = renderQrSvg(qr.modules, { style, background, foreground });
@@ -179,7 +180,7 @@ export class QrSessions {
     const session = this.sessions.get(message.key.remoteJid);
     if (!session) return null;
     const payload = String(text || '').trim();
-    if (!payload) throw new Error('Pesan/caption wajib diisi agar bisa menjadi isi QR. Sesi tetap aktif.');
+    if (!payload) throw new UserInputError('Pesan/caption wajib diisi agar bisa menjadi isi QR. Sesi tetap aktif.');
     let iconMedia = null;
     try {
       iconMedia = await downloadQrIcon(sock, message, 'qr-session-icon');

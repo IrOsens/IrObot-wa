@@ -1,3 +1,4 @@
+import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -37,9 +38,9 @@ export function findByIdOrTitle(store, query) {
 
 export function assertUniqueTitle(store, title, ignoreId = null) {
   const key = titleKey(title);
-  if (!key) throw new Error('Judul wajib diisi.');
+  if (!key) throw new UserInputError('Judul wajib diisi.');
   const exists = store.items.find((item) => titleKey(item.title) === key && item.id !== ignoreId);
-  if (exists) throw new Error(`Judul "${title}" sudah ada (#${exists.id}).`);
+  if (exists) throw new UserInputError(`Judul "${title}" sudah ada (#${exists.id}).`);
 }
 
 export async function addNamedItem(file, title, payload) {
@@ -59,7 +60,7 @@ export async function addNamedItem(file, title, payload) {
 export async function deleteNamedItem(file, query, label = 'Item') {
   const store = await readCollection(file);
   const item = findByIdOrTitle(store, query);
-  if (!item) throw new Error(`${label} "${query}" tidak ditemukan.`);
+  if (!item) throw new UserInputError(`${label} "${query}" tidak ditemukan.`);
   store.items = store.items.filter((candidate) => candidate.id !== item.id);
   renumberCollection(store);
   await writeCollection(file, store);
@@ -69,7 +70,7 @@ export async function deleteNamedItem(file, query, label = 'Item') {
 export async function renameNamedItem(file, query, newTitle, label = 'Item') {
   const store = await readCollection(file);
   const item = findByIdOrTitle(store, query);
-  if (!item) throw new Error(`${label} "${query}" tidak ditemukan.`);
+  if (!item) throw new UserInputError(`${label} "${query}" tidak ditemukan.`);
   assertUniqueTitle(store, newTitle, item.id);
   item.title = String(newTitle).trim();
   item.updatedAt = new Date().toISOString();

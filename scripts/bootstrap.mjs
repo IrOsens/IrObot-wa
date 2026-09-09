@@ -156,6 +156,7 @@ async function maybeInstallSystemTools() {
   if (!withTools) return;
   log('Menjalankan installer tool sistem opsional...');
   await run('node', ['scripts/install-system-tools.mjs']);
+  await run('node', ['scripts/install-arial.mjs']);
 }
 
 async function maybeInstallSystemdService() {
@@ -185,6 +186,26 @@ async function maybeInstallSystemdService() {
   await run('node', ['scripts/install-systemd.mjs', 'install']);
 }
 
+async function setupLocalRoot() {
+  if (prepareOnly) return;
+  const config = JSON.parse(await fs.readFile(CONFIG_FILE, 'utf8'));
+  const flag = [...args].find((arg) => arg.startsWith('--storage-root='));
+  if (config.storage?.root && !flag) return;
+  let root = flag?.slice('--storage-root='.length) || '';
+  if (!root && process.stdin.isTTY && !process.env.CI) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try { root = (await rl.question('Root penyimpanan lokal opsional (Enter untuk tetap memakai grup): ')).trim(); }
+    finally { rl.close(); }
+  }
+  if (!root) return;
+  if (!path.isAbsolute(root)) throw new Error('Root penyimpanan harus path absolut.');
+  await fs.mkdir(root, { recursive: true });
+  await fs.access(root, fs.constants.W_OK);
+  config.storage = { ...config.storage, root: path.resolve(root), features: config.storage?.features || {} };
+  await fs.writeFile(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`);
+  log('Root lokal disimpan; tujuan aktif fitur tetap memakai konfigurasi sebelumnya.');
+}
+
 async function main() {
   checkNodeVersion();
   await installNodeDependencies();
@@ -201,6 +222,7 @@ async function main() {
   const createdLinks = await ensureJsonFile(LINKS_FILE, { nextId: 1, items: [] });
   const createdReminders = await ensureJsonFile(REMINDERS_FILE, { nextId: 1, items: [] });
   const createdWol = await ensureJsonFile(WOL_FILE, { nextId: 1, items: [] });
+  await setupLocalRoot();
   await maybeInstallSystemTools();
   await maybeInstallSystemdService();
 

@@ -7,6 +7,7 @@ export class ReactionActionStore {
   constructor({ ttlMs = 60 * 1000 } = {}) {
     this.ttlMs = ttlMs;
     this.actions = new Map();
+    this.prompts = new Set();
   }
 
   register(messageKey, action) {
@@ -20,8 +21,11 @@ export class ReactionActionStore {
       expiresAt: Date.now() + (action.ttlMs || this.ttlMs)
     };
     this.actions.set(key, item);
+    this.prompts.add(key);
     return item;
   }
+
+  isPrompt(messageKey) { return this.prompts.has(reactionTargetKey(messageKey)); }
 
   get(messageKey, actorJid) {
     this.cleanupExpired();

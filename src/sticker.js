@@ -1,3 +1,4 @@
+import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -55,7 +56,7 @@ const ANIMATED_STICKER_FALLBACKS = [
   { canvas: 320, quality: 52, fps: 8, durationSeconds: 4 }
 ];
 
-function buildStickerExif(author, title) {
+export function buildStickerExif(author, title) {
   const json = Buffer.from(JSON.stringify({
     'sticker-pack-id': 'com.iro.wabot',
     'sticker-pack-name': title,
@@ -181,7 +182,7 @@ function stickerPresets(animated, requestedQuality) {
 function normalizeStickerQuality(value) {
   const quality = Number(value);
   if (!Number.isInteger(quality) || quality < 1 || quality > 100) {
-    throw new Error('Kualitas sticker harus angka 1-100.');
+    throw new UserInputError('Kualitas sticker harus angka 1-100.');
   }
   return quality;
 }
@@ -196,7 +197,7 @@ export function parseSmemeArgs(args) {
   const [positionRaw, ...rest] = args;
   const position = String(positionRaw || '').toLowerCase();
   if (!['up', 'down'].includes(position)) {
-    throw new Error('Format: ,smeme up/down <teks> [1-99]');
+    throw new UserInputError('Format: ,smeme up/down <teks> [1-99]');
   }
 
   const tail = [...rest];
@@ -205,12 +206,12 @@ export function parseSmemeArgs(args) {
   if (/^\d+$/.test(maybeQuality || '')) {
     quality = Number(tail.pop());
     if (!Number.isInteger(quality) || quality < 1 || quality > 99) {
-      throw new Error('Kualitas smeme harus angka 1-99.');
+      throw new UserInputError('Kualitas smeme harus angka 1-99.');
     }
   }
 
   const text = tail.join(' ').trim();
-  if (!text) throw new Error('Teks smeme wajib diisi.');
+  if (!text) throw new UserInputError('Teks smeme wajib diisi.');
   return {
     position,
     text,
@@ -283,7 +284,7 @@ async function makeAnimatedSmemeSticker(media, { author, title, tools, smeme }) 
     const entries = (await fs.readdir(tempDir))
       .filter((name) => /^frame-\d+\.png$/.test(name))
       .sort();
-    if (!entries.length) throw new Error('Frame smeme bergerak tidak ditemukan.');
+    if (!entries.length) throw new UserInputError('Frame smeme bergerak tidak ditemukan.');
 
     for (const name of entries) {
       const source = path.join(tempDir, name);
@@ -887,7 +888,7 @@ export function parseStickerArgs(input, options = {}) {
   let quality = 100;
   if (qualityTokens.length) {
     const value = qualityTokens[0].trim().slice(2);
-    if (!/^\d+$/.test(value)) throw new Error('Kualitas sticker harus memakai format q=1-100.');
+    if (!/^\d+$/.test(value)) throw new UserInputError('Kualitas sticker harus memakai format q=1-100.');
     quality = normalizeStickerQuality(value);
   }
 

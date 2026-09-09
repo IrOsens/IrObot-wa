@@ -7,7 +7,7 @@ Bot WhatsApp pribadi berbasis Baileys. Login memakai QR di terminal, command mem
 - Cocok dipindah ke Linux atau Windows lain.
 - Data runtime berada di `data/`, credential di `.env` dan `auth/`.
 - Tool sistem opsional dipakai untuk fitur media dan PDF.
-- Backup `data/` dikirim ke destination WhatsApp `backup`.
+- Backup `data/` default dikirim ke destination WhatsApp `backup`; opsi lokal tersedia melalui `,setup backup`.
 
 ## Persiapan
 
@@ -133,7 +133,7 @@ systemctl --user disable --now irobot-wa
 
 ## Command
 
-- Media: `,s`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,toimg`
+- Media: `,s`, `,stext`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,toimg`
 - Reminder/task: `,task list|add|loop|repeat|record|pause|stop|resume|del`, `,remindme <teks> <durasi>`
 - Save: `,save`, `,save update`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load rename <id|judul> <judul-baru>`
 - Note/link: `,note list|add|get|del|rename`, `,link list|add|get|del|rename`
@@ -224,14 +224,14 @@ Reminder:
 
 - `,remindme minum 10m`
 - Durasi mendukung `10s`, `5m`, `2h`, `1d`, dan `1h30m`.
-- Reminder dikirim ke grup target `IrOBot`.
+- Reminder dikirim ke grup target `IrOBot`. `,remindme <durasi>` membuka listening untuk merekam isi reminder.
 - Task: `,task add "backup server" at 23:00`, `,task loop "cek koneksi" at 08:00`, `,task repeat 3 "ingatkan minum" at 21:00`, `,task record 08123431212 at 21:00`, `,task record Tim Produksi at 21:00`, `,task record Grup TA at 21:00`, `,task record loop 08123431212 at 08:00`, `,task pause 2`/`,task stop 2`, `,task resume 2`, `,task del 2`.
 - `,task record` membuka sesi rekam untuk nomor, nama kontak, atau nama grup tujuan (tanpa tanda petik; nama yang sama/ambigu akan ditolak): kirim teks, gambar, video, dokumen, audio, sticker, lokasi, kontak, poll, atau event; ketik `,end` untuk menjadwalkan. Batalkan dengan `,cancel` atau reaction ❌/👎/❎ pada prompt sesi.
 - Legacy `,ltask`, `,ltask true|false|del <id>` tetap didukung.
 
 Backup/restore:
 
-- `,backup` membuat zip folder `data/` dan mengirimnya ke destination WhatsApp `dest.backup`.
+- `,backup` membuat zip folder `data/` dan menyimpannya ke tujuan backup aktif (default WhatsApp `dest.backup`).
 - Backup otomatis berjalan setiap `00:00` WIB secara default dengan mekanisme yang sama seperti `,backup`.
 - Jika zip terlalu besar, bot mengirim part seperti `PART1-2026-05-15-18_12_49.zip`.
 - Tujuan backup bisa group atau nomor: `,config set dest.backup <nama-grup|jid|nomor>`.
@@ -244,7 +244,7 @@ Konfirmasi:
 - Aksi hapus, `,clear`, final `,restore`, `,update`, `,restartbot`, dan perubahan admin wajib dikonfirmasi dengan `,confirm`.
 - Ketik `,cancel` untuk membatalkan konfirmasi pending atau sesi aktif.
 - Konfirmasi dan prompt session juga menerima reaction `👍`, `❤️`, `✅` untuk lanjut/end/confirm dan `❌`, `👎`, `❎` untuk cancel.
-- Reaction hanya diterima dari user yang memicu command, dan kedaluwarsa setelah 1 menit.
+- Reaction hanya diterima dari user yang memicu command. Konfirmasi/item daftar kedaluwarsa setelah 1 menit; prompt listening mengikuti masa aktif sesi.
 - List seperti `,load`, `,note`, `,link`, `,task list`, `,wol`, `,admin list`, dan `,anticall except list` dikirim per item. React `❌`, `👎`, atau `❎` pada item untuk memulai konfirmasi hapus.
 - Legacy `,ltask` dan `,won` tetap didukung.
 
@@ -253,8 +253,8 @@ Changed message, logs, dan status:
 - Default destination: grup/target `logs`, `changedmsg`, dan `saved`. Bisa diganti ke grup atau nomor lewat `,config set dest.logs|dest.changedmsg|dest.saved <target>`.
 - `,changedmsg list|allow|del <id|nama-grup|jid>` mengatur grup yang dipantau untuk pesan terhapus/diedit. Direct message dipantau default.
 - Pesan dari chat terpantau dimirror ke `logs`; saat pesan dihapus atau diedit, laporan dikirim ke `changedmsg`.
-- Index changedmsg hanya menyimpan metadata/text kecil, bukan media bytes. Media diamankan lewat salinan WhatsApp di `logs`.
-- `,statussave list|add|del <nomor|id>` menyimpan status WhatsApp dari nomor tertentu ke `saved`.
+- Index changedmsg menyimpan metadata/text dan referensi arsip. Media diamankan di tujuan `logs` aktif, berupa salinan WhatsApp atau file lokal.
+- `,statussave list|add|del <nomor|id>` mengatur nomor auto-save status. Tujuan aktif dipilih melalui `,setup statussave`; default instalasi adalah grup `saved`.
 - `,config` menampilkan key aman yang bisa diubah; `,config get <key>` dan `,config set <key> <value>` untuk membaca/mengubah.
 
 Utility tambahan:
@@ -290,3 +290,112 @@ Bot tetap bisa start tanpa tool tersebut. Command yang membutuhkan tool hilang a
 6. Scan QR bila folder `auth/` tidak ikut dipindah.
 
 Jangan upload `auth/`, `.env`, `logs/`, `temp/`, atau file runtime `data/*.json` pribadi ke GitHub.
+
+## Setup tujuan grup / server
+
+`,setup` menampilkan tujuan aktif. Owner dapat memilih **satu tujuan per fitur**:
+
+```text
+,setup root /home/iro/hdd35/services/Irobot-wa
+,setup statussave local
+,setup statussave group saved
+,setup backup local /mnt/backup/irobot
+,setup logs local
+,setup changedmsg local
+,setup errors group <JID-grup-errormsg>
+```
+
+Pilihan lokal tersedia untuk `statussave`, `backup`, `logs`, dan `changedmsg`. Tanpa path, folder diturunkan dari root + nama fitur. Instalasi baru dan konfigurasi lama tetap memakai grup sampai tujuan lokal dipilih. `dest.saved` tetap menjadi alias tujuan grup statussave; mengubahnya lewat `,config set` juga mengaktifkan mode grup. Mode lokal tidak otomatis kembali ke grup saat gagal. Arsip lama tidak dipindah/dihapus ketika tujuan diganti.
+
+Setup terminal menanyakan root lokal secara opsional. Untuk non-interaktif gunakan `npm run setup -- --storage-root=/path/server`. Folder dibuat dan akses tulis diperiksa sebelum tujuan baru disimpan. Tujuan backup lokal harus di luar `data/` supaya backup tidak memasukkan arsipnya sendiri.
+
+Untuk server yang menjalankan bot sebagai root, aktivasi status lokal dan restart service dapat dilakukan dari direktori proyek:
+
+```bash
+sudo /home/iro/.local/bin/node scripts/activate-storage.mjs /home/iro/hdd35/services/Irobot-wa
+```
+
+Perintah ini membuat backup konfigurasi, membuat folder `statussave`, mengaktifkan mode lokal statussave, dan restart service yang dikonfigurasi. Tujuan fitur lain dipertahankan.
+
+Arsip status: `<path>/<nama-kontak-atau-nomor>/YYYY-MM-DD/`. Tanggal dan nama waktu menggunakan WIB. Nama kontak tersimpan diprioritaskan, nama sama diberi nomor pembeda, dan folder kontak tidak berubah ketika kontak berganti nama. Teks disimpan sebagai TXT dan metadata sebagai JSON; media disimpan dengan format aslinya. Logs lokal memakai struktur chat/tanggal; laporan changedmsg menyertakan referensi arsip sumber. Backup lokal menghasilkan ZIP atau part ZIP seperti mode grup.
+
+## Statussave: otomatis simpan, tampilkan lewat WhatsApp
+
+Alur utama: **tambahkan nomor sekali → status baru otomatis tersimpan → lihat isinya melalui `list <nomor>`**.
+
+```text
+,statussave
+,statussave add 08123456789
+,statussave list
+,statussave list 08123456789
+,statussave show 08123456789
+,statussave on
+,statussave off
+,statussave setup
+```
+
+- `,statussave` menampilkan ringkasan auto-save, tujuan, dan cara penggunaan. `list` tanpa nomor menampilkan nomor yang dipantau; `list <nomor>` / `show <nomor>` mengirim **seluruh isi status aktif** kontak tersebut ke chat command.
+- `add` cukup sekali. Nomor yang sudah terdaftar mendapat konfirmasi bahwa pemantauan sudah ada. Status aktif yang sudah diterima dan status baru berikutnya disimpan otomatis selama fitur aktif; tidak perlu `dump` manual.
+- `off` menghentikan arsip otomatis, sementara cache dan fungsi melihat status tetap tersedia selama bot aktif. `on` memproses kembali status aktif dari watchlist yang belum tersimpan. Tujuan arsip tetap memakai konfigurasi grup/lokal yang dipilih.
+- Status ditampilkan dari paling lama ke terbaru. Gambar/video menyertakan caption asli; teks dikirim sebagai teks, dan caption audio/tipe lain dikirim sebagai pesan pendamping jika tersedia.
+- Menampilkan status tidak mengubah tujuan arsip atau penanda sudah tersimpan. Kamu bisa meminta tampilan berulang kali. Media lokal yang cocok dipakai kembali, atau diunduh jika belum tersedia. Status lama/kedaluwarsa tidak ikut ditampilkan.
+- Jika satu status gagal, bot melanjutkan status lainnya dan menampilkan jumlah berhasil/gagal. Error teknis tetap menuju grup error.
+- Auto-save mencocokkan nomor dan identitas LID/PN Baileys. Metadata aktif disimpan di `data/status-inbox.json`, bertahan setelah restart, dan dibersihkan setelah status kedaluwarsa/terhapus. Arsip permanen tidak ikut dihapus.
+- Bot hanya dapat menampilkan status yang diterimanya. Status terlihat di ponsel belum tentu sudah diterima sesi Baileys.
+
+Command lanjutan tetap tersedia:
+
+```text
+,statussave active [kontak] [page=2]
+,statussave dump <id-status>
+,statussave dump all <kontak>
+,statussave del <nomor|id>
+```
+
+`active` adalah daftar metadata, maksimal 10 status per halaman. `dump` menyimpan ke tujuan arsip aktif dan melewati status yang sudah tersimpan di tujuan itu. Reply status lalu `,statussave dump` juga didukung bila payload tersedia; jika waktu publikasinya tidak tersedia, arsip mencatat waktu penerimaan. ID status berbeda dari ID watchlist. `fetchStatus` bukan API untuk mengambil koleksi story WhatsApp.
+
+## Listening dan pesan berulang
+
+Save/update, anticall, task record, dan reminder listening mendukung teks, gambar, video, dokumen, stiker, audio, **voice note asli**, lokasi native, kontak, poll, dan event yang didukung Baileys. Live location direkam sebagai posisi yang diterima, bukan pelacakan lanjutan.
+
+- Satu prompt progres diperbarui selama rekaman. Akhiri dengan `,end` atau reaksi ✅/👍/❤️ pada prompt; batalkan dengan `,cancel` atau ❌/👎/❎.
+- Hanya pembuat sesi yang bisa mengisi/mengendalikan sesi. Reaksi pada prompt berlaku selama sesi; sesi dibatalkan setelah 30 menit tanpa aktivitas.
+- Teks yang diawali command selain `,end`/`,cancel` dianggap isi saat listening rekaman. Pesan bot dan reaksi tidak ikut direkam.
+- Penggantian save/anticall mempertahankan isi sebelumnya sampai penyimpanan baru berhasil.
+
+```text
+,task record Grup Kerja every 30m count 3
+,task record 08123456789 every 2h forever
+,task record Grup Kerja every 1h count 5 at 08:00 12/09/2026
+,remindme 10m
+```
+
+Kirim isi setelah command, lalu `,end`. Tanpa `at`, pengiriman pertama dilakukan setelah interval pertama dari `,end`. `count 3` berarti seluruh rekaman dikirim tiga kali; `forever` berulang sampai dipause/dihapus. Jam/tanggal memakai WIB. `,remindme <durasi>` membuka rekaman satu kali ke tujuan reminder lama; bentuk `,remindme <teks> <durasi>` tetap didukung.
+
+`,task pause|resume|del <id>` tetap tersedia. Jadwal dan progres pengiriman tersimpan; interval yang terlewat tidak dikirim sekaligus setelah restart. Kegagalan atau hasil pengiriman ambigu mem-pause task tanpa mengurangi jumlah kiriman. Periksa penerima sebelum `resume`: item yang belum terkonfirmasi mungkin sebenarnya sudah sampai; resume akan mencoba item tersebut kembali. ID task stabil setelah penghapusan.
+
+## Reaksi hapus dan error teknis
+
+Reaksi ❌/👎/❎ **dari owner pada pesan akun sendiri** meminta hapus untuk semua orang. Prompt sesi, konfirmasi, dan item daftar tetap menjalankan fungsi reaksinya; prompt kedaluwarsa yang dikenali tidak berubah menjadi target hapus otomatis. Reaksi orang lain tidak memicu fitur ini. WhatsApp tetap menentukan apakah pesan dapat dicabut.
+
+Kesalahan format/input tetap dijelaskan di chat command. Error teknis media, jaringan, server, filesystem, scheduler, dan kegagalan revoke dicatat ke log serta antrean `data/error-outbox.json`, lalu dikirim ke grup `errormsg` dalam community `dev`. Bot memilih otomatis hanya jika hubungan community cocok dan hasilnya tunggal; jika belum bisa ditentukan, owner menerima menu setup. Tujuan dapat disimpan eksplisit dengan `,setup errors group <jid>`.
+
+Laporan menyertakan ID kejadian, waktu, sumber, dan detail diagnostik dengan rahasia disamarkan. Error identik yang masih mengantre digabung. Saat offline/tujuan belum tersedia, antrean tetap disimpan; error pengiriman laporan tidak membuat loop. Log harian tetap menjadi catatan penuh, sementara antrean notifikasi dibatasi 500 jenis error terbaru.
+
+## Help dan stiker teks
+
+`,help` menampilkan ringkasan kategori; `,help Media` menampilkan deskripsi singkat; `,help statussave` atau `,help task` menampilkan format lengkap. Command tetap disaring berdasarkan akses pengguna.
+
+```text
+,stext Halo dunia
+,stext align=center Selamat pagi
+,stext align=kiri Teks rata kiri
+,stext align=right Teks rata kanan
+,stext align=justify Teks rata kiri-kanan
+```
+
+Hasilnya stiker WebP 512×512, teks hitam Arial, panel putih bersudut membulat dengan tepi luar transparan 16 px dan jarak teks 36 px dari panel. Tampilan low quality memakai teks yang sedikit buram dan kompresi WebP; ukuran canvas tetap 512×512. Ukuran font otomatis mengikuti isi; setiap kata harus muat utuh dalam satu baris. Perpindahan baris hanya antarkata atau pada baris baru yang diketik. Contoh `anjay` tidak dipecah menjadi `anj` dan `ay`; font diperkecil jika perlu. Paragraf/baris baru dipertahankan. Default rata kiri dengan jarak huruf normal, tanpa direnggangkan untuk memenuhi lebar baris. Justify tetap tersedia jika dipilih melalui align=justify. Alias alignment: `kiri`, `kanan`, `tengah`, `kiri-kanan`. Teks yang tidak muat pada ukuran minimum 8 px harus dipendekkan, tanpa pemotongan diam-diam.
+
+Pasang Arial: `npm run setup:font` (memerlukan `cabextract` dan `fc-scan` pada Linux). Installer memakai arsip Microsoft Core Fonts dengan pemeriksaan SHA-256 dari paket Ubuntu msttcorefonts, menyimpan font dan lisensi di `data/fonts/`. Font tidak diganti diam-diam jika belum tersedia. `setup:full` juga menjalankan pemasangan font.
+
+`npm test` menjalankan tes pada direktori runtime sementara yang terisolasi, sehingga tidak menyentuh data bot aktif. Tes render Arial dijalankan jika font telah dipasang.

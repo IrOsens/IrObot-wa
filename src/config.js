@@ -57,8 +57,10 @@ export const DEFAULT_APP_CONFIG = {
     logs: 'logs',
     changedmsg: 'changedmsg',
     saved: 'saved',
-    backup: 'backup'
+    backup: 'backup',
+    errors: 'errormsg'
   },
+  storage: { root: '', features: {} },
   changedmsg: {
     enabled: true,
     indexMaxItems: 1000,

@@ -2,6 +2,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { LOG_DIR, todayKey } from './config.js';
 
+let errorSink = null;
+export function setErrorSink(sink) { errorSink = sink; }
+
 let activeDay = todayKey();
 let activeFile = path.join(LOG_DIR, `bot-${activeDay}.log`);
 
@@ -35,7 +38,9 @@ export async function cleanupOldLogs() {
 export async function log(level, message, meta) {
   try {
     await rotateIfNeeded();
+    await fs.mkdir(LOG_DIR, { recursive: true });
     await fs.appendFile(activeFile, line(level, message, meta));
+    if (errorSink && (level === 'error' || (level === 'warn' && meta?.error))) await errorSink(message, meta);
   } catch {
     // Logging must never crash the bot.
   }

@@ -1,10 +1,11 @@
+import { UserInputError } from './errors.js';
 import dgram from 'node:dgram';
 import { WOL_BROADCAST_ADDRESS, WOL_FILE, WOL_PORT } from './config.js';
 import { readCollection, renumberCollection, writeCollection } from './namedStore.js';
 
 export function normalizeMac(input) {
   const hex = String(input || '').replace(/[^a-fA-F0-9]/g, '').toUpperCase();
-  if (hex.length !== 12) throw new Error('MAC address tidak valid. Contoh: AA:BB:CC:DD:EE:FF');
+  if (hex.length !== 12) throw new UserInputError('MAC address tidak valid. Contoh: AA:BB:CC:DD:EE:FF');
   return hex.match(/.{2}/g).join(':');
 }
 
@@ -43,7 +44,7 @@ export async function handleWolCommand(command) {
     const mac = normalizeMac(command.args[1]);
     const store = await readCollection(WOL_FILE);
     const exists = store.items.find((item) => item.mac === mac);
-    if (exists) throw new Error(`MAC ${mac} sudah tersimpan sebagai #${exists.id}.`);
+    if (exists) throw new UserInputError(`MAC ${mac} sudah tersimpan sebagai #${exists.id}.`);
     const item = {
       id: store.nextId++,
       title: mac,
@@ -60,7 +61,7 @@ export async function handleWolCommand(command) {
     if (!query) throw new Error(wolFormat());
     const store = await readCollection(WOL_FILE);
     const item = findWol(store.items, query);
-    if (!item) throw new Error(`WOL "${query}" tidak ditemukan.`);
+    if (!item) throw new UserInputError(`WOL "${query}" tidak ditemukan.`);
     store.items = store.items.filter((candidate) => candidate.id !== item.id);
     renumberCollection(store);
     await writeCollection(WOL_FILE, store);

@@ -1,3 +1,4 @@
+import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DATA_DIR, RESTORE_SESSION_TIMEOUT_MS, TEMP_DIR } from './config.js';
@@ -79,7 +80,7 @@ export class RestoreSessions {
   }
 
   async restore(session) {
-    if (!session?.files?.length) throw new Error('Belum ada file zip untuk restore.');
+    if (!session?.files?.length) throw new UserInputError('Belum ada file zip untuk restore.');
     const ordered = orderRestoreParts(session.files);
     const zipBuffer = Buffer.concat(await Promise.all(ordered.map((file) => fs.readFile(file.path))));
     const extractDir = await fs.mkdtemp(path.join(TEMP_DIR, 'restore-extract-'));
