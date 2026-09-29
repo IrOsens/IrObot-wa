@@ -6,6 +6,7 @@ import { PDFDocument } from 'pdf-lib';
 import { PDF_DEFAULT_FILE_NAME, PDF_SESSION_TIMEOUT_MS, makeTempPath } from './config.js';
 import { cleanupFiles, downloadAnyMessageMedia, downloadMessageMedia, isImageFile, isOfficeFile, isPdfFile } from './media.js';
 import { formatBytes, runTool } from './tools.js';
+import { renderPdfPage } from './pdfImages.js';
 
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000;
 const PDF_SIZE_RE = /^(.*?),\s*(\d+(?:\.\d+)?)\s*([kmgt]?b)$/i;
@@ -33,6 +34,7 @@ export class PdfSessions {
       actorJid: opts.actorJid || jid,
       fileName: normalizePdfFileName(opts.fileName),
       maxSizeBytes: Number.isInteger(opts.maxSizeBytes) && opts.maxSizeBytes > 0 ? opts.maxSizeBytes : null,
+      targetSizeBytes: validateTargetSize(opts.targetSizeBytes),
       split: opts.split === true,
       files: [],
       nextOrder: 1,
@@ -42,6 +44,10 @@ export class PdfSessions {
         this.cleanup(expired).catch(() => {});
       }, PDF_SESSION_TIMEOUT_MS)
     };
+    if (session.maxSizeBytes && session.targetSizeBytes) {
+      clearTimeout(session.timer);
+      throw new UserInputError('--max-size dan --target-size tidak boleh digabung.');
+    }
     this.sessions.set(jid, session);
     return session;
   }
@@ -130,7 +136,8 @@ export class PdfSessions {
 
   async build(session) {
     if (!session?.files?.length) throw new UserInputError('Belum ada file untuk dibuat PDF.');
-    if (session.maxSizeBytes) return this.buildWithinSize(session);
+    session.rasterized = false;
+    if (session.maxSizeBytes || session.targetSizeBytes) return this.buildWithinSize(session);
     return this.buildPdfBuffer(session);
   }
 
@@ -140,9 +147,10 @@ export class PdfSessions {
     const files = [];
     for (const [index, item] of ordered.entries()) {
       const singleSession = { ...session, files: [item], maxSizeBytes: session.maxSizeBytes };
-      const buffer = session.maxSizeBytes ? await this.buildWithinSize(singleSession) : await this.buildPdfBuffer(singleSession);
+      const buffer = await this.build(singleSession);
       files.push({
         buffer,
+        rasterized: singleSession.rasterized,
         fileName: splitPdfFileName(session.fileName, item, index + 1)
       });
     }
@@ -150,21 +158,58 @@ export class PdfSessions {
   }
 
   async buildWithinSize(session) {
+    const limit = session.targetSizeBytes || session.maxSizeBytes;
+    const finish = (buffer) => session.targetSizeBytes ? padPdfToSize(buffer, limit) : buffer;
     const normal = await this.buildPdfBuffer(session);
-    if (normal.length <= session.maxSizeBytes) return normal;
-
-    const ordered = orderedSessionFiles(session);
-    if (ordered.some((item) => !isImageFile(item.path, item.mimetype))) {
-      throw new Error(`PDF ${formatBytes(normal.length)} melebihi batas ${formatBytes(session.maxSizeBytes)}. Kompres otomatis hanya mendukung sesi yang berisi gambar.`);
-    }
+    if (normal.length <= limit) return finish(normal);
 
     let smallest = normal;
-    for (const imageOptions of IMAGE_COMPRESSION_ATTEMPTS) {
-      const compressed = await this.buildPdfBuffer(session, { imageOptions });
-      if (compressed.length < smallest.length) smallest = compressed;
-      if (compressed.length <= session.maxSizeBytes) return compressed;
+    const imagesOnly = orderedSessionFiles(session).every((item) => isImageFile(item.path, item.mimetype));
+    if (imagesOnly) {
+      for (const imageOptions of IMAGE_COMPRESSION_ATTEMPTS) {
+        const compressed = await this.buildPdfBuffer(session, { imageOptions });
+        if (compressed.length < smallest.length) smallest = compressed;
+        if (compressed.length <= limit) return finish(compressed);
+      }
+    } else {
+      const pdfPath = makeTempPath('resize-source', '.pdf');
+      try {
+        await fs.writeFile(pdfPath, normal);
+        const source = await PDFDocument.load(normal);
+        for (const imageOptions of IMAGE_COMPRESSION_ATTEMPTS) {
+          const result = await PDFDocument.create();
+          for (let index = 0; index < source.getPageCount(); index += 1) {
+            const page = source.getPage(index);
+            const box = page.getCropBox();
+            const rotated = Math.abs(page.getRotation().angle % 180) === 90;
+            const width = rotated ? box.height : box.width;
+            const height = rotated ? box.width : box.height;
+            const rendered = await renderPdfPage(pdfPath, index, this.tools, {
+              density: Math.min(160, imageOptions.maxDimension * 72 / Math.max(width, height))
+            });
+            try {
+              const jpeg = await sharp(rendered.path).rotate()
+                .resize({ width: imageOptions.maxDimension, height: imageOptions.maxDimension, fit: 'inside', withoutEnlargement: true })
+                .flatten({ background: '#ffffff' })
+                .jpeg({ quality: imageOptions.quality, mozjpeg: true }).toBuffer();
+              const image = await result.embedJpg(jpeg);
+              result.addPage([width, height]).drawImage(image, { x: 0, y: 0, width, height });
+            } finally {
+              await fs.rm(rendered.directory, { recursive: true, force: true });
+            }
+          }
+          const compressed = Buffer.from(await result.save());
+          if (compressed.length < smallest.length) smallest = compressed;
+          if (compressed.length <= limit) {
+            session.rasterized = true;
+            return finish(compressed);
+          }
+        }
+      } finally {
+        await cleanupFiles([pdfPath]);
+      }
     }
-    throw new Error(`PDF masih ${formatBytes(smallest.length)} setelah kompres, melebihi batas ${formatBytes(session.maxSizeBytes)}.`);
+    throw new UserInputError(`PDF terkecil ${formatBytes(smallest.length)}, belum memenuhi ${session.targetSizeBytes ? 'target' : 'batas'} ${formatBytes(limit)}. Coba ukuran lebih besar.`);
   }
 
   async buildPdfBuffer(session, options = {}) {
@@ -236,6 +281,7 @@ export function defaultPdfBaseName(date = new Date(), botName = PDF_DEFAULT_FILE
 export function parsePdfStartArgs(rawArgs) {
   const raw = String(rawArgs || '').trim();
   if (!raw) return { fileName: '', maxSizeBytes: null, split: false };
+  if (/(?:^|\s)--[^\s]*/.test(raw.replace(/"[^"]*"|'[^']*'/g, ''))) return parsePdfFlags(raw);
   const split = /^split(?:\s+|$)/i.test(raw);
   let body = split ? raw.replace(/^split\s*/i, '').trim() : raw;
   let maxSizeBytes = null;
@@ -267,7 +313,64 @@ export function parsePdfSizeLimit(input) {
     gb: 1024 * 1024 * 1024,
     tb: 1024 * 1024 * 1024 * 1024
   };
-  return Math.floor(value * multipliers[unit]);
+  const bytes = Math.floor(value * multipliers[unit]);
+  if (!Number.isSafeInteger(bytes) || bytes < 1) throw new UserInputError('Ukuran PDF harus minimal 1 byte dan berupa angka yang aman.');
+  return bytes;
+}
+
+function validateTargetSize(value) {
+  if (value == null) return null;
+  if (!Number.isSafeInteger(value) || value < 1 || value > 100 * 1024 * 1024) {
+    throw new UserInputError('--target-size harus antara 1B dan 100MB.');
+  }
+  return value;
+}
+
+function parsePdfFlags(raw) {
+  const tokens = [];
+  const pattern = /\s*(?:"([^"]*)"|'([^']*)'|([^\s"']+))/gy;
+  let offset = 0;
+  while (offset < raw.length) {
+    pattern.lastIndex = offset;
+    const match = pattern.exec(raw);
+    if (!match) throw new UserInputError('Parameter PDF tidak valid. Contoh: ,topdf --name "laporan" --max-size 1MB');
+    tokens.push({ value: match[1] ?? match[2] ?? match[3], quoted: match[3] === undefined });
+    offset = pattern.lastIndex;
+    if (offset < raw.length && !/\s/.test(raw[offset])) throw new UserInputError('Pisahkan parameter PDF dengan spasi.');
+  }
+  const result = { fileName: '', maxSizeBytes: null, targetSizeBytes: null, split: false };
+  const seen = new Set();
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    const flag = token.value.toLowerCase();
+    if (token.quoted || !['--name', '--split', '--max-size', '--target-size'].includes(flag)) {
+      throw new UserInputError(`Parameter PDF tidak dikenal: ${token.value}. Contoh: ,topdf --name "laporan" --max-size 1MB`);
+    }
+    if (seen.has(flag)) throw new UserInputError(`Parameter ${flag} tidak boleh diulang.`);
+    seen.add(flag);
+    if (flag === '--split') { result.split = true; continue; }
+    const value = tokens[++index];
+    if (!value || (!value.quoted && value.value.startsWith('--')) || !value.value.trim()) {
+      throw new UserInputError(`Nilai ${flag} wajib diisi. Contoh: ,topdf --name "laporan" --max-size 1MB`);
+    }
+    if (flag === '--name') result.fileName = value.value;
+    else if (flag === '--max-size') result.maxSizeBytes = parsePdfSizeLimit(value.value);
+    else result.targetSizeBytes = validateTargetSize(parsePdfSizeLimit(value.value));
+  }
+  if (result.maxSizeBytes && result.targetSizeBytes) throw new UserInputError('--max-size dan --target-size tidak boleh digabung.');
+  return result;
+}
+
+export async function padPdfToSize(buffer, target) {
+  validateTargetSize(target);
+  if (buffer.length > target) throw new UserInputError('PDF masih melebihi target ukuran.');
+  const marker = buffer.lastIndexOf(Buffer.from('startxref'));
+  if (marker < 0) throw new UserInputError('Struktur PDF tidak valid untuk pengaturan ukuran.');
+  const output = Buffer.concat([buffer.subarray(0, marker), Buffer.alloc(target - buffer.length, 32), buffer.subarray(marker)]);
+  const original = await PDFDocument.load(buffer);
+  const verified = await PDFDocument.load(output);
+  if (output.length !== target || verified.getPageCount() !== original.getPageCount()) throw new Error('Verifikasi target ukuran PDF gagal.');
+  return output;
 }
 
 export function parsePdfOrderText(text) {
@@ -355,6 +458,8 @@ async function imageToPdf(imagePath, options = {}) {
 }
 
 async function compressedImageToPdf(input, options = {}) {
+  const original = await sharp(input).metadata();
+  const swap = [5, 6, 7, 8].includes(original.orientation);
   let pipeline = sharp(input).rotate();
   if (options.maxDimension) {
     pipeline = pipeline.resize({
@@ -371,8 +476,8 @@ async function compressedImageToPdf(input, options = {}) {
   const metadata = await sharp(jpeg).metadata();
   const pdf = await PDFDocument.create();
   const image = await pdf.embedJpg(jpeg);
-  const width = metadata.width || 595;
-  const height = metadata.height || 842;
+  const width = (swap ? original.height : original.width) || metadata.width || 595;
+  const height = (swap ? original.width : original.height) || metadata.height || 842;
   const page = pdf.addPage([width, height]);
   page.drawImage(image, { x: 0, y: 0, width, height });
   return Buffer.from(await pdf.save());

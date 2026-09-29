@@ -92,3 +92,33 @@ async function renderPdfWithMagick(pdfPath, command, maxPages) {
     mimetype: 'image/png'
   }));
 }
+
+// Render exactly one page, with a private directory so failed tools cannot leak files.
+export async function renderPdfPage(pdfPath, pageIndex, tools = {}, options = {}) {
+  const dir = makeTempPath('pdf-resize-page', '');
+  await fs.mkdir(dir, { recursive: true });
+  const out = path.join(dir, 'page.png');
+  const density = options.density || 160;
+  const failures = [];
+  const attempts = [
+    () => sharp(pdfPath, { page: pageIndex, density }).png().toFile(out),
+    ...(tools.pdftoppm ? [() => runTool(tools.pdftoppm, [
+      '-png', '-singlefile', '-cropbox', '-r', String(density), '-f', String(pageIndex + 1), '-l', String(pageIndex + 1), pdfPath, path.join(dir, 'page')
+    ], { timeout: 120000 })] : []),
+    ...(tools.magick ? [() => runTool(tools.magick, [
+      '-density', String(density), '-define', 'pdf:use-cropbox=true', `${pdfPath}[${pageIndex}]`, out
+    ], { timeout: 120000 })] : [])
+  ];
+  for (const attempt of attempts) {
+    try {
+      await attempt();
+      await fs.access(out);
+      return { path: out, directory: dir };
+    } catch (error) {
+      failures.push(error.message);
+      await fs.rm(out, { force: true });
+    }
+  }
+  await fs.rm(dir, { recursive: true, force: true });
+  throw new Error(`Halaman PDF ${pageIndex + 1} gagal dirender. Kompresi PDF membutuhkan Sharp dengan dukungan PDF, Poppler pdftoppm, atau ImageMagick magick. ${failures.join(' | ')}`);
+}

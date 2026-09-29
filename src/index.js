@@ -455,7 +455,7 @@ const HELP_DETAILS = {
   qr: ['Format langsung: ,qr [style=square|dot|rounded] [bg=warna|#RRGGBB] <pesan>', 'Format sesi: ,qr [style=square|dot|rounded] [bg=warna|#RRGGBB], lalu kirim pesan terpisah dan akhiri dengan ,end.', 'Background: white, black, red, blue, green, yellow, purple, orange. Default style=square dan bg=white.', 'Lampirkan gambar/GIF pada pesan untuk menjadikannya ikon tengah QR. Caption tetap menjadi isi QR.'],
   status: ['Format: ,status atau ,status bot', ',status menampilkan server ringkas. ,status bot menampilkan destination, scheduler, changedmsg, statussave, dan warning nama grup duplikat.'],
   serverinfo: ['Format: ,serverinfo', 'Menampilkan spesifikasi server lengkap: OS, CPU, RAM, disk, network, Node.js, dan proses bot.'],
-  topdf: ['Format: ,topdf', 'Format: ,topdf <nama>', 'Format: ,topdf split <nama>', 'Format: ,topdf <nama> max <size>', 'Format: ,topdf split <nama> max <size>', 'Legacy: ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
+  topdf: ['Format: ,topdf [--name "nama"] [--split] [--max-size 1MB | --target-size 2MB]', '--max-size: batas maksimum; --target-size: ukuran tepat, maksimal 100MB.', 'Target tepat dapat menambahkan padding tanpa meningkatkan kualitas. Kompresi PDF dapat mengubah teks menjadi gambar.', 'Nama berspasi wajib dikutip dalam mode flag. Jangan campur flag dengan format lama.', 'Legacy: ,topdf nama max 1MB, ,topdf split nama, dan ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
   toimg: ['Format: ,toimg', 'Reply/kirim dokumen PDF, lalu bot mengirim tiap halaman sebagai gambar.'],
   note: ['Format: ,note list', 'Format: ,note add <judul> <teks>', 'Format: ,note get <id|judul>', 'Format: ,note del <id|judul>', 'Format: ,note rename <id|judul> <judul-baru>', 'Legacy: ,note <judul> <teks> dan ,note change tetap didukung.'],
   link: ['Format: ,link list', 'Format: ,link add <nama> <https://link>', 'Format: ,link get <id|nama>', 'Format: ,link del <id|nama>', 'Format: ,link rename <id|nama> <nama-baru>', 'Legacy: ,link <nama> <url> dan ,link change tetap didukung.'],
@@ -1833,6 +1833,8 @@ function formatPdfProgressMessage(session) {
   const lines = [
     `Sesi PDF "${session.fileName}" ${session.split ? '(split)' : ''}`.trim()
   ];
+  if (session.targetSizeBytes) lines.push(`Target ukuran tepat: ${formatBytes(session.targetSizeBytes)} (${session.targetSizeBytes} byte). Padding tidak meningkatkan kualitas.`);
+  if (session.maxSizeBytes || session.targetSizeBytes) lines.push('Jika perlu, kompresi PDF mengubah halaman menjadi gambar; teks tidak lagi bisa diseleksi.');
   if (session.maxSizeBytes) lines.push(`Maksimal ukuran: ${formatBytes(session.maxSizeBytes)}.`);
   if (session.split) lines.push('Mode split: setiap media akan dibuat menjadi PDF terpisah.');
   if (session.latestItem) {
@@ -1874,6 +1876,7 @@ async function handleEndPdfByJid(jid, actorJid) {
       for (const file of pdfs) {
         await sendBotMessage(jid, {
           document: file.buffer,
+          ...(file.rasterized ? { caption: 'PDF dikompres menjadi gambar; teks tidak lagi bisa diseleksi.' } : {}),
           mimetype: 'application/pdf',
           fileName: file.fileName
         });
@@ -1882,6 +1885,7 @@ async function handleEndPdfByJid(jid, actorJid) {
       const pdf = await state.pdfSessions.build(session);
       await sendBotMessage(jid, {
         document: pdf,
+        ...(session.rasterized ? { caption: 'PDF dikompres menjadi gambar; teks tidak lagi bisa diseleksi.' } : {}),
         mimetype: 'application/pdf',
         fileName: session.fileName || `${PDF_DEFAULT_FILE_NAME}-${Date.now()}.pdf`
       });

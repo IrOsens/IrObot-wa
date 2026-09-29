@@ -188,14 +188,20 @@ PDF:
 - Ketik `,topdf` atau `,topdf laporan`.
 - Ketik `,topdf split laporan` untuk membuat setiap media dalam sesi menjadi PDF terpisah saat `,end`.
 - Jika nama kosong, nama PDF default memakai format WIB seperti `23_5_2026_115700_IrOBot.pdf`.
-- Batas ukuran opsional: `,topdf laporan max 1MB` atau `,topdf split scan max 1MB`.
+- Format utama: `,topdf --name "laporan" --max-size 1MB` untuk batas maksimum ukuran file.
+- Ukuran tepat: `,topdf --name "laporan" --target-size 2MB`; file yang terlalu besar dikompres, yang lebih kecil ditambah padding PDF valid. Padding tidak meningkatkan kualitas.
+- Split: `,topdf --split --name "scan" --max-size 500KB`; batas/target berlaku per PDF keluaran.
+- `--max-size` dan `--target-size` tidak boleh digabung. Target tepat maksimal 100MB. Satuan biner: 1KB = 1024 byte, 1MB = 1048576 byte; pecahan dibulatkan ke bawah, minimal 1 byte.
+- Nama berspasi memakai kutip dengan `--name`, termasuk nama seperti `"split max laporan"`. Opsi boleh diurutkan bebas; opsi duplikat/tidak dikenal ditolak. Jangan campur format flag dan format lama.
+- Format lama `,topdf laporan max 1MB` dan `,topdf split scan max 1MB` tetap didukung.
 - Legacy `,topdf laporan,1MB` tetap didukung.
 - Kirim/reply beberapa media atau dokumen.
 - Saat media ditambahkan, bot mengedit satu pesan progress berisi item terbaru, total saat ini, daftar file, dan instruksi `,end`/`,cancel`.
 - Caption/teks angka dipakai sebagai urutan PDF.
 - Jika nomor sudah terisi, bot memberi warning dan media tidak ditambahkan.
 - Audio, video, GIF, dan animasi dilewati dengan pesan alasan.
-- Jika batas ukuran dipasang, bot mencoba kompres gambar. Jika tetap melebihi batas, PDF tidak dikirim.
+- Pengaturan ukuran mendukung gambar, PDF yang sudah ada, dan hasil konversi Office. Jika perlu, seluruh halaman PDF dirasterisasi dengan Sharp/Poppler pdftoppm/ImageMagick magick; teks tidak lagi bisa diseleksi dan kualitas bisa turun. Jumlah, urutan, serta dimensi halaman dipertahankan.
+- Jika renderer tidak tersedia, PDF tidak dapat dibaca, atau ukuran tidak tercapai, bot memberi error dan tidak mengirim hasil yang melanggar batas/target. Dimensi kertas tidak diubah oleh parameter ukuran file.
 - Ketik `,end` untuk membuat PDF.
 
 PDF ke image:
