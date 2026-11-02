@@ -735,8 +735,10 @@ async function decodeAnimatedWebpFrames(inputPath, { maxDurationMs = 10_000 } = 
     if (remaining <= 0) break;
     const delay = Math.min(normalizeFrameDelay(frame.delay), remaining);
     const base = Buffer.from(canvas);
-    const x = Math.max(0, Number(frame.x) || 0);
-    const y = Math.max(0, Number(frame.y) || 0);
+    // ANMF stores frame offsets in two-pixel units. node-webpmux exposes the
+    // encoded values, while Sharp composites the decoded frame at x/y * 2.
+    const x = Math.max(0, (Number(frame.x) || 0) * 2);
+    const y = Math.max(0, (Number(frame.y) || 0) * 2);
     const frameWidth = Number(frame.width) || width;
     const frameHeight = Number(frame.height) || height;
     if (frame.blend === false) clearRawRect(base, width, height, x, y, frameWidth, frameHeight);
@@ -759,6 +761,14 @@ async function decodeAnimatedWebpFrames(inputPath, { maxDurationMs = 10_000 } = 
   }
 
   return { width, height, frames };
+}
+
+export async function decodeStickerFrames(inputPath) {
+  if (await isAnimatedWebpPath(inputPath)) {
+    return decodeAnimatedWebpFrames(inputPath, { maxDurationMs: Number.MAX_SAFE_INTEGER });
+  }
+  const { data, info } = await sharp(inputPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  return { width: info.width, height: info.height, frames: [{ data, delay: 1000 }] };
 }
 
 function normalizeFrameDelay(delay) {

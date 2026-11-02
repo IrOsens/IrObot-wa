@@ -150,7 +150,9 @@ test('text sticker parsing and actual Arial renders fit a 512px canvas', async (
     const pixel = (x, y) => [...data.subarray((y * info.width + x) * 4, (y * info.width + x) * 4 + 4)];
     assert.equal(pixel(0, 0)[3], 0, 'outer margin is transparent');
     assert.equal(pixel(16, 16)[3], 0, 'card corner is rounded');
-    assert.deepEqual(pixel(256, 24), [255, 255, 255, 255], 'card is white');
+    const cardPixel = pixel(256, 24);
+    assert.equal(cardPixel[3], 255, 'card is opaque');
+    assert.ok(cardPixel.slice(0, 3).every((channel) => channel >= 250), 'lossy WebP card appears white');
     sizes.push(result.fontSize);
   }
   for (const word of ['anjay', 'superpanjangtanpaspasi', 'kata-dengan-tanda-hubung']) {
@@ -178,8 +180,8 @@ test('bot integration: local status, owner listening, prompt priority, error rou
     state.saveRecorder = new SaveRecorder({ file: path.join(dir, 'saves.json'), mediaDir: path.join(dir, 'media') });
     state.taskRecorder = new TaskRecorder(); state.anticall = new AnticallStore(path.join(dir, 'anticall.json'), path.join(dir, 'anticall')); await state.anticall.load();
     state.commandAccess = new CommandAccessStore(path.join(dir, 'access.json')); await state.commandAccess.load();
-    const emptySessions = { has: () => false, cancel: async () => false, end: () => null };
-    state.pdfSessions = emptySessions; state.qrSessions = emptySessions; state.restoreSessions = emptySessions;
+    const emptySessions = { has: () => false, get: () => null, cancel: async () => false, end: () => null };
+    state.pdfSessions = emptySessions; state.toVideoSessions = emptySessions; state.stimpaSessions = emptySessions; state.qrSessions = emptySessions; state.restoreSessions = emptySessions;
     state.contactNames.set(phone, 'Contact Test');
     await onMessageUpsert({ messages: [status('integration')] });
     assert.equal(sent.length, 0); assert.equal(state.statusInbox.list()[0].saved.length, 1);

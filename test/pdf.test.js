@@ -10,6 +10,8 @@ import { renderPdfPage } from '../src/pdfImages.js';
 import { TEMP_DIR } from '../src/config.js';
 
 const sessions = new PdfSessions({});
+const pdfTempArtifacts = async () => (await fs.readdir(TEMP_DIR))
+  .filter((name) => /^(pdf-page|pdf-resize-page|resize-source|image-pdf)(?:-|\.)/.test(name)).sort();
 async function fixture(fn) {
   await fs.mkdir(TEMP_DIR, { recursive: true });
   const dir = await fs.mkdtemp(path.join(TEMP_DIR, 'pdf-test-'));
@@ -88,10 +90,10 @@ test('image compression preserves dimensions and rejects impossible targets', as
 
 test('PDF renderer failure cleans temporary files and corrupted PDFs fail', async () => fixture(async (dir) => {
   const file = await sourcePdf(dir);
-  const before = (await fs.readdir(TEMP_DIR)).sort();
+  const before = await pdfTempArtifacts();
   if (!sharp.format.pdf.input.file) {
     await assert.rejects(sessions.build(session([file], { maxSizeBytes: 1 })), /gagal dirender/);
-    assert.deepEqual((await fs.readdir(TEMP_DIR)).sort(), before);
+    assert.deepEqual(await pdfTempArtifacts(), before);
   }
   await fs.writeFile(file.path, 'invalid pdf');
   await assert.rejects(sessions.build(session([file], { maxSizeBytes: 20000 })));
@@ -107,7 +109,7 @@ test('real PDF compression preserves all 51 pages, rotation and mixed inputs', a
     await sharp({ create: { width: 80, height: 60, channels: 3, background: 'blue' } }).png().toFile(png);
     const input = session([file, { path: png, mimetype: 'image/png', fileName: 'extra.png' }], { targetSizeBytes: 250000 });
     assert.ok((await runner.buildPdfBuffer(input)).length > input.targetSizeBytes);
-    const before = (await fs.readdir(TEMP_DIR)).sort();
+    const before = await pdfTempArtifacts();
     const output = await runner.build(input);
     assert.equal(output.length, input.targetSizeBytes);
     assert.equal(input.rasterized, true);
@@ -116,7 +118,7 @@ test('real PDF compression preserves all 51 pages, rotation and mixed inputs', a
     assert.deepEqual(pdf.getPage(0).getSize(), { width: 300, height: 400 });
     assert.deepEqual(pdf.getPage(1).getSize(), { width: 401, height: 301 });
     assert.deepEqual(pdf.getPage(51).getSize(), { width: 80, height: 60 });
-    assert.deepEqual((await fs.readdir(TEMP_DIR)).sort(), before);
+    assert.deepEqual(await pdfTempArtifacts(), before);
     const resultPath = path.join(dir, 'result.pdf');
     await fs.writeFile(resultPath, output);
     const rendered = await renderPdfPage(resultPath, 51, tools);

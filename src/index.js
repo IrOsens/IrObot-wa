@@ -4,7 +4,7 @@ import { UserInputError, SetupRequiredError } from './errors.js';
 import { LocalArchive, STORAGE_FEATURES, destinationAlias, atomicJson, prepareLocalPath } from './storage.js';
 import { StatusInbox } from './statusInbox.js';
 import { ErrorReporter } from './errorReporter.js';
-import { reviveValue } from './recordedMessages.js';
+import { reviveValue, visibleRecordedEntries } from './recordedMessages.js';
 import { makeTextSticker, parseTextSticker } from './textSticker.js';
 import os from 'node:os';
 import fs from 'node:fs/promises';
@@ -67,6 +67,8 @@ import { isAnimatedMedia, makeSmemeSticker, makeSticker, parseSmemeArgs, parseSt
 import { QrSessions, downloadQrIcon, makeQrCode, parseQrArgs } from './qr.js';
 import { TaskRecorder, TaskScheduler, createTask, formatTaskList, formatWib, listTasks, parseTaskRecordingArgs, updateTaskState } from './tasks.js';
 import { PdfSessions, parsePdfOrderText, parsePdfStartArgs } from './pdf.js';
+import { ToVideoSessions, parseToVideoOptions, videoMediaKind } from './toVideo.js';
+import { StimpaSessions } from './stimpa.js';
 import { pdfToImages } from './pdfImages.js';
 import {
   SaveRecorder,
@@ -79,7 +81,8 @@ import {
   parseSaveUpdate,
   prepareSavedUpdate,
   renameSaved,
-  sendSaved
+  sendSaved,
+  sendRecentSaved
 } from './saved.js';
 import { handleLinkCommand, handleNoteCommand, listLinks, listNotes } from './notes.js';
 import { ReminderScheduler, parseDurationMs, createReminder, formatCountdown, listReminders } from './reminders.js';
@@ -227,6 +230,13 @@ class ViewOnceCache {
     return this.pruned(target, Date.now())[0]?.message || null;
   }
 
+  findByKey(key) {
+    if (!key?.remoteJid || !key?.id) return null;
+    return this.pruned(key.remoteJid, Date.now())
+      .find(({ message }) => message.key?.id === key.id && message.key?.remoteJid === key.remoteJid
+        && (!key.participant || !message.key?.participant || sameActor(message.key.participant, key.participant)))?.message || null;
+  }
+
   pruned(target, now) {
     const entries = this.byTarget.get(target) || [];
     const fresh = entries.filter((entry) => now - entry.seenAt <= this.ttlMs);
@@ -249,9 +259,12 @@ const state = {
   tools: null,
   chatDirectory: new ChatDirectory(),
   viewOnceCache: new ViewOnceCache(),
+  forwardedViewOnceReactions: new Set(),
   scheduler: null,
   reminderScheduler: null,
   pdfSessions: null,
+  toVideoSessions: null,
+  stimpaSessions: null,
   qrSessions: null,
   restoreSessions: null,
   saveRecorder: null,
@@ -377,6 +390,8 @@ const HELP_SECTIONS = [
       { name: 'resend', text: ',resend   Kirim ulang media/view-once' },
       { name: 'qr', text: ',qr       Buat QR dari pesan' },
       { name: 'topdf', text: ',topdf    Gabung gambar/dokumen jadi PDF' },
+      { name: 'tovideo', text: ',tovideo  Ubah gambar/video jadi MP4 atau GIF' },
+      { name: 'stimpa', text: ',stimpa   Timpa stiker bergerak dengan gambar edit' },
       { name: 'toimg', text: ',toimg    Ubah PDF jadi gambar' }
     ]
   },
@@ -456,10 +471,12 @@ const HELP_DETAILS = {
   status: ['Format: ,status atau ,status bot', ',status menampilkan server ringkas. ,status bot menampilkan destination, scheduler, changedmsg, statussave, dan warning nama grup duplikat.'],
   serverinfo: ['Format: ,serverinfo', 'Menampilkan spesifikasi server lengkap: OS, CPU, RAM, disk, network, Node.js, dan proses bot.'],
   topdf: ['Format: ,topdf [--name "nama"] [--split] [--max-size 1MB | --target-size 2MB]', '--max-size: batas maksimum; --target-size: ukuran tepat, maksimal 100MB.', 'Target tepat dapat menambahkan padding tanpa meningkatkan kualitas. Kompresi PDF dapat mengubah teks menjadi gambar.', 'Nama berspasi wajib dikutip dalam mode flag. Jangan campur flag dengan format lama.', 'Legacy: ,topdf nama max 1MB, ,topdf split nama, dan ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
+  tovideo: ['Kirim/reply gambar, video, atau stiker: ,tovideo [duration=3s] [speed=0.25-4|slow=1-4] [format=mp4|gif] [q=1-100].', 'speed=2 mempercepat 2×; slow=2 memperlambat 2× (video dan audio sumber). Tanpa duration, panjang hasil video menyesuaikan kecepatan; duration=... tetap menentukan panjang hasil.', 'Jika mulai dari stiker, kirim gambar/video template yang sudah menampilkan stiker itu di dalam sesi.', 'Tanpa duration, gambar dibuat 5 detik dan video mengikuti durasi aslinya. Durasi dapat diubah selama sesi.', 'Sesi menerima stiker WhatsApp, audio, atau teks: duration=2m, speed=2, slow=2, sync, mute, unmute, vvol=50%, mvol=50%, q=80, format=gif.', 'Selesai: ,end atau ✅/👍/❤️ pada pesan sesi. Batal: ,cancel atau ❌/👎/❎.', 'Stiker harus terlihat pada sumber agar posisi, ukuran, dan rotasinya bisa dicocokkan. GIF WhatsApp tidak bersuara.'],
+  stimpa: ['Reply stiker bergerak dengan ,stimpa.', 'Bot mengirim frame pertama sebagai gambar kanvas. Edit gambar itu di WhatsApp, lalu kirim satu atau beberapa gambar edit tanpa crop.', 'Setiap gambar yang cocok ditumpuk pada animasi yang sama; gambar yang tidak cocok dilewati. ,end membuat stiker bergerak; ,cancel membatalkan.'],
   toimg: ['Format: ,toimg', 'Reply/kirim dokumen PDF, lalu bot mengirim tiap halaman sebagai gambar.'],
   note: ['Format: ,note list', 'Format: ,note add <judul> <teks>', 'Format: ,note get <id|judul>', 'Format: ,note del <id|judul>', 'Format: ,note rename <id|judul> <judul-baru>', 'Legacy: ,note <judul> <teks> dan ,note change tetap didukung.'],
   link: ['Format: ,link list', 'Format: ,link add <nama> <https://link>', 'Format: ,link get <id|nama>', 'Format: ,link del <id|nama>', 'Format: ,link rename <id|nama> <nama-baru>', 'Legacy: ,link <nama> <url> dan ,link change tetap didukung.'],
-  save: ['Format: ,save <judul> [teks awal]', 'Format: ,save update <id|"judul lama"> ["judul baru"]', 'Mulai rekam teks/media sampai ,end atau ,cancel. Update yang selesai mendapat ID baru dan muncul paling bawah.'],
+  save: ['Format: ,save <judul> [teks awal]', 'Format: ,save update <id|"judul lama"> ["judul baru"]', 'Saat update, bot menampilkan 2 isi terakhir dari save lama (jika tersedia). Kirim konten tambahan lalu ,end; isi lama tetap ada dan ID tidak berubah.'],
   load: ['Format: ,load', 'Format: ,load <id|judul>', 'Format: ,load del <id|judul>', 'Format: ,load rename <id|"judul lama"> <judul-baru>', 'Legacy: ,load change tetap didukung.'],
   remindme: [',remindme <durasi> membuka listening teks/media/VN/lokasi.', 'Format: ,remindme <teks> <durasi>', 'Unit: s = detik, m = menit, h = jam, d = hari.', 'Contoh: ,remindme cek server 1h30m'],
   task: [',task record <target> every <durasi> count <jumlah>', ',task record <target> every <durasi> forever', 'Tambahkan at <HH:MM> [DD/MM/YYYY] untuk waktu mulai WIB.', 'Pengiriman pertama setelah interval dari ,end; count adalah total kiriman.', 'Task gagal/hasil ambigu dipause; periksa sebelum ,task resume <id>. Resume melanjutkan item belum terkonfirmasi, yang mungkin sudah terkirim.', 'Format: ,task list', 'Format: ,task add <teks> at <HH:MM>', 'Format: ,task add <teks> at <HH:MM> <DD/MM/YYYY>', 'Format: ,task loop <teks> at <HH:MM>', 'Format: ,task repeat <jumlah> <teks> at <HH:MM>', 'Format: ,task record [loop|repeat <jumlah>] <nomor|nama kontak|nama grup> at <HH:MM> [DD/MM/YYYY]', 'Setelah record, kirim pesan bebas/media lalu ,end. ,cancel atau reaction ❌/👎/❎ membatalkan rekaman.', 'Format: ,task pause|stop <id>', 'Format: ,task resume <id>', 'Format: ,task del <id>', 'Legacy: ,ltask true|false|del <id> tetap didukung.'],
@@ -480,7 +497,7 @@ const HELP_DETAILS = {
     'Lanjutan: ,statussave active [kontak] [page=2] untuk daftar metadata; ,statussave dump <id-status>|all <kontak> untuk arsip manual.',
     'Menampilkan status tidak mengubah tujuan arsip. Hanya status aktif yang diterima bot yang tersedia.'],
   backup: ['Format: ,backup', 'Backup data/ ke satu tujuan aktif. Pilih grup/server dengan ,setup backup.'],
-  restore: ['Format: ,restore', 'Mulai sesi restore ZIP lewat WhatsApp. Kirim part ZIP, lalu ,end dan ,confirm.'],
+  restore: ['Format: ,restore atau ,restore save', ',restore memulihkan seluruh data/. ,restore save hanya memulihkan koleksi save.', 'Kirim ZIP/semua part, lalu ,end. Pada restore save pilih semua atau beberapa save dengan angka; 0 kembali. Pilih timpa/gabung lalu ,confirm.'],
   anticall: ['Listening: ,anticall new, kirim teks/media/VN/lokasi, lalu ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.', 'Format: ,anticall', 'Format: ,anticall new|on|off', 'Format: ,anticall except list|add|del <nomor|id>'],
   allow: ['Format: ,allow here on|off', 'Format: ,allow all on|off', 'Legacy true|false tetap didukung.'],
   admin: ['Format: ,admin list', 'Format: ,admin add <nomor>', 'Format: ,admin del <nomor|id>'],
@@ -746,6 +763,8 @@ function activeSessionType(jid) {
   if (state.taskRecorder?.has(jid)) return 'rekam task';
   if (state.anticall?.has(jid)) return 'anticall';
   if (state.pdfSessions?.has(jid)) return 'PDF';
+  if (state.toVideoSessions?.has(jid)) return 'video';
+  if (state.stimpaSessions?.has(jid)) return 'stimpa';
   if (state.qrSessions?.has(jid)) return 'QR';
   if (state.restoreSessions?.has(jid)) return 'restore';
   return null;
@@ -756,9 +775,30 @@ function activeSessionActorMatches(jid, actorJid) {
   if (state.taskRecorder?.has(jid)) return state.taskRecorder.isActor(jid, actorJid);
   if (state.anticall?.has(jid)) return state.anticall.isActor(jid, actorJid);
   if (state.pdfSessions?.has(jid)) return state.pdfSessions.isActor(jid, actorJid);
+  if (state.toVideoSessions?.has(jid)) return state.toVideoSessions.isActor(jid, actorJid);
+  if (state.stimpaSessions?.has(jid)) return state.stimpaSessions.isActor(jid, actorJid);
   if (state.qrSessions?.has(jid)) return state.qrSessions.isActor(jid, actorJid);
   if (state.restoreSessions?.has(jid)) return state.restoreSessions.isActor(jid, actorJid);
   return true;
+}
+
+function activeSessionOwnerJid(jid) {
+  const promptActor = state.sessionPrompts.get(jid)?.actorJid;
+  if (promptActor) return promptActor;
+  for (const session of [state.saveRecorder?.sessions?.get(jid), state.taskRecorder?.sessions?.get(jid),
+    state.anticall?.sessions?.get(jid), state.pdfSessions?.get(jid), state.toVideoSessions?.get(jid),
+    state.stimpaSessions?.get(jid), state.qrSessions?.get(jid), state.restoreSessions?.sessions?.get(jid)]) {
+    if (session?.actorJid) return session.actorJid;
+  }
+  return null;
+}
+
+function isSessionController(jid, actorJid, isOwner = false) {
+  return Boolean(activeSessionType(jid) && (isOwner || state.commandAccess?.isAdmin(actorJid)));
+}
+
+function sessionControlActor(jid, actorJid, isOwner = false) {
+  return isSessionController(jid, actorJid, isOwner) ? activeSessionOwnerJid(jid) || actorJid : actorJid;
 }
 
 function assertNoActiveSession(jid) {
@@ -772,6 +812,8 @@ function hasAnyTempSession() {
     || state.taskRecorder?.sessions?.size
     || state.anticall?.sessions?.size
     || state.pdfSessions?.count()
+    || state.toVideoSessions?.count()
+    || state.stimpaSessions?.count()
     || state.qrSessions?.count()
     || state.restoreSessions?.count()
   );
@@ -1009,7 +1051,7 @@ async function handleHealth(jid) {
     `Disk: ${diskText}`,
     `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, office=${Boolean(state.tools.office)}, pdftoppm=${Boolean(state.tools.pdftoppm)}, magick=${Boolean(state.tools.magick)}`,
     `Data counts: save=${saved.length}, note=${notes.length}, link=${links.length}, task=${tasks.length}, remind=${reminders.length}, wol=${wolItems.length}`,
-    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, qr=${state.qrSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, confirm=${state.confirmStore.count()}`,
+    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, video=${state.toVideoSessions?.count() || 0}, stimpa=${state.stimpaSessions?.count() || 0}, qr=${state.qrSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, confirm=${state.confirmStore.count()}`,
     `Anticall: ${anticall.enabled ? 'aktif' : 'nonaktif'}, pesan=${anticall.hasMessage ? `${anticall.entryCount} item` : 'belum ada'}, exception=${anticall.exceptionCount || 0}`,
     `Public command access: all=${Boolean(access.all)}, chats=${access.chatCount || 0}, admins=${access.adminCount || 0}`,
     `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
@@ -1179,6 +1221,27 @@ async function sendReversedSticker(jid, media) {
     mimetype: converted.mimetype,
     fileName: converted.fileName
   });
+}
+
+export async function maybeForwardReactedViewOnce(update, { downloadMedia = downloadMessageMedia, sendMedia = sendDownloadedMedia } = {}) {
+  if (!update?.reaction?.key?.fromMe || !String(update.reaction.text || '').trim()) return false;
+  const source = state.viewOnceCache.findByKey(update.key);
+  if (!source) return false;
+  const key = `${update.key.remoteJid}:${update.key.id}`;
+  if (state.forwardedViewOnceReactions.has(key)) return true;
+  const destinationJid = state.chatDirectory.findByName(PRIMARY_TARGET_NAME);
+  if (!destinationJid) throw new Error(`Grup target "${PRIMARY_TARGET_NAME}" tidak ditemukan di cache chat bot.`);
+  let media = null;
+  try {
+    media = await downloadMedia(state.sock, source, 'view-once-reaction');
+    if (!media) throw new Error('View-once yang direaksi tidak bisa dibaca.');
+    await sendMedia(destinationJid, media);
+    state.forwardedViewOnceReactions.add(key);
+    if (state.forwardedViewOnceReactions.size > 1000) state.forwardedViewOnceReactions.delete(state.forwardedViewOnceReactions.values().next().value);
+    return true;
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
 }
 
 async function maybeForwardRepliedViewOnce(message, text) {
@@ -1813,6 +1876,140 @@ async function handleTopdf(message, command, actorJid) {
   registerSessionPrompt(sent.key, jid, actorJid);
 }
 
+async function handleStimpa(message, actorJid) {
+  const jid = message.key.remoteJid;
+  assertNoActiveSession(jid);
+  const media = await downloadQuotedOrOwnMedia(state.sock, message, 'stimpa-source');
+  if (!media) throw new UserInputError('Reply stiker bergerak dengan ,stimpa.');
+  try {
+    const { preview } = await state.stimpaSessions.start(jid, actorJid, media);
+    await sendBotMessage(jid, { image: preview, mimetype: 'image/png', caption: 'Kanvas ,stimpa: edit gambar ini di WhatsApp, lalu kirim hasilnya tanpa crop.' });
+    const sent = await sendText(jid, '*Sesi stimpa*\nKirim satu atau beberapa gambar hasil edit kanvas (tanpa crop). Semua edit yang cocok akan digabung.\nBuat stiker bergerak: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.');
+    registerSessionPrompt(sent.key, jid, actorJid);
+  } catch (error) {
+    if (state.stimpaSessions.has(jid)) await state.stimpaSessions.cancel(jid, actorJid);
+    else await cleanupFiles([media.path]);
+    throw error;
+  }
+}
+
+async function collectStimpaItem(message) {
+  const jid = message.key.remoteJid;
+  const session = await state.stimpaSessions.add(state.sock, message);
+  if (!session) return;
+  if (session.ignored) {
+    if (mediaNode(message)) await sendText(jid, `Gambar dilewati: ${session.reason}`);
+    return;
+  }
+  const prompt = state.sessionPrompts.get(jid);
+  if (prompt?.key) await editText(jid, prompt.key, `*Sesi stimpa* • ${session.edits.length} gambar edit diterima\nGambar lain yang cocok akan digabung.\nBuat stiker bergerak: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.`);
+}
+
+async function finishStimpaByJid(jid, actorJid) {
+  const session = state.stimpaSessions?.get(jid);
+  if (!session || !state.stimpaSessions.isActor(jid, actorJid)) return false;
+  if (session.busy) return true;
+  if (!session.edit) {
+    await sendText(jid, 'Kirim gambar kanvas yang sudah diedit sebelum ,end. Sesi masih aktif.');
+    return true;
+  }
+  const progress = await sendText(jid, '*Membuat stiker bergerak • 0%*\nMenunggu proses');
+  let lastPercent = -1;
+  try {
+    await state.stimpaSessions.finish(jid, actorJid, async (percent, label) => {
+      const value = Math.floor(percent);
+      if (value <= lastPercent) return;
+      lastPercent = value;
+      await editText(jid, progress.key, `*Membuat stiker bergerak • ${value}%*\n${label}`).catch(() => {});
+    }, async (sticker) => sendBotMessage(jid, { sticker, mimetype: 'image/webp', isAnimated: true }));
+  } catch (error) {
+    await editText(jid, progress.key, `*Pembuatan stiker gagal*\n${error.message}\nSesi masih aktif; kirim gambar edit baru atau ketik ,end.`);
+    if (error instanceof UserInputError) return true;
+    throw error;
+  }
+  return true;
+}
+
+async function handleToVideo(message, command, actorJid) {
+  const jid = message.key.remoteJid;
+  assertNoActiveSession(jid);
+  const options = parseToVideoOptions(command.rawArgs);
+  if (!state.tools?.ffmpeg || !state.tools?.ffprobe) throw new UserInputError('FFmpeg dan FFprobe diperlukan untuk ,tovideo.');
+  const media = mediaNode(message)
+    ? await downloadMessageMedia(state.sock, message, 'tovideo-source')
+    : await downloadQuotedOrOwnMedia(state.sock, message, 'tovideo-source');
+  if (!media) throw new UserInputError('Lampirkan gambar/video atau reply stiker dengan ,tovideo.');
+  if (!['image', 'video', 'sticker'].includes(videoMediaKind(media))) {
+    await cleanupFiles([media.path]);
+    throw new UserInputError('Media awal ,tovideo harus gambar, video, atau stiker WhatsApp.');
+  }
+  const session = state.toVideoSessions.start(jid, actorJid, media, options);
+  const sent = await sendText(jid, formatToVideoSession(session));
+  registerSessionPrompt(sent.key, jid, actorJid);
+}
+
+function formatToVideoSession(session) {
+  const options = session.options;
+  const duration = options.durationMode === 'sync' ? 'mengikuti musik (sync)'
+    : options.durationMode === 'explicit' ? `${options.durationMs / 1000}s`
+      : videoMediaKind(session.source) === 'video' ? 'mengikuti video' : '5s';
+  return [
+    `*Sesi video* • ${options.format.toUpperCase()} • durasi ${duration} • speed=${options.speed || 1}× • q=${options.quality}`,
+    `Sumber: ${videoMediaKind(session.source) || 'menunggu gambar/video template'}. Stiker: ${session.stickers.length}. Musik: ${session.music ? 'ada' : 'belum ada'}.`,
+    !session.source ? 'Kirim gambar/video template yang sudah menampilkan stiker pada posisi tujuan.' : null,
+    options.format === 'gif' && session.music ? 'Musik diabaikan pada GIF WhatsApp.' : null,
+    'Kirim stiker WhatsApp, audio, atau instruksi seperti duration=2m, speed=2, slow=2, sync, mute, vvol=50%, mvol=50%, q=80, format=gif.',
+    'Buat: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.'
+  ].filter(Boolean).join('\n');
+}
+
+async function collectToVideoItem(message, text) {
+  const jid = message.key.remoteJid;
+  const session = state.toVideoSessions.get(jid);
+  if (!session) return;
+  await state.toVideoSessions.add(state.sock, message, text);
+  const prompt = state.sessionPrompts.get(jid);
+  if (prompt?.key) await editText(jid, prompt.key, formatToVideoSession(session));
+}
+
+async function finishToVideoByJid(jid, actorJid) {
+  const session = state.toVideoSessions.get(jid);
+  if (!session || !state.toVideoSessions.isActor(jid, actorJid)) return false;
+  if (session.busy) return true;
+  if (!session.source) {
+    await sendText(jid, 'Kirim gambar atau video template sebelum ,end. Sesi masih aktif.');
+    return true;
+  }
+  const progress = await sendText(jid, '*Membuat video • 0%*\nMenunggu proses');
+  let lastPercent = -1;
+  let lastEdit = 0;
+  let progressQueue = Promise.resolve();
+  const update = async (percent, label) => {
+    const now = Date.now();
+    const value = Math.max(lastPercent, 0, Math.min(100, Math.floor(percent)));
+    if (value !== 100 && value <= lastPercent + 1 && now - lastEdit < 2000) return;
+    lastPercent = value;
+    lastEdit = now;
+    progressQueue = progressQueue.then(() => editText(jid, progress.key, `*Membuat video • ${value}%*\n${label}`)).catch(() => {});
+    await progressQueue;
+  };
+  try {
+    await state.toVideoSessions.finish(jid, actorJid, update, async (output, format) => {
+      await sendBotMessage(jid, {
+        video: { url: output },
+        mimetype: 'video/mp4',
+        ...(format === 'gif' ? { gifPlayback: true } : {})
+      });
+    });
+  } catch (error) {
+    await progressQueue;
+    await editText(jid, progress.key, `*Pembuatan video gagal*\n${error.message}\nSesi masih aktif; perbaiki sumber/opsi lalu ketik ,end.`);
+    if (error instanceof UserInputError) return true;
+    throw error;
+  }
+  return true;
+}
+
 async function updatePdfProgressMessage(jid, session, latestItem = null) {
   if (!session) return sendText(jid, 'Sesi PDF tidak ditemukan.');
   if (latestItem?.skipped) {
@@ -1902,8 +2099,13 @@ async function handleSave(message, command, actorJid) {
     const jid = message.key.remoteJid;
     assertNoActiveSession(jid);
     const { item, title } = await prepareSavedUpdate(update.query, update.newTitle);
+    const previewCount = Math.min(2, visibleRecordedEntries(item.entries || []).length);
+    if (previewCount) {
+      await sendText(jid, `Isi terakhir save #${item.id} "${item.title}" (${previewCount} item):`);
+      await sendRecentSaved(botSender(), jid, item);
+    }
     const session = state.saveRecorder.startUpdate(jid, item, title, actorJid);
-    const sent = await sendText(jid, `Mulai update save #${item.id} "${item.title}"${title !== item.title ? ` menjadi "${title}"` : ''}. Kirim isi pengganti lalu ,end untuk simpan atau ,cancel untuk batal. Save lama tetap aman sampai update selesai.`);
+    const sent = await sendText(jid, `Mulai tambah isi save #${item.id} "${item.title}"${title !== item.title ? ` menjadi "${title}"` : ''}. Kirim konten tambahan lalu ,end untuk simpan atau ,cancel untuk batal. Isi lama tetap ada dan ID tidak berubah.`);
     registerSessionPrompt(sent.key, jid, actorJid);
     return;
   }
@@ -2082,8 +2284,8 @@ async function finishSaveByJid(jid, actorJid) {
   const item = await state.saveRecorder.finish(jid, actorJid);
   if (!item) return false;
   invalidateListKind('saved');
-  const action = item.replacedId ? `diupdate dari #${item.replacedId} menjadi` : 'tersimpan sebagai';
-  await sendText(jid, `Save ${action} #${item.id} "${item.title}" (${item.entries.length} item).`);
+  const action = item.appendedCount ? `ditambah ${item.appendedCount} item` : 'tersimpan';
+  await sendText(jid, `Save #${item.id} "${item.title}" ${action} (${item.entries.length} item total).`);
   return true;
 }
 
@@ -2138,6 +2340,15 @@ async function cancelActiveSessionByJid(jid, actorJid) {
     return true;
   }
 
+  if (await state.toVideoSessions.cancel(jid, actorJid)) {
+    await sendText(jid, 'Sesi video dibatalkan.');
+    return true;
+  }
+  if (await state.stimpaSessions?.cancel(jid, actorJid)) {
+    await sendText(jid, 'Sesi stimpa dibatalkan.');
+    return true;
+  }
+
   if (await state.qrSessions.cancel(jid, actorJid)) {
     await sendText(jid, 'Sesi QR dibatalkan.');
     return true;
@@ -2180,8 +2391,26 @@ async function finishActiveSession(jid, actorJid) {
   }
   if (await finishAnticallByJid(jid, actorJid)) return true;
   if (await finishQrByJid(jid, actorJid)) return true;
+  if (await finishToVideoByJid(jid, actorJid)) return true;
+  if (await finishStimpaByJid(jid, actorJid)) return true;
   if (state.restoreSessions.has(jid)) {
     if (!activeSessionActorMatches(jid, actorJid)) return false;
+    const session = state.restoreSessions.sessions.get(jid);
+    if (session.mode === 'save') {
+      if (session.phase === 'upload') {
+        const result = await state.restoreSessions.prepareSaved(session);
+        await sendText(jid, `Backup terbaca: ${result.count} save dari ${result.parts} part.\n1. Semua save\n2. Pilih save tertentu\n0. Kembali ke unggah ZIP\nKetik angka pilihan.`);
+      } else if (session.phase === 'select') {
+        if (!session.selectedIds.size) throw new UserInputError('Pilih setidaknya satu save dari daftar.');
+        session.phase = 'mode';
+        await sendSaveRestoreMode(jid, session);
+      } else if (session.phase === 'scope') {
+        await sendSaveRestoreScope(jid, session);
+      } else {
+        await sendSaveRestoreMode(jid, session);
+      }
+      return true;
+    }
     await requestConfirmation(jid, actorJid, {
       title: 'Restore data',
       description: 'Folder data/ akan ditimpa dari file restore yang sudah dikirim.',
@@ -2238,6 +2467,17 @@ async function finishRestore(message, actorJid = messageActorJid(message)) {
 async function finishRestoreByJid(jid, actorJid) {
   const session = state.restoreSessions.end(jid, actorJid);
   if (!session) return false;
+  if (session.mode === 'save') {
+    try {
+      if (state.saveRecorder.sessions.size) throw new UserInputError('Selesaikan sesi ,save yang masih aktif sebelum restore save.');
+      const result = await state.restoreSessions.restoreSaved(session);
+      invalidateListKind('saved');
+      await sendText(jid, `Restore save selesai: ${result.restored} save dipulihkan (${result.mode === 'merge' ? 'gabung' : 'timpa'}). Total sekarang ${result.total} save.`);
+    } finally {
+      await state.restoreSessions.cleanup(session);
+    }
+    return true;
+  }
   state.scheduler?.stop();
   state.reminderScheduler?.stop();
   try {
@@ -2254,12 +2494,93 @@ async function finishRestoreByJid(jid, actorJid) {
 
 async function maybeCollectRestorePart(message) {
   if (!state.restoreSessions.has(message.key.remoteJid)) return false;
+  const session = state.restoreSessions.sessions.get(message.key.remoteJid);
+  if (session.mode === 'save' && session.phase !== 'upload') {
+    await handleSaveRestoreChoice(message.key.remoteJid, session.actorJid, getMessageText(message));
+    return true;
+  }
   const item = await state.restoreSessions.add(state.sock, message);
   if (item) {
     await sendText(message.key.remoteJid, `Restore part diterima: ${item.fileName}`);
     return true;
   }
   await sendText(message.key.remoteJid, 'Kirim dokumen .zip untuk restore, atau ketik ,end jika semua part sudah dikirim.');
+  return true;
+}
+
+async function sendSaveRestoreScope(jid, session) {
+  await sendText(jid, `Backup berisi ${session.savedItems.length} save.\n1. Semua save\n2. Pilih save tertentu\n0. Kembali ke unggah ZIP`);
+}
+
+async function sendSaveRestoreList(jid, session) {
+  const start = session.page * 10;
+  const items = session.savedItems.slice(start, start + 10);
+  const lines = [`Pilih save (halaman ${session.page + 1}/${Math.ceil(session.savedItems.length / 10)}). Ketik angka untuk menandai/melepas:`];
+  lines.push(...items.map((item, index) => `${index + 1}. ${session.selectedIds.has(item.id) ? '✅ ' : ''}#${item.id} ${item.title} (${item.entries.length} item)`));
+  if (start + 10 < session.savedItems.length) lines.push('11. Halaman berikutnya');
+  if (session.page) lines.push('12. Halaman sebelumnya');
+  lines.push('0. Kembali', `Terpilih: ${session.selectedIds.size}. Ketik ,end untuk lanjut.`);
+  await sendText(jid, lines.join('\n'));
+}
+
+async function sendSaveRestoreMode(jid, session) {
+  await sendText(jid, `${session.selectedIds.size} save dipilih.\n1. Timpa seluruh koleksi save sekarang dengan pilihan backup\n2. Gabung sebagai save baru (judul bentrok diberi pembeda)\n0. Kembali`);
+}
+
+async function handleSaveRestoreChoice(jid, actorJid, text) {
+  const session = state.restoreSessions.sessions.get(jid);
+  if (!session || session.mode !== 'save' || session.actorJid !== actorJid) return false;
+  const choice = String(text || '').trim();
+  if (session.phase === 'scope') {
+    if (choice === '0') {
+      session.phase = 'upload';
+      await sendText(jid, 'Kirim ZIP/part backup tambahan, lalu ketik ,end.');
+    } else if (choice === '1') {
+      session.scopeSelection = 'all';
+      session.selectedIds = new Set(session.savedItems.map((item) => item.id));
+      session.phase = 'mode';
+      await sendSaveRestoreMode(jid, session);
+    } else if (choice === '2') {
+      session.scopeSelection = 'selected';
+      session.selectedIds.clear();
+      session.page = 0;
+      session.phase = 'select';
+      await sendSaveRestoreList(jid, session);
+    } else await sendSaveRestoreScope(jid, session);
+  } else if (session.phase === 'select') {
+    const start = session.page * 10;
+    if (choice === '0') {
+      session.phase = 'scope';
+      await sendSaveRestoreScope(jid, session);
+    } else if (choice === '11' && start + 10 < session.savedItems.length) {
+      session.page++;
+      await sendSaveRestoreList(jid, session);
+    } else if (choice === '12' && session.page) {
+      session.page--;
+      await sendSaveRestoreList(jid, session);
+    } else if (/^(?:[1-9]|10)$/.test(choice) && session.savedItems[start + Number(choice) - 1]) {
+      const id = session.savedItems[start + Number(choice) - 1].id;
+      if (session.selectedIds.has(id)) session.selectedIds.delete(id);
+      else session.selectedIds.add(id);
+      await sendSaveRestoreList(jid, session);
+    } else await sendSaveRestoreList(jid, session);
+  } else if (session.phase === 'mode') {
+    if (choice === '0') {
+      session.phase = session.scopeSelection === 'selected' ? 'select' : 'scope';
+      if (session.phase === 'select') await sendSaveRestoreList(jid, session);
+      else await sendSaveRestoreScope(jid, session);
+    } else if (choice === '1' || choice === '2') {
+      session.restoreMode = choice === '1' ? 'overwrite' : 'merge';
+      const count = session.selectedIds.size;
+      await requestConfirmation(jid, actorJid, {
+        title: `Restore ${count} save (${session.restoreMode === 'overwrite' ? 'timpa' : 'gabung'})`,
+        description: session.restoreMode === 'overwrite'
+          ? `Seluruh koleksi save sekarang akan diganti oleh ${count} save yang dipilih dari backup. Data fitur lain tetap.`
+          : `${count} save dari backup akan ditambahkan sebagai save baru. Data save sekarang tetap.`,
+        execute: async () => finishRestoreByJid(jid, actorJid)
+      });
+    } else await sendSaveRestoreMode(jid, session);
+  }
   return true;
 }
 
@@ -2436,7 +2757,7 @@ async function handleButton(message, command) {
 async function handleAllow(message, command) {
   const jid = message.key.remoteJid;
   const { scope, enabled } = parseAllowArgs(command.args);
-  const commands = ['help', 's', 'smeme', 'resend', 'qr']
+  const commands = ['help', 's', 'smeme', 'resend', 'qr', 'tovideo', 'stimpa']
     .filter((name) => PUBLIC_COMMANDS.has(name))
     .map((name) => `${COMMAND_PREFIX}${name}`)
     .join(', ');
@@ -2685,11 +3006,15 @@ async function sendStatusSaveList(jid, actorJid) {
   });
 }
 
-async function handleRestoreStart(message, actorJid) {
+async function handleRestoreStart(message, command, actorJid) {
   const jid = message.key.remoteJid;
   assertNoActiveSession(jid);
-  await state.restoreSessions.start(jid, actorJid);
-  const sent = await sendText(jid, 'Sesi restore dimulai. Kirim file .zip/PART zip sebagai dokumen WhatsApp, lalu ketik ,end dan ,confirm untuk overwrite folder data/. Ketik ,cancel untuk batal.');
+  const mode = command.args[0]?.toLowerCase() === 'save' ? 'save' : 'full';
+  if (command.args.length > (mode === 'save' ? 1 : 0)) throw new UserInputError('Gunakan ,restore atau ,restore save.');
+  await state.restoreSessions.start(jid, actorJid, { mode });
+  const sent = await sendText(jid, mode === 'save'
+    ? 'Sesi restore save dimulai. Kirim ZIP/semua part backup sebagai dokumen, lalu ,end untuk memilih save. ,cancel membatalkan.'
+    : 'Sesi restore dimulai. Kirim file .zip/PART zip sebagai dokumen WhatsApp, lalu ketik ,end dan ,confirm untuk overwrite folder data/. Ketik ,cancel untuk batal.');
   registerSessionPrompt(sent.key, jid, actorJid);
 }
 
@@ -2891,6 +3216,12 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'topdf':
       await handleTopdf(message, command, context.actorJid);
       break;
+    case 'tovideo':
+      await handleToVideo(message, command, context.actorJid);
+      break;
+    case 'stimpa':
+      await handleStimpa(message, context.actorJid);
+      break;
     case 'toimg':
       await handleToImg(message);
       break;
@@ -2941,7 +3272,7 @@ async function handleCommand(message, command, context = commandContext(message)
       await handleStatusSaveCommand(message, command, context);
       break;
     case 'restore':
-      await handleRestoreStart(message, context.actorJid);
+      await handleRestoreStart(message, command, context.actorJid);
       break;
     case 'clear':
       await requestConfirmation(jid, context.actorJid, {
@@ -3009,11 +3340,13 @@ async function onMessageUpsert(event) {
 
       const sessionActive = activeSessionType(jid);
       const sessionActorMatches = activeSessionActorMatches(jid, context.actorJid);
+      const controlCommand = ['end', 'cancel'].includes(command?.name);
+      const canControlSession = controlCommand && (sessionActorMatches || isSessionController(jid, context.actorJid, context.isOwner));
       if (sessionActorMatches && state.sessionPrompts.has(jid)) {
         const prompt = state.sessionPrompts.get(jid); prompt.lastActivity = Date.now();
         const action = state.reactionActions.get(prompt.key, prompt.actorJid); if (action) action.expiresAt = Date.now() + 1800000;
       }
-      if (sessionActive && !sessionActorMatches && (!command || ['end', 'cancel', 'confirm'].includes(command.name))) {
+      if (sessionActive && !sessionActorMatches && !canControlSession && (!command || ['end', 'cancel', 'confirm'].includes(command.name))) {
         continue;
       }
 
@@ -3037,12 +3370,24 @@ async function onMessageUpsert(event) {
         await maybeCollectQrItem(message, text);
         continue;
       }
+      if (sessionActorMatches && state.toVideoSessions.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
+        await collectToVideoItem(message, text);
+        continue;
+      }
+      if (sessionActorMatches && state.stimpaSessions?.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
+        await collectStimpaItem(message);
+        continue;
+      }
       if (!command && !state.pdfSessions.has(jid) && context.isOwner && await maybeForwardRepliedViewOnce(message, text)) {
         continue;
       }
       if (command) {
-        if (!state.commandAccess?.canUseAs(command.name, jid, context.actorJid, { owner: context.isOwner })) continue;
-        await handleCommand(message, command, context);
+        if (!state.commandAccess?.canUseAs(command.name, jid, context.actorJid, { owner: context.isOwner }) && !(sessionActive && canControlSession)) continue;
+        if (canControlSession && !sessionActorMatches) {
+          await handleCommand(message, command, { ...context, actorJid: sessionControlActor(jid, context.actorJid, context.isOwner) });
+        } else {
+          await handleCommand(message, command, context);
+        }
       } else {
         if (sessionActorMatches) await maybeCollectPdfItem(message, text);
       }
@@ -3092,11 +3437,18 @@ async function onMessagesDelete(update) {
 async function onMessagesReaction(updates) {
   if (!isBotEnabled()) return;
   for (const update of updates || []) {
-    const intent = reactionIntent(update?.reaction?.text);
-    if (!intent) continue;
-    const actorJid = reactionActorJid(update);
-    const action = state.reactionActions.get(update.key, actorJid);
     try {
+      if (await maybeForwardReactedViewOnce(update)) continue;
+      const intent = reactionIntent(update?.reaction?.text);
+      if (!intent) continue;
+      const actorJid = reactionActorJid(update);
+      let action = state.reactionActions.get(update.key, actorJid);
+      const jid = update.key?.remoteJid;
+      const prompt = state.sessionPrompts.get(jid);
+      if (!action && prompt?.key?.id === update.key?.id && prompt.key.remoteJid === jid
+        && isSessionController(jid, actorJid, Boolean(update.reaction?.key?.fromMe))) {
+        action = state.reactionActions.get(update.key, prompt.actorJid);
+      }
       if (!action) {
         if (intent === 'cancel' && update.reaction?.key?.fromMe && update.key?.fromMe && !state.reactionActions.isPrompt(update.key)) await sendBotMessage(update.key.remoteJid, { delete: update.key });
         continue;
@@ -3104,7 +3456,8 @@ async function onMessagesReaction(updates) {
       const handler = intent === 'confirm' ? action.onConfirm : action.onCancel;
       if (!handler) continue;
       await handler(update);
-      state.reactionActions.delete(update.key);
+      if (action.scope?.startsWith('session:') && activeSessionType(jid)) action.expiresAt = Date.now() + 30 * 60 * 1000;
+      else state.reactionActions.delete(update.key);
     } catch (error) {
       await handleFailure(error, { jid: update?.key?.remoteJid, messageId: update.key?.id });
     }
@@ -3313,6 +3666,8 @@ async function main() {
   try { state.reactionActions.prompts = new Set(JSON.parse(await fs.readFile(path.join(ROOT_DIR, 'data', 'prompt-keys.json'), 'utf8'))); } catch {}
   state.tools = await detectTools();
   state.pdfSessions = new PdfSessions(state.tools);
+  state.toVideoSessions = new ToVideoSessions(state.tools);
+  state.stimpaSessions = new StimpaSessions();
   state.qrSessions = new QrSessions();
   state.restoreSessions = new RestoreSessions();
   state.saveRecorder = new SaveRecorder();

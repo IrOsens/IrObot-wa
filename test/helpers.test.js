@@ -35,7 +35,7 @@ import { RuntimeConfigStore } from '../src/runtimeConfig.js';
 import { ChangedMessageStore, messageIndexKey } from '../src/changedMessages.js';
 import { StatusSaveStore } from '../src/statusSave.js';
 import { formatServices, listOpenServices, parseSsOutput } from '../src/services.js';
-import { deleteSaved, SaveRecorder, parseSaveUpdate } from '../src/saved.js';
+import { deleteSaved, SaveRecorder, parseSaveUpdate, sendRecentSaved } from '../src/saved.js';
 import {
   QrSessions,
   makeQrCode,
@@ -523,7 +523,7 @@ test('makeSticker ffmpeg path keeps transparent animated-media pixels', async ()
   }
 });
 
-test('SaveRecorder update replaces content with a new ID at the bottom', async () => {
+test('SaveRecorder update appends entries under the same ID and preserves earlier content', async () => {
   const tempRoot = path.join(process.cwd(), 'temp');
   await fs.mkdir(tempRoot, { recursive: true });
   const work = await fs.mkdtemp(path.join(tempRoot, 'saved-update-test-'));
@@ -541,10 +541,48 @@ test('SaveRecorder update replaces content with a new ID at the bottom', async (
     const updated = await recorder.finish('chat@test', 'owner@test');
     const store = JSON.parse(await fs.readFile(file, 'utf8'));
 
-    assert.equal(updated.replacedId, 1);
-    assert.deepEqual(store.items.map((item) => [item.id, item.title]), [[2, 'Dua'], [3, 'Satu Baru']]);
-    assert.equal(store.items[1].entries[0].text, 'isi baru');
-    assert.equal(store.nextId, 4);
+    assert.equal(updated.id, first.id);
+    assert.equal(updated.appendedCount, 1);
+    assert.deepEqual(store.items.map((item) => [item.id, item.title]), [[1, 'Satu Baru'], [2, 'Dua']]);
+    assert.deepEqual(store.items[0].entries.map((entry) => entry.text), ['isi lama', 'isi baru']);
+    assert.equal(store.items[0].createdAt, first.createdAt);
+    assert.ok(store.items[0].updatedAt);
+    assert.equal(store.nextId, 3);
+    const again = recorder.startUpdate('chat@test', updated, 'Satu Baru', 'owner@test');
+    again.entries.push({ kind: 'text', text: 'isi ketiga' });
+    await recorder.finish('chat@test', 'owner@test');
+    const final = JSON.parse(await fs.readFile(file, 'utf8'));
+    assert.deepEqual(final.items[0].entries.map((entry) => entry.text), ['isi lama', 'isi baru', 'isi ketiga']);
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
+test('save update keeps old media and cancellation leaves the original untouched', async () => {
+  const work = await fs.mkdtemp(path.join(process.cwd(), 'saved-media-test-'));
+  const file = path.join(work, 'saved.json');
+  const recorder = new SaveRecorder({ file, mediaDir: path.join(work, 'media') });
+  try {
+    const oldFile = path.join(work, 'old.png');
+    const newFile = path.join(work, 'new.png');
+    await fs.writeFile(oldFile, 'old bytes');
+    await fs.writeFile(newFile, 'new bytes');
+    const initial = recorder.start('chat@test', 'Gambar', '', 'owner@test');
+    initial.entries.push({ kind: 'media', tempPath: oldFile, fileName: 'old.png', messageType: 'imageMessage' });
+    const first = await recorder.finish('chat@test', 'owner@test');
+    const oldPath = first.entries[0].path;
+    const cancelled = recorder.startUpdate('chat@test', first, 'Gambar', 'owner@test');
+    cancelled.entries.push({ kind: 'text', text: 'batal' });
+    await recorder.cancel('chat@test', 'owner@test');
+    assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')).items[0].entries, JSON.parse(JSON.stringify(first.entries)));
+    const session = recorder.startUpdate('chat@test', first, 'Gambar', 'owner@test');
+    session.entries.push({ kind: 'media', tempPath: newFile, fileName: 'new.png', messageType: 'imageMessage' });
+    const updated = await recorder.finish('chat@test', 'owner@test');
+    assert.equal(updated.id, first.id);
+    assert.equal(updated.entries.length, 2);
+    assert.equal(await fs.readFile(oldPath, 'utf8'), 'old bytes');
+    assert.equal(await fs.readFile(updated.entries[1].path, 'utf8'), 'new bytes');
+    assert.notEqual(updated.entries[0].path, updated.entries[1].path);
   } finally {
     await fs.rm(work, { recursive: true, force: true });
   }
@@ -583,6 +621,46 @@ test('parseSaveUpdate supports an optional replacement title', () => {
     newTitle: 'judul baru'
   });
   assert.throws(() => parseSaveUpdate({ args: ['update'] }), /Format/);
+});
+
+test('save update preview replays only the last two visible entries in order', async () => {
+  const sent = [];
+  const sock = { sendMessage: async (_jid, payload) => sent.push(payload) };
+  const saved = { entries: [
+    { kind: 'text', text: 'awal' },
+    { kind: 'text', text: 'Direkam (2 item).' },
+    { kind: 'text', text: 'kedua' },
+    { kind: 'text', text: 'terakhir' }
+  ] };
+  assert.equal(await sendRecentSaved(sock, 'chat@test', saved), 2);
+  assert.deepEqual(sent, [{ text: 'kedua' }, { text: 'terakhir' }]);
+});
+
+test('save update preview handles an item with only one entry', async () => {
+  const sent = [];
+  const sock = { sendMessage: async (_jid, payload) => sent.push(payload) };
+  assert.equal(await sendRecentSaved(sock, 'chat@test', { entries: [{ kind: 'text', text: 'satu' }] }), 1);
+  assert.deepEqual(sent, [{ text: 'satu' }]);
+});
+
+test('save update preview replays recent media with its native type', async () => {
+  const dir = await fs.mkdtemp(path.join(process.cwd(), 'save-preview-'));
+  try {
+    const mediaPath = path.join(dir, 'photo.png');
+    await fs.writeFile(mediaPath, Buffer.from('sample image bytes'));
+    const sent = [];
+    const sock = { sendMessage: async (_jid, payload) => sent.push(payload) };
+    const saved = { entries: [
+      { kind: 'text', text: 'lama' },
+      { kind: 'media', path: mediaPath, mimetype: 'image/png', messageType: 'imageMessage', caption: 'foto baru' },
+      { kind: 'text', text: 'teks baru' }
+    ] };
+    assert.equal(await sendRecentSaved(sock, 'chat@test', saved), 2);
+    assert.deepEqual(sent.map((payload) => payload.text || payload.caption), ['foto baru', 'teks baru']);
+    assert.deepEqual(sent[0].image, Buffer.from('sample image bytes'));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('smeme text keeps emoji as colored emoji run', async () => {

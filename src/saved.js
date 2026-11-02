@@ -1,5 +1,6 @@
 import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { SAVED_MESSAGES_DIR, SAVED_MESSAGES_FILE } from './config.js';
 import { cleanupFiles } from './media.js';
@@ -84,7 +85,7 @@ export class SaveRecorder {
       title,
       entries: [],
       tempFiles: [],
-      replaceId: options.replaceId || null,
+      appendId: options.appendId || null,
       startedAt: Date.now()
     };
     if (firstText) session.entries.push({ kind: 'text', text: firstText });
@@ -94,7 +95,7 @@ export class SaveRecorder {
 
   startUpdate(jid, saved, title = saved?.title, actorJid = jid) {
     if (!saved?.id) throw new UserInputError('Save yang akan diupdate tidak valid.');
-    return this.start(jid, title, '', actorJid, { replaceId: saved.id });
+    return this.start(jid, title, '', actorJid, { appendId: saved.id });
   }
 
   has(jid) {
@@ -122,33 +123,31 @@ export class SaveRecorder {
     if (actorJid && session.actorJid !== actorJid) return null;
     if (!session.entries.length) throw new UserInputError('Belum ada isi yang direkam.');
     const store = await readStore(this.file);
-    const replaced = session.replaceId ? findSaved(store, session.replaceId) : null;
-    if (session.replaceId && !replaced) throw new UserInputError(`Save #${session.replaceId} yang akan diupdate sudah tidak ditemukan.`);
-    assertUniqueTitle(store, session.title, replaced?.id || null);
-    const id = store.nextId++;
-    const dir = path.join(this.mediaDir, `${id}-${slug(session.title)}`);
-    await fs.mkdir(dir, { recursive: true });
+    const original = session.appendId ? findSaved(store, session.appendId) : null;
+    if (session.appendId && !original) throw new UserInputError(`Save #${session.appendId} yang akan diupdate sudah tidak ditemukan.`);
+    assertUniqueTitle(store, session.title, original?.id || null);
+    const id = original?.id ?? store.nextId;
+    // Each recording gets its own directory so an update never overwrites old media.
+    const dir = path.join(this.mediaDir, `${id}-${slug(session.title)}-${randomUUID()}`);
     let result;
     try {
       const entries = await persistRecordedEntries(session.entries, dir);
       const now = new Date().toISOString();
-      const item = {
-        id,
-        title: session.title,
-        entries,
-        createdAt: now,
-        ...(replaced ? { updatedAt: now } : {})
-      };
-      if (replaced) store.items = store.items.filter((saved) => saved.id !== replaced.id);
-      store.items.push(item);
+      if (original) {
+        const item = { ...original, title: session.title, entries: [...original.entries, ...entries], updatedAt: now };
+        store.items[store.items.findIndex((saved) => saved.id === original.id)] = item;
+        result = { ...item, appendedCount: entries.length };
+      } else {
+        result = { id, title: session.title, entries, createdAt: now };
+        store.nextId = id + 1;
+        store.items.push(result);
+      }
       await writeStore(store, this.file);
-      result = replaced ? { ...item, replacedId: replaced.id } : item;
     } catch (error) {
       await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
       throw error;
     }
     await this.cancel(jid);
-    if (replaced) await cleanupSavedMedia(replaced).catch(() => {});
     return result;
   }
 
@@ -214,6 +213,12 @@ export async function renameSaved(query, newTitle) {
 
 export async function sendSaved(sock, jid, item) {
   await sendRecordedEntries(sock, jid, visibleEntries(item));
+}
+
+export async function sendRecentSaved(sock, jid, item, limit = 2) {
+  const recent = visibleEntries(item).slice(-limit);
+  await sendRecordedEntries(sock, jid, recent);
+  return recent.length;
 }
 
 async function cleanupSavedMedia(item) {

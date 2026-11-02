@@ -28,6 +28,7 @@ export function getMessageText(message) {
   if (content.extendedTextMessage?.text) return content.extendedTextMessage.text;
   if (content.imageMessage?.caption) return content.imageMessage.caption;
   if (content.videoMessage?.caption) return content.videoMessage.caption;
+  if (content.stickerMessage?.caption) return content.stickerMessage.caption;
   if (content.documentMessage?.caption) return content.documentMessage.caption;
   if (content.buttonsResponseMessage?.selectedButtonId) return content.buttonsResponseMessage.selectedButtonId;
   if (content.templateButtonReplyMessage?.selectedId) return content.templateButtonReplyMessage.selectedId;

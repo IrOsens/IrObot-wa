@@ -40,9 +40,13 @@ export async function log(level, message, meta) {
     await rotateIfNeeded();
     await fs.mkdir(LOG_DIR, { recursive: true });
     await fs.appendFile(activeFile, line(level, message, meta));
-    if (errorSink && (level === 'error' || (level === 'warn' && meta?.error))) await errorSink(message, meta);
   } catch {
-    // Logging must never crash the bot.
+    // A read-only/foreign-owned log file must not suppress error delivery.
+  }
+  if (errorSink && (level === 'error' || (level === 'warn' && meta?.error))) {
+    try { await errorSink(message, meta); } catch {
+      // Reporting must never crash the bot.
+    }
   }
 }
 

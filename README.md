@@ -133,7 +133,7 @@ systemctl --user disable --now irobot-wa
 
 ## Command
 
-- Media: `,s`, `,stext`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,toimg`
+- Media: `,s`, `,stext`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,toimg`, `,tovideo`, `,stimpa`
 - Reminder/task: `,task list|add|loop|repeat|record|pause|stop|resume|del`, `,remindme <teks> <durasi>`
 - Save: `,save`, `,save update`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load rename <id|judul> <judul-baru>`
 - Note/link: `,note list|add|get|del|rename`, `,link list|add|get|del|rename`
@@ -148,7 +148,7 @@ View-once/media:
 - Bot mengirim media itu kembali ke chat tempat command dijalankan.
 - Jika `,resend` dipakai pada sticker, sticker statis dikirim sebagai PNG dan sticker bergerak dikirim sebagai GIF.
 - Legacy `,rs` tetap didukung.
-- Jika owner membalas media view-once dengan pesan biasa, bot otomatis mengirim medianya ke grup target `IrOBot`.
+- Jika owner membalas media view-once dengan pesan biasa, bot otomatis mengirim medianya ke grup target `IrOBot`. Owner juga bisa memberi reaksi emoji apa pun pada pesan view-once yang sama untuk meneruskannya (sekali per pesan). Reaksi pada pesan biasa tidak diteruskan.
 - Teks balasan dipakai sebagai caption baru jika media mendukung caption; balasan berupa command tidak memicu pengiriman otomatis.
 
 Sticker:
@@ -176,6 +176,7 @@ Operasional:
 - `,allow all on|off` membuka/menutup akses publik di semua chat/grup.
 - Legacy `true|false` tetap didukung untuk `,allow`.
 - Akses publik biasa berlaku untuk `,help`, `,s`, `,smeme`, `,resend`, `,qr`, dan legacy `,rs`.
+- `,tovideo` juga tersedia pada chat yang diberi akses publik.
 - `,help` dinamis: publik hanya melihat command publik, admin tambahan melihat command yang boleh dia pakai, owner melihat semuanya. `,help <command|prefix>` menampilkan detail atau kandidat command.
 - `,admin list|add|del <nomor|id>` mengelola admin tambahan. Hanya owner/session WhatsApp yang bisa menjalankannya.
 - Admin tambahan hanya aktif saat akses publik chat/all terbuka, dan tetap tidak bisa memakai command server/security seperti `,admin`, `,bot`, `,backup`, `,restore`, `,update`, dan `,restartbot`.
@@ -208,7 +209,25 @@ PDF ke image:
 
 - Reply/kirim dokumen PDF lalu ketik `,toimg`.
 - Bot mengirim setiap halaman PDF sebagai image PNG.
+
+Video dari gambar atau video:
+
+- Kirim gambar/video dengan caption `,tovideo`, atau reply gambar/video/stiker dengan command yang sama. Jika stiker dikirim lebih dulu, lanjutkan dengan gambar/video template yang sudah menampilkan stiker pada posisi tujuan.
+- Tanpa `duration`, gambar menjadi 5 detik dan video mengikuti durasi aslinya (dibagi faktor kecepatan bila dipakai). Gunakan `duration=3s`, `duration=2m`, atau gabungan satuan untuk menetapkan durasi hasil, termasuk saat sesi berlangsung.
+- `speed=2` mempercepat video dan audio sumber 2×, `slow=2` memperlambat 2×; rentang `speed=0.25-4` atau `slow=1-4`. Contoh: reply video dengan `,tovideo speed=2`, lalu `,end`. Gambar statis tetap statis; musik tambahan tidak diubah temponya. `duration=...` tetap menentukan durasi keluaran (video dipotong/diulang jika perlu).
+- Default MP4 dan `q=100`. Pakai `format=gif` untuk tampilan GIF WhatsApp tanpa audio, atau `q=80` untuk kualitas lebih rendah.
+- Bot membuka sesi. Kirim beberapa stiker WhatsApp yang sudah terlihat pada gambar/frame awal, audio musik, atau instruksi teks `duration=2m`, `speed=2`, `slow=2`, `sync`, `mute`, `unmute`, `vvol=50%`, `mvol=50%`, dan `format=gif`.
+- `sync` mengikuti durasi musik. Video dan audio yang lebih pendek diulang, sedangkan yang lebih panjang dipotong. Musik dan suara video dicampur kecuali `mute` dipakai. Musik pada mode GIF diabaikan.
+- Selesaikan dengan `,end` atau reaction ✅/👍/❤️; batalkan dengan `,cancel` atau ❌/👎/❎. Setelah konfirmasi bot mengirim satu pesan progres yang diedit sampai hasil terkirim.
+- Posisi, ukuran, dan rotasi stiker dicocokkan otomatis dari beberapa frame animasi, termasuk jika stiker memiliki ruang transparan. Area latar yang tertutup stiker diperkirakan. Jika tidak cocok, hasil tidak dikirim dan sesi bisa diperbaiki.
 - Jika runtime sharp tidak bisa render PDF langsung, fallback butuh Poppler `pdftoppm` atau ImageMagick `magick`.
+
+Stiker bergerak dengan gambar edit:
+
+- Reply stiker bergerak dengan `,stimpa`. Bot mengirim frame pertama sebagai kanvas gambar 512×512.
+- Edit kanvas itu di WhatsApp dengan teks, coretan, atau gambar; kirim satu atau beberapa gambar hasil edit tanpa memotong gambar. Bot hanya menerima gambar yang cocok dengan kanvas sesi dan menumpuk edit dari semuanya. Gambar yang tidak cocok dilewati.
+- Ketik `,end` atau beri reaksi ✅/👍/❤️ pada prompt sesi. Bot menaruh gabungan perubahan pada setiap frame asli, lalu mengirim stiker WebP bergerak. `,cancel` atau ❌/👎/❎ membatalkan. Pemilik sesi dan nomor admin/host dapat mengakhiri/membatalkan sesi; pengguna lain tidak bisa.
+- Lapisan edit tetap pada posisi yang sama sementara animasi asli berjalan. Menghapus bagian asli atau menggerakkan lapisan edit secara terpisah belum didukung.
 
 Anticall:
 
@@ -220,7 +239,7 @@ Save/load:
 
 - Judul `,save`, `,note`, dan `,link` wajib unik.
 - Judul dengan spasi bisa memakai quote, contoh: `,save "judul panjang"`.
-- Update isi dengan `,save update <id|"judul lama"> ["judul baru"]`, kirim isi pengganti, lalu `,end`. Hasil update mendapat ID baru dan muncul paling bawah.
+- Tambahkan isi dengan `,save update <id|"judul lama"> ["judul baru"]`. Bot mengirim ulang dua item terakhir sebagai pratinjau (atau satu jika hanya ada satu), lalu mulai sesi: kirim konten tambahan dan akhiri dengan `,end`. Isi lama tetap ada, konten baru diletakkan di bawahnya, dan ID tidak berubah. `,cancel` membatalkan tanpa mengubah save.
 - Ganti nama tanpa mengubah isi/urutan dengan `,load rename <id|"judul lama"> "judul baru"`; legacy `,load change` tetap didukung.
 - ID save yang masih ada tidak berubah setelah save lain dihapus; angka yang sudah dipakai tidak digunakan ulang.
 - Note: `,note add <judul> <teks>`, `,note get <id|judul>`, `,note del <id|judul>`, `,note rename <id|judul> <judul-baru>`.
@@ -243,6 +262,8 @@ Backup/restore:
 - Tujuan backup bisa group atau nomor: `,config set dest.backup <nama-grup|jid|nomor>`.
 - `,restore` dimulai dari WhatsApp, lalu kirim file zip/part sebagai dokumen.
 - Setelah semua part terkirim, ketik `,end`, lalu `,confirm`; folder `data/` akan ditimpa dari isi zip.
+- `,restore save` memulihkan hanya koleksi `,save` dari ZIP/part backup lama. Setelah `,end`, pilih semua save atau pilih beberapa lewat angka (1–10 per halaman, 11/12 pindah halaman, `0` kembali). Dalam daftar, ketik `,end` setelah menandai pilihan.
+- Pilih `timpa` untuk mengganti seluruh koleksi save sekarang dengan pilihan backup, atau `gabung` untuk menambahkan pilihan sebagai save baru. Judul yang sama dalam mode gabung diberi akhiran `(backup)`; ID baru dialokasikan. Keduanya memerlukan `,confirm` dan tidak mengubah data fitur lain.
 - Backup tidak mencakup `auth/`, `.env`, `logs/`, atau `temp/`.
 
 Konfirmasi:
