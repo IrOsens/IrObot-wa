@@ -481,6 +481,7 @@ const HELP_SECTIONS = [
       { name: 'backup', text: ',backup   Backup data' },
       { name: 'restore', text: ',restore  Restore data' },
       { name: 'update', text: ',update   Update bot' },
+      { name: 'pull', text: ',pull     Git pull branch aktif' },
       { name: 'restartbot', text: ',restartbot Restart bot' },
       { name: 'anticall', text: ',anticall Kelola anti-call' },
       { name: 'changedmsg', text: ',changedmsg Pantau pesan edit/hapus' },
@@ -574,6 +575,7 @@ const HELP_DETAILS = {
     'Buka sesi pengaturan service cinta: trigger, pesan otomatis, gambar, dan emoji reaksi.',
     ',cancel membatalkan langkah, ,end menutup sesi.'
   ],
+  pull: ['Format: ,pull', 'Menjalankan git pull pada branch yang sedang aktif tanpa restart. Restart manual dengan ,restartbot agar perubahan dipakai.'],
   update: ['Format: ,update', 'Menjalankan git pull dan restart service dengan konfirmasi.'],
   restartbot: ['Format: ,restartbot', 'Keluar dari proses bot dengan konfirmasi agar supervisor bisa menyalakan ulang.'],
   clear: ['Format: ,clear', 'Membersihkan temp/ dengan konfirmasi.'],
@@ -3103,6 +3105,20 @@ async function handleServices(jid) {
   await sendText(jid, formatServices(result));
 }
 
+async function handlePullBot(jid) {
+  const branchResult = await runTool('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: ROOT_DIR });
+  const branch = String(branchResult.stdout || '').trim();
+  if (!branch || branch === 'HEAD') throw new UserInputError('Branch aktif tidak terdeteksi (detached HEAD).');
+  await sendText(jid, `Menjalankan git pull ${UPDATE_REMOTE} ${branch}...`);
+  const pull = await runTool('git', ['pull', UPDATE_REMOTE, branch], { cwd: ROOT_DIR });
+  await sendText(jid, [
+    `Pull branch ${branch} selesai.`,
+    formatCommandOutput(pull) || 'git pull selesai tanpa output.',
+    '',
+    'Bot belum di-restart. Ketik ,restartbot agar perubahan dipakai.'
+  ].join('\n'));
+}
+
 async function handleUpdateBot(jid) {
   await sendText(jid, `Menjalankan git pull ${UPDATE_REMOTE} ${UPDATE_BRANCH}...`);
   const pull = await runTool('git', ['pull', UPDATE_REMOTE, UPDATE_BRANCH], { cwd: ROOT_DIR });
@@ -3372,6 +3388,13 @@ async function handleCommand(message, command, context = commandContext(message)
       break;
     case 'worker':
       await handleWorkerAdminCommand(message, command, context);
+      break;
+    case 'pull':
+      await requestConfirmation(jid, context.actorJid, {
+        title: 'Git pull branch aktif',
+        description: 'Akan menjalankan git pull pada branch yang sedang aktif tanpa restart bot.',
+        execute: async () => handlePullBot(jid)
+      });
       break;
     case 'update':
       await requestConfirmation(jid, context.actorJid, {

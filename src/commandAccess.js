@@ -22,6 +22,7 @@ export const ADMIN_RESTRICTED_COMMANDS = new Set([
   'restore',
   'clear',
   'update',
+  'pull',
   'restartbot',
   'services'
 ]);
