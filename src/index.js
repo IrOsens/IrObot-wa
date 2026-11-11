@@ -469,7 +469,7 @@ const HELP_SECTIONS = [
     ]
   },
   {
-    title: 'Admin',
+    title: 'Pengelolaan',
     items: [
       { name: 'pause', text: ',pause    Pause bot' },
       { name: 'resume', text: ',resume   Aktifkan lagi bot' },
@@ -491,7 +491,7 @@ const HELP_SECTIONS = [
     ]
   },
   {
-    title: 'Worker',
+    title: 'Multiakun',
     items: [
       { name: 'jadibot', text: ',jadibot  Daftar jadi worker' },
       { name: 'cinta', text: ',cinta    Atur service cinta' }
