@@ -641,6 +641,7 @@ async function handleHelpDetail(jid, query, context) {
 }
 
 function canShowHelpItem(commandName, jid, context) {
+  if (commandName === 'cinta' && !workerScope.getStore()) return false;
   return Boolean(state.commandAccess?.canUseAs(commandName, jid, context?.actorJid, { owner: context?.isOwner }));
 }
 
@@ -3381,9 +3382,6 @@ async function handleCommand(message, command, context = commandContext(message)
       break;
     case 'end':
       await handleEndSession(jid, context.actorJid);
-      break;
-    case 'cinta':
-      await sendText(jid, 'Command ,cinta dipakai di dalam worker. Masuk dulu dengan ,worker session <id|nomor>, lalu ketik ,cinta di chat dengan nomor worker.');
       break;
     default:
       await sendText(jid, `Command tidak dikenal: ${COMMAND_PREFIX}${command.name}\nKetik ,help`);
