@@ -85,8 +85,7 @@ export function cintaConfig(worker) {
   const saved = worker?.serviceConfig?.cinta || {};
   return {
     triggers: Array.isArray(saved.triggers) && saved.triggers.length ? saved.triggers : DEFAULT_CINTA_TRIGGERS,
-    caption: typeof saved.caption === 'string' ? saved.caption : DEFAULT_CINTA_CAPTION,
-    imageFile: saved.imageFile || null,
+    entries: Array.isArray(saved.entries) ? saved.entries : [],
     reactionEmoji: saved.reactionEmoji || ''
   };
 }

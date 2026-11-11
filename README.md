@@ -329,9 +329,11 @@ Command worker (diketik dari akun worker sendiri, misalnya di chat "Pesan ke dir
 Service `cinta`:
 
 - Membalas pesan pribadi yang isinya persis `Aku mau pesan kak` atau `Aku mau pesan kak!` (boleh huruf kecil semua atau kapital semua). Pesan dengan karakter lain tidak memicu balasan.
-- Balasan berupa gambar menu + caption Tako-Wae. Selama gambar belum diunggah, balasan hanya caption.
-- `,cinta` membuka sesi pengaturan: ganti trigger, ganti pesan/gambar, ganti emoji reaksi, tes balasan, dan hapus gambar. `,cancel` membatalkan langkah, `,end` menutup sesi.
-- Gambar disimpan di `workers/<id>/data/cinta/`.
+- Balasan berupa pesan otomatis hasil rekaman `,cinta`. Selama belum ada rekaman, balasan memakai teks Tako-Wae bawaan tanpa gambar.
+- `,cinta` membuka sesi rekam seperti `,save` atau `,anticall new`: kirim teks, gambar, atau media lain, lalu `,end` atau reaksi `✅`/`👍`/`❤️` untuk menyimpannya sebagai pesan otomatis. `,cancel` atau reaksi `❌`/`👎`/`❎` membatalkan. Rekaman baru menggantikan yang lama. Selama belum ada rekaman, balasan memakai teks Tako-Wae bawaan.
+- `,cinta trigger <teks>` mengganti trigger (satu trigger per baris), `,cinta emoji <emoji|->` mengganti emoji reaksi, `,cinta info` melihat pengaturan, `,cinta test` mencoba balasan, `,cinta reset` mengembalikan ke bawaan.
+- Media rekaman disimpan di `workers/<id>/data/cinta/`.
+- Command `,cinta` hanya muncul dan bisa dipakai pada worker yang memakai service cinta.
 
 Pengaman anti-banned (khusus worker):
 

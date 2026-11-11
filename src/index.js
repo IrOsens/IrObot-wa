@@ -5,7 +5,7 @@ import { UserInputError, SetupRequiredError } from './errors.js';
 import { LocalArchive, STORAGE_FEATURES, destinationAlias, atomicJson, prepareLocalPath } from './storage.js';
 import { StatusInbox } from './statusInbox.js';
 import { ErrorReporter } from './errorReporter.js';
-import { reviveValue, visibleRecordedEntries } from './recordedMessages.js';
+import { reviveValue, sendRecordedEntries, visibleRecordedEntries } from './recordedMessages.js';
 import { makeTextSticker, parseTextSticker } from './textSticker.js';
 import os from 'node:os';
 import fs from 'node:fs/promises';
@@ -117,11 +117,13 @@ import { formatServices, listOpenServices } from './services.js';
 import { TypingController } from './typing.js';
 import { WorkerStore, formatWorkerInfo, formatWorkerList, waLink } from './workers.js';
 import { WorkerConnection } from './workerConnection.js';
+import { CintaRecorder, absoluteEntries, relativeEntries, removeStoredMedia } from './cintaRecorder.js';
 import {
   CINTA_DELAY_MS,
   CINTA_MAX_MESSAGE_AGE_MS,
   CINTA_REPLY_LIMIT,
   CINTA_REPLY_WINDOW_MS,
+  DEFAULT_CINTA_CAPTION,
   ReplyLimiter,
   WORKER_COMMAND_DELAY_MS,
   WORKER_COMMAND_LIMIT,
@@ -495,7 +497,7 @@ const HELP_SECTIONS = [
     title: 'Multiakun',
     items: [
       { name: 'jadibot', text: ',jadibot  Daftar jadi worker' },
-      { name: 'cinta', text: ',cinta    Atur service cinta' }
+      { name: 'cinta', text: ',cinta    Rekam pesan otomatis cinta' }
     ]
   },
   {
@@ -571,9 +573,11 @@ const HELP_DETAILS = {
     'Satu nomor hanya bisa menjadi satu worker. Berhenti jadi worker: logout perangkat tertaut di WhatsApp.'
   ],
   cinta: [
-    'Format: ,cinta',
-    'Buka sesi pengaturan service cinta: trigger, pesan otomatis, gambar, dan emoji reaksi.',
-    ',cancel membatalkan langkah, ,end menutup sesi.'
+    'Format: ,cinta (mulai sesi rekam pesan otomatis)',
+    'Kirim teks, gambar, atau media lain lalu ,end atau ✅/👍/❤️ untuk simpan. Batal: ,cancel atau ❌/👎/❎.',
+    'Format: ,cinta trigger <teks> (satu trigger per baris)',
+    'Format: ,cinta emoji <emoji|->',
+    'Format: ,cinta info, ,cinta test, ,cinta reset'
   ],
   pull: ['Format: ,pull', 'Menjalankan git pull pada branch yang sedang aktif tanpa restart. Restart manual dengan ,restartbot agar perubahan dipakai.'],
   update: ['Format: ,update', 'Menjalankan git pull dan restart service dengan konfirmasi.'],
@@ -837,6 +841,7 @@ function activeSessionType(jid) {
   if (state.saveRecorder?.has(jid)) return 'save';
   if (state.taskRecorder?.has(jid)) return 'rekam task';
   if (state.anticall?.has(jid)) return 'anticall';
+  if (state.cintaRecorder?.has(jid)) return 'cinta';
   if (state.pdfSessions?.has(jid)) return 'PDF';
   if (state.toVideoSessions?.has(jid)) return 'video';
   if (state.stimpaSessions?.has(jid)) return 'stimpa';
@@ -849,6 +854,7 @@ function activeSessionActorMatches(jid, actorJid) {
   if (state.saveRecorder?.has(jid)) return state.saveRecorder.isActor(jid, actorJid);
   if (state.taskRecorder?.has(jid)) return state.taskRecorder.isActor(jid, actorJid);
   if (state.anticall?.has(jid)) return state.anticall.isActor(jid, actorJid);
+  if (state.cintaRecorder?.has(jid)) return state.cintaRecorder.isActor(jid, actorJid);
   if (state.pdfSessions?.has(jid)) return state.pdfSessions.isActor(jid, actorJid);
   if (state.toVideoSessions?.has(jid)) return state.toVideoSessions.isActor(jid, actorJid);
   if (state.stimpaSessions?.has(jid)) return state.stimpaSessions.isActor(jid, actorJid);
@@ -861,7 +867,7 @@ function activeSessionOwnerJid(jid) {
   const promptActor = state.sessionPrompts.get(jid)?.actorJid;
   if (promptActor) return promptActor;
   for (const session of [state.saveRecorder?.sessions?.get(jid), state.taskRecorder?.sessions?.get(jid),
-    state.anticall?.sessions?.get(jid), state.pdfSessions?.get(jid), state.toVideoSessions?.get(jid),
+    state.anticall?.sessions?.get(jid), state.cintaRecorder?.sessions?.get(jid), state.pdfSessions?.get(jid), state.toVideoSessions?.get(jid),
     state.stimpaSessions?.get(jid), state.qrSessions?.get(jid), state.restoreSessions?.sessions?.get(jid)]) {
     if (session?.actorJid) return session.actorJid;
   }
@@ -886,6 +892,7 @@ function hasAnyTempSession() {
     state.saveRecorder?.sessions?.size
     || state.taskRecorder?.sessions?.size
     || state.anticall?.sessions?.size
+    || state.cintaRecorder?.sessions?.size
     || state.pdfSessions?.count()
     || state.toVideoSessions?.count()
     || state.stimpaSessions?.count()
@@ -2411,6 +2418,10 @@ async function cancelActiveSessionByJid(jid, actorJid) {
     await sendText(jid, 'Rekaman anticall dibatalkan.');
     return true;
   }
+  if (await state.cintaRecorder?.cancel(jid, actorJid)) {
+    await sendText(jid, 'Rekaman cinta dibatalkan.');
+    return true;
+  }
 
   const pdfSession = state.pdfSessions.end(jid, actorJid);
   if (pdfSession) {
@@ -2469,6 +2480,7 @@ async function finishActiveSession(jid, actorJid) {
     return true;
   }
   if (await finishAnticallByJid(jid, actorJid)) return true;
+  if (await finishCintaByJid(jid, actorJid)) return true;
   if (await finishQrByJid(jid, actorJid)) return true;
   if (await finishToVideoByJid(jid, actorJid)) return true;
   if (await finishStimpaByJid(jid, actorJid)) return true;
@@ -4078,7 +4090,7 @@ function createWorkerScope(worker, connection) {
       notesFile: path.join(dataDir, 'notes.json'),
       linksFile: path.join(dataDir, 'links.json'),
       promptKeysFile: path.join(dataDir, 'prompt-keys.json'),
-      cintaSessions: new Map()
+      cintaRecorder: new CintaRecorder()
     }
   };
 }
@@ -4221,11 +4233,13 @@ async function handleWorkerOperatorMessage(runtime, worker, message, text, fromA
   const jid = message.key.remoteJid;
   const command = parseCommand(text);
   const actorJid = messageActorJid(message);
-  if (state.cintaSessions.has(jid) && await handleCintaSessionInput(worker, message, text, command, actorJid)) return;
-
   const sessionActorMatches = activeSessionActorMatches(jid, actorJid);
   const isControlCommand = ['end', 'cancel'].includes(command?.name);
   if (sessionActorMatches && !isControlCommand) {
+    if (state.cintaRecorder.has(jid)) {
+      await listeningProgress(jid, await state.cintaRecorder.record(state.sock, message));
+      return;
+    }
     if (state.qrSessions.has(jid)) {
       await maybeCollectQrItem(message, text);
       return;
@@ -4263,7 +4277,7 @@ async function runWorkerCommand(runtime, worker, message, command, { actorJid, f
     await showWorkerTyping(jid, WORKER_COMMAND_DELAY_MS);
   }
   if (command.name === 'cinta') {
-    await startCintaSession(worker, jid, actorJid);
+    await handleCintaCommand(worker, jid, command, actorJid);
   } else if (command.name === 'status') {
     await handleWorkerStatus(jid, worker);
   } else {
@@ -4394,30 +4408,18 @@ async function handleWorkerDefaultCommand(jid, args) {
   await sendText(jid, `Command default worker #${worker.id} ${value === 'on' ? 'diaktifkan' : 'dinonaktifkan'}.${worker.service ? '' : ' Worker tanpa service selalu memakai command default.'}`);
 }
 
-const CINTA_MENU = [
-  '*Pengaturan service cinta*',
-  '1. Ganti trigger',
-  '2. Ganti pesan otomatis (teks dan/atau gambar)',
-  '3. Ganti emoji reaksi',
-  '4. Tes balasan',
-  '5. Hapus gambar',
-  '',
-  'Ketik angka pilihan. ,cancel untuk batal, ,end untuk selesai.'
-].join('\n');
-
-function cintaImagePath(worker) {
-  const { imageFile } = cintaConfig(worker);
-  return imageFile ? path.join(state.workerStore.dataDir(worker), imageFile) : null;
+function currentWorker() {
+  const scope = workerScope.getStore();
+  return scope ? ownerState.workerStore.get(scope.workerId) : null;
 }
 
 async function sendCintaReply(jid, worker) {
-  const config = cintaConfig(worker);
-  const imagePath = cintaImagePath(worker);
-  if (imagePath && await fileExists(imagePath)) {
-    await sendBotMessage(jid, { image: { url: imagePath }, caption: config.caption });
-  } else if (config.caption) {
-    await sendText(jid, config.caption);
+  const { entries } = cintaConfig(worker);
+  if (!entries.length) {
+    await sendText(jid, DEFAULT_CINTA_CAPTION);
+    return;
   }
+  await sendRecordedEntries(botSender(), jid, absoluteEntries(entries, state.workerStore.dataDir(worker)));
 }
 
 async function maybeReplyWorkerService(runtime, worker, message, text) {
@@ -4442,11 +4444,16 @@ async function maybeReplyWorkerService(runtime, worker, message, text) {
 function formatCintaConfig(worker) {
   const config = cintaConfig(worker);
   return [
-    '*Konfigurasi cinta saat ini*',
+    '*Pengaturan service cinta*',
     `Trigger: ${config.triggers.map((trigger) => `"${trigger}"`).join(', ')}`,
-    `Gambar: ${config.imageFile ? 'ada' : 'belum ada'}`,
     `Emoji reaksi: ${config.reactionEmoji || 'tidak ada'}`,
-    `Pesan: ${truncateText(config.caption, 120) || '(kosong)'}`
+    `Pesan otomatis: ${config.entries.length ? `${config.entries.length} item rekaman` : 'bawaan (teks Tako-Wae)'}`,
+    '',
+    ',cinta rekam pesan otomatis baru',
+    ',cinta trigger <teks> (satu trigger per baris)',
+    ',cinta emoji <emoji|->',
+    ',cinta test',
+    ',cinta reset'
   ].join('\n');
 }
 
@@ -4456,117 +4463,60 @@ async function updateCintaConfig(worker, changes) {
   return state.workerStore.update(worker.id, { serviceConfig });
 }
 
-async function startCintaSession(worker, jid, actorJid) {
-  state.cintaSessions.set(jid, { actorJid, step: 'menu' });
-  await sendText(jid, `${formatCintaConfig(worker)}\n\n${CINTA_MENU}`);
+async function handleCintaCommand(worker, jid, command, actorJid) {
+  const action = (command.args[0] || '').toLowerCase();
+  if (!action) {
+    await startCintaRecording(jid, actorJid);
+  } else if (action === 'info') {
+    await sendText(jid, formatCintaConfig(worker));
+  } else if (action === 'trigger') {
+    const triggers = parseCintaTriggers(command.rawArgs.replace(/^\S+/, ''));
+    await updateCintaConfig(worker, { triggers });
+    await sendText(jid, `Trigger tersimpan: ${triggers.map((trigger) => `"${trigger}"`).join(', ')}`);
+  } else if (action === 'emoji') {
+    const reactionEmoji = parseReactionEmoji(command.args[1]);
+    await updateCintaConfig(worker, { reactionEmoji });
+    await sendText(jid, reactionEmoji ? `Emoji reaksi diganti menjadi ${reactionEmoji}.` : 'Reaksi emoji dimatikan.');
+  } else if (action === 'test') {
+    await sendCintaReply(jid, worker);
+  } else if (action === 'reset') {
+    await resetCintaConfig(worker, jid, actorJid);
+  } else {
+    throw new UserInputError(HELP_DETAILS.cinta.join('\n'));
+  }
 }
 
-async function handleCintaSessionInput(worker, message, text, command, actorJid) {
-  const jid = message.key.remoteJid;
-  const session = state.cintaSessions.get(jid);
-  if (!sameActor(session.actorJid, actorJid)) return false;
-  if (command?.name === 'end') {
-    state.cintaSessions.delete(jid);
-    await sendText(jid, 'Sesi pengaturan cinta selesai. Semua perubahan sudah tersimpan.');
-    return true;
-  }
-  if (command?.name === 'cancel') {
-    if (session.step === 'menu') {
-      state.cintaSessions.delete(jid);
-      await sendText(jid, 'Sesi pengaturan cinta ditutup.');
-    } else {
-      session.step = 'menu';
-      await sendText(jid, `Langkah dibatalkan.\n\n${CINTA_MENU}`);
-    }
-    return true;
-  }
-  if (command) {
-    await sendText(jid, 'Sesi pengaturan cinta masih aktif. Selesaikan dengan ,end atau batalkan dengan ,cancel.');
-    return true;
-  }
+async function startCintaRecording(jid, actorJid) {
+  assertNoActiveSession(jid);
+  await state.cintaRecorder.start(jid, actorJid);
+  const sent = await sendText(jid, 'Mulai rekam pesan otomatis cinta. Kirim teks, gambar, atau media lain lalu ,end atau ✅ untuk simpan, ,cancel atau ❌ untuk batal. Rekaman baru menggantikan pesan otomatis lama.');
+  registerSessionPrompt(sent.key, jid, actorJid);
+}
 
-  if (session.step === 'menu') await handleCintaMenuChoice(worker, jid, session, text);
-  else if (session.step === 'trigger') await saveCintaTriggers(worker, jid, session, text);
-  else if (session.step === 'message') await saveCintaMessage(worker, jid, session, message, text);
-  else if (session.step === 'emoji') await saveCintaEmoji(worker, jid, session, text);
+async function finishCintaByJid(jid, actorJid) {
+  if (!state.cintaRecorder?.has(jid)) return false;
+  const worker = currentWorker();
+  const dataDir = state.workerStore.dataDir(worker);
+  const previousEntries = cintaConfig(worker).entries;
+  const entries = await state.cintaRecorder.finish(jid, actorJid, path.join(dataDir, 'cinta', `reply-${Date.now()}`));
+  if (!entries) return false;
+  await updateCintaConfig(worker, { entries: relativeEntries(entries, dataDir) });
+  await removeStoredMedia(previousEntries, dataDir);
+  await sendText(jid, `Pesan otomatis cinta tersimpan (${entries.length} item). Ketik ,cinta test untuk mencoba.`);
   return true;
 }
 
-async function handleCintaMenuChoice(worker, jid, session, text) {
-  const choice = String(text || '').trim();
-  if (choice === '1') {
-    session.step = 'trigger';
-    await sendText(jid, [
-      'Kirim trigger baru, satu baris untuk satu trigger. Contoh:',
-      'Aku mau pesan kak',
-      'Aku mau pesan kak!',
-      '',
-      'Trigger cocok jika pesan persis sama, boleh huruf kecil semua atau kapital semua.'
-    ].join('\n'));
-  } else if (choice === '2') {
-    session.step = 'message';
-    await sendText(jid, [
-      'Kirim pesan otomatis baru:',
-      '- Teks saja: mengganti caption.',
-      '- Gambar dengan caption: mengganti gambar dan caption.',
-      '- Gambar tanpa caption: hanya mengganti gambar.'
-    ].join('\n'));
-  } else if (choice === '3') {
-    session.step = 'emoji';
-    await sendText(jid, 'Kirim satu emoji untuk reaksi pada pesan trigger, atau - untuk mematikan reaksi.');
-  } else if (choice === '4') {
-    await sendCintaReply(jid, worker);
-    await sendText(jid, CINTA_MENU);
-  } else if (choice === '5') {
-    await removeCintaImage(worker);
-    await sendText(jid, `Gambar dihapus. Balasan sekarang hanya teks.\n\n${CINTA_MENU}`);
-  } else {
-    await sendText(jid, 'Pilih angka 1-5, atau ,end untuk selesai.');
-  }
-}
-
-async function saveCintaTriggers(worker, jid, session, text) {
-  const triggers = parseCintaTriggers(text);
-  await updateCintaConfig(worker, { triggers });
-  session.step = 'menu';
-  await sendText(jid, `Trigger tersimpan: ${triggers.map((trigger) => `"${trigger}"`).join(', ')}\n\n${CINTA_MENU}`);
-}
-
-async function saveCintaMessage(worker, jid, session, message, text) {
-  const changes = {};
-  if (mediaNode(message)?.type === 'imageMessage') {
-    const media = await downloadMessageMedia(state.sock, message, 'cinta-image');
-    try {
-      const oldImagePath = cintaImagePath(worker);
-      if (oldImagePath) await fs.rm(oldImagePath, { force: true });
-      const imageFile = path.join('cinta', `menu${path.extname(media.path) || '.jpg'}`);
-      const imagePath = path.join(state.workerStore.dataDir(worker), imageFile);
-      await fs.mkdir(path.dirname(imagePath), { recursive: true });
-      await fs.copyFile(media.path, imagePath);
-      changes.imageFile = imageFile;
-    } finally {
-      await cleanupFiles([media.path]);
+async function resetCintaConfig(worker, jid, actorJid) {
+  const dataDir = state.workerStore.dataDir(worker);
+  await requestConfirmation(jid, actorJid, {
+    title: 'Reset pengaturan cinta',
+    description: 'Trigger, emoji reaksi, dan pesan otomatis kembali ke bawaan.',
+    execute: async () => {
+      await removeStoredMedia(cintaConfig(worker).entries, dataDir);
+      await state.workerStore.update(worker.id, { serviceConfig: { ...worker.serviceConfig, cinta: {} } });
+      await sendText(jid, 'Pengaturan cinta dikembalikan ke bawaan.');
     }
-  }
-  const caption = String(text || '').trim();
-  if (caption) changes.caption = caption;
-  if (!Object.keys(changes).length) throw new UserInputError('Kirim teks atau gambar untuk pesan otomatis.');
-  await updateCintaConfig(worker, changes);
-  session.step = 'menu';
-  await sendText(jid, `Pesan otomatis tersimpan.\n\n${CINTA_MENU}`);
-}
-
-async function saveCintaEmoji(worker, jid, session, text) {
-  const reactionEmoji = parseReactionEmoji(text);
-  await updateCintaConfig(worker, { reactionEmoji });
-  session.step = 'menu';
-  await sendText(jid, `${reactionEmoji ? `Emoji reaksi diganti menjadi ${reactionEmoji}.` : 'Reaksi emoji dimatikan.'}\n\n${CINTA_MENU}`);
-}
-
-async function removeCintaImage(worker) {
-  const imagePath = cintaImagePath(worker);
-  if (imagePath) await fs.rm(imagePath, { force: true });
-  await updateCintaConfig(worker, { imageFile: null });
+  });
 }
 
 async function maybeLogSystemdTip() {

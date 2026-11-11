@@ -231,3 +231,62 @@ test('jadibot request notifies the owner and can be rejected by replying to the 
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+test('cinta recording session saves the recorded messages as the automatic reply', async () => {
+  const dir = await tmp();
+  const previous = { sock: state.sock, workerStore: state.workerStore };
+  Object.assign(CINTA_DELAY_MS, { min: 0, max: 0 });
+  Object.assign(WORKER_COMMAND_DELAY_MS, { min: 0, max: 0 });
+  try {
+    state.sock = { user: { id: '628999999999@s.whatsapp.net' }, sendMessage: async () => ({ key: {} }) };
+    state.workerStore = await new WorkerStore({
+      file: path.join(dir, 'workers.json'),
+      rootDir: path.join(dir, 'workers'),
+      archiveDir: path.join(dir, 'workers', 'archive')
+    }).load();
+    const worker = await state.workerStore.create({ phoneJid: workerPhone, name: 'Tako' });
+    await state.workerStore.update(worker.id, { service: 'cinta' });
+
+    const sent = [];
+    const workerSock = {
+      user: { id: workerPhone },
+      sendMessage: async (jid, content) => { sent.push({ jid, content }); return { key: { remoteJid: jid, id: `worker-${sent.length}`, fromMe: true } }; },
+      sendPresenceUpdate: async () => {},
+      readMessages: async () => {}
+    };
+    const connection = { sock: workerSock, connected: true };
+    const runtime = { workerId: worker.id, connection, scope: createWorkerScope(worker, connection), limiter: new ReplyLimiter() };
+    let id = 0;
+    const message = (text, fromMe) => ({
+      key: { remoteJid: fromMe ? workerPhone : customer, id: `in-${++id}`, fromMe },
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      message: { conversation: text }
+    });
+    const deliver = (item) => workerScope.run(runtime.scope, () => onWorkerMessageUpsert(runtime, { type: 'notify', messages: [item] }));
+
+    await deliver(message(',cinta', true));
+    assert.match(sent.at(-1).content.text, /Mulai rekam pesan otomatis cinta/);
+    await deliver(message('Halo, ini menu kami', true));
+    await deliver(message('Silakan pesan ya', true));
+    await deliver(message(',end', true));
+    assert.match(sent.at(-1).content.text, /tersimpan \(2 item\)/);
+    assert.equal(worker.serviceConfig.cinta.entries.length, 2);
+
+    await deliver(message(',cinta trigger Mau pesan\nMau pesan!', true));
+    await deliver(message('mau pesan', false));
+    const replies = sent.filter((item) => item.jid === customer).map((item) => item.content.text);
+    assert.deepEqual(replies, ['Halo, ini menu kami', 'Silakan pesan ya']);
+
+    await deliver(message(',cinta', true));
+    await deliver(message('rekaman batal', true));
+    await deliver(message(',cancel', true));
+    assert.match(sent.at(-1).content.text, /Rekaman cinta dibatalkan/);
+    assert.equal(worker.serviceConfig.cinta.entries.length, 2);
+  } finally {
+    Object.assign(CINTA_DELAY_MS, { min: 3000, max: 8000 });
+    Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
+    state.sock = previous.sock;
+    state.workerStore = previous.workerStore;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
