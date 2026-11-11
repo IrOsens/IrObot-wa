@@ -8,6 +8,7 @@ data/saved-messages.json
 data/saved-messages/
 logs/
 temp/
+workers/
 
 .env
 .DS_Store

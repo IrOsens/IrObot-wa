@@ -727,7 +727,8 @@ test('CommandAccessStore gates public commands', async () => {
     assert.equal(store.canUseAs('status', 'chat-b', admin.jid), true);
     assert.equal(store.canUseAs('wol', 'chat-b', admin.jid), true);
     assert.equal(store.canUseAs('backup', 'chat-b', admin.jid), false);
-    assert.equal(store.canUseAs('bot', 'chat-b', admin.jid), false);
+    assert.equal(store.canUseAs('pause', 'chat-b', admin.jid), false);
+    assert.equal(store.canUseAs('worker', 'chat-b', admin.jid), false);
     assert.equal(store.canUseAs('anticall', 'chat-b', admin.jid), false);
     const deleted = await store.deleteAdmin('08123431212');
     assert.equal(deleted.id, 1);

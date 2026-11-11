@@ -4,12 +4,15 @@ import path from 'node:path';
 import { COMMAND_ACCESS_FILE } from './config.js';
 import { displayPhoneFromJid, normalizePhoneToJid, sameJid, tryNormalizeJid } from './phone.js';
 
-export const PUBLIC_COMMANDS = new Set(['help', 'stext', 's', 'smeme', 'rs', 'resend', 'qr', 'tovideo', 'stimpa']);
+export const PUBLIC_COMMANDS = new Set(['help', 'stext', 's', 'smeme', 'rs', 'resend', 'qr', 'tovideo', 'stimpa', 'jadibot']);
 export const ADMIN_RESTRICTED_COMMANDS = new Set([
   'allow',
   'admin',
   'anticall',
-  'bot',
+  'pause',
+  'resume',
+  'worker',
+  'cinta',
   'changedmsg',
   'config',
   'setup',

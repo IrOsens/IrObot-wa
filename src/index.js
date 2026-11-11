@@ -1,5 +1,6 @@
 import { presentStatus, statusCaption } from './statusViewer.js';
 import { pathToFileURL } from 'node:url';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { UserInputError, SetupRequiredError } from './errors.js';
 import { LocalArchive, STORAGE_FEATURES, destinationAlias, atomicJson, prepareLocalPath } from './storage.js';
 import { StatusInbox } from './statusInbox.js';
@@ -46,6 +47,7 @@ import {
   UPDATE_RESTART_MODE,
   UPDATE_SYSTEMD_SERVICE,
   WOL_FILE,
+  WORKERS_PENDING_DIR,
   cleanupStartupTemp,
   ensureRuntimeDirs
 } from './config.js';
@@ -113,6 +115,26 @@ import {
 import { AnticallStore, formatAnticallStatus } from './anticall.js';
 import { formatServices, listOpenServices } from './services.js';
 import { TypingController } from './typing.js';
+import { WorkerStore, formatWorkerInfo, formatWorkerList, waLink } from './workers.js';
+import { WorkerConnection } from './workerConnection.js';
+import {
+  CINTA_DELAY_MS,
+  CINTA_MAX_MESSAGE_AGE_MS,
+  CINTA_REPLY_LIMIT,
+  CINTA_REPLY_WINDOW_MS,
+  ReplyLimiter,
+  WORKER_COMMAND_DELAY_MS,
+  WORKER_COMMAND_LIMIT,
+  WORKER_COMMAND_WINDOW_MS,
+  cintaConfig,
+  findWorkerService,
+  formatWorkerServiceList,
+  matchCintaTrigger,
+  parseCintaTriggers,
+  parseReactionEmoji,
+  randomDelayMs,
+  workerCommandAllowed
+} from './workerServices.js';
 
 class ChatDirectory {
   constructor() {
@@ -246,7 +268,9 @@ class ViewOnceCache {
   }
 }
 
-const state = {
+const workerScope = new AsyncLocalStorage();
+
+const ownerState = {
   sock: null,
   connected: false,
   groups: new Map(),
@@ -281,8 +305,28 @@ const state = {
   typing: null,
   rejectedCallIds: new Set(),
   ignoredOwnMessageIds: new Set(),
-  reconnecting: false
+  reconnecting: false,
+  notesFile: NOTES_FILE,
+  linksFile: LINKS_FILE,
+  promptKeysFile: path.join(ROOT_DIR, 'data', 'prompt-keys.json'),
+  workerStore: null
 };
+
+// While a worker message is handled, state.<key> reads the worker's own value
+// (socket, sessions, data files) when the worker scope defines that key.
+const state = new Proxy(ownerState, {
+  get(target, key) {
+    const scope = workerScope.getStore();
+    if (scope && key in scope.state) return scope.state[key];
+    return target[key];
+  },
+  set(target, key, value) {
+    const scope = workerScope.getStore();
+    if (scope && key in scope.state) scope.state[key] = value;
+    else target[key] = value;
+    return true;
+  }
+});
 
 function normalizeLookupText(value) {
   return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
@@ -427,7 +471,9 @@ const HELP_SECTIONS = [
   {
     title: 'Admin',
     items: [
-      { name: 'bot', text: ',bot      On/off bot' },
+      { name: 'pause', text: ',pause    Pause bot' },
+      { name: 'resume', text: ',resume   Aktifkan lagi bot' },
+      { name: 'worker', text: ',worker   Kelola worker' },
       { name: 'allow', text: ',allow    Atur akses chat' },
       { name: 'admin', text: ',admin    Atur admin' },
       { name: 'setup', text: ',setup Tujuan grup/server' },
@@ -442,6 +488,13 @@ const HELP_SECTIONS = [
       { name: 'clear', text: ',clear    Bersihkan temp' },
       { name: 'button', text: ',button   Tes tombol command' },
       { name: 'typing', text: ',typing   Tampilkan typing terus-menerus' }
+    ]
+  },
+  {
+    title: 'Worker',
+    items: [
+      { name: 'jadibot', text: ',jadibot  Daftar jadi worker' },
+      { name: 'cinta', text: ',cinta    Atur service cinta' }
     ]
   },
   {
@@ -501,7 +554,26 @@ const HELP_DETAILS = {
   anticall: ['Listening: ,anticall new, kirim teks/media/VN/lokasi, lalu ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.', 'Format: ,anticall', 'Format: ,anticall new|on|off', 'Format: ,anticall except list|add|del <nomor|id>'],
   allow: ['Format: ,allow here on|off', 'Format: ,allow all on|off', 'Legacy true|false tetap didukung.'],
   admin: ['Format: ,admin list', 'Format: ,admin add <nomor>', 'Format: ,admin del <nomor|id>'],
-  bot: ['Format: ,bot, ,bot on, ,bot off', ',bot off mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall.'],
+  pause: ['Format: ,pause', 'Mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall akun utama. Worker tetap berjalan.'],
+  resume: ['Format: ,resume', 'Mengaktifkan lagi bot setelah ,pause.'],
+  worker: [
+    'Format: ,worker atau ,worker list',
+    'Format: ,worker info <id|nomor>',
+    'Format: ,worker session <id|nomor>, lalu ketik command di chat dengan nomor worker. Keluar: ,end atau ,worker exit',
+    'Format: ,worker service list',
+    'Format: ,worker service <id|nomor> <nama|off>',
+    'Format: ,worker default <id|nomor> on|off (izinkan command default untuk worker yang memakai service)'
+  ],
+  jadibot: [
+    'Format: ,jadibot atau ,jadibot kode',
+    'Permintaan dikirim ke admin. Setelah disetujui, QR (atau kode tautan) dikirim dan berlaku 60 detik.',
+    'Satu nomor hanya bisa menjadi satu worker. Berhenti jadi worker: logout perangkat tertaut di WhatsApp.'
+  ],
+  cinta: [
+    'Format: ,cinta',
+    'Buka sesi pengaturan service cinta: trigger, pesan otomatis, gambar, dan emoji reaksi.',
+    ',cancel membatalkan langkah, ,end menutup sesi.'
+  ],
   update: ['Format: ,update', 'Menjalankan git pull dan restart service dengan konfirmasi.'],
   restartbot: ['Format: ,restartbot', 'Keluar dari proses bot dengan konfirmasi agar supervisor bisa menyalakan ulang.'],
   clear: ['Format: ,clear', 'Membersihkan temp/ dengan konfirmasi.'],
@@ -835,8 +907,10 @@ async function requestConfirmation(jid, actorOrAction, maybeAction = null) {
 let promptSaveQueue = Promise.resolve();
 function rememberPromptKey(key) {
   if (!key?.remoteJid || !key?.id) return;
-  state.reactionActions.prompts.add(`${key.remoteJid}:${key.id}`);
-  promptSaveQueue = promptSaveQueue.then(() => atomicJson(path.join(ROOT_DIR, 'data', 'prompt-keys.json'), [...state.reactionActions.prompts])).catch((error) => logger.error('Prompt persistence failed', { error: error.message }));
+  const prompts = state.reactionActions.prompts;
+  const promptKeysFile = state.promptKeysFile;
+  prompts.add(`${key.remoteJid}:${key.id}`);
+  promptSaveQueue = promptSaveQueue.then(() => atomicJson(promptKeysFile, [...prompts])).catch((error) => logger.error('Prompt persistence failed', { error: error.message }));
 }
 
 function registerConfirmationPrompt(messageKey, jid, actorJid) {
@@ -2247,22 +2321,24 @@ async function sendSavedList(jid, actorJid) {
 }
 
 async function sendNoteList(jid, actorJid) {
-  await sendReactionList(jid, actorJid, 'notes', await listNotes(), {
+  const notesFile = state.notesFile;
+  await sendReactionList(jid, actorJid, 'notes', await listNotes(notesFile), {
     emptyText: 'Belum ada note.',
     formatItem: (item) => `#${item.id} - ${item.title}`,
     deleteTitle: (item) => `Hapus note #${item.id}`,
     deleteDescription: 'Note ini akan dihapus permanen.',
-    deleteItem: async (item) => handleNoteCommand({ args: ['del', String(item.id)], rawArgs: `del ${item.id}` })
+    deleteItem: async (item) => handleNoteCommand({ args: ['del', String(item.id)], rawArgs: `del ${item.id}` }, notesFile)
   });
 }
 
 async function sendLinkList(jid, actorJid) {
-  await sendReactionList(jid, actorJid, 'links', await listLinks(), {
+  const linksFile = state.linksFile;
+  await sendReactionList(jid, actorJid, 'links', await listLinks(linksFile), {
     emptyText: 'Belum ada link.',
     formatItem: (item) => `#${item.id} - ${item.title}`,
     deleteTitle: (item) => `Hapus link #${item.id}`,
     deleteDescription: 'Link ini akan dihapus permanen.',
-    deleteItem: async (item) => handleLinkCommand({ args: ['del', String(item.id)], rawArgs: `del ${item.id}` })
+    deleteItem: async (item) => handleLinkCommand({ args: ['del', String(item.id)], rawArgs: `del ${item.id}` }, linksFile)
   });
 }
 
@@ -2779,19 +2855,12 @@ async function handleAllow(message, command) {
   ].filter(Boolean).join('\n'));
 }
 
-async function handleBotCommand(message, command, context) {
-  if (!context.isOwner) throw new UserInputError('Command ,bot hanya bisa dipakai nomor yang terhubung ke session bot.');
+async function handlePauseCommand(message, command, context) {
+  if (!context.isOwner) throw new UserInputError(`Command ,${command.name} hanya bisa dipakai nomor yang terhubung ke session bot.`);
   const jid = message.key.remoteJid;
-  const action = (command.args[0] || '').toLowerCase();
-  if (!action) {
-    const snapshot = state.botState.snapshot();
-    await sendText(jid, `Bot: ${snapshot.enabled ? 'on' : 'off'}.`);
-    return;
-  }
-  if (!['on', 'off'].includes(action)) throw new UserInputError('Format: ,bot [on|off]');
-  const snapshot = await state.botState.setEnabled(action === 'on');
+  const snapshot = await state.botState.setEnabled(command.name === 'resume');
   applyBotRuntimeState();
-  await sendText(jid, `Bot sekarang ${snapshot.enabled ? 'on' : 'off'}.`);
+  await sendText(jid, snapshot.enabled ? 'Bot aktif kembali.' : 'Bot di-pause. Ketik ,resume untuk mengaktifkan lagi.');
 }
 
 async function handleAdminCommand(message, command, context) {
@@ -3149,17 +3218,18 @@ async function handleCommand(message, command, context = commandContext(message)
       } else if (command.args[0]?.toLowerCase() === 'del') {
         const query = command.args.slice(1).join(' ').trim();
         if (!query) throw new UserInputError(HELP_DETAILS.note.join('\n'));
+        const notesFile = state.notesFile;
         await requestConfirmation(jid, context.actorJid, {
           title: `Hapus note "${query}"`,
           description: 'Note ini akan dihapus permanen.',
           execute: async () => {
-            const text = await handleNoteCommand(command);
+            const text = await handleNoteCommand(command, notesFile);
             invalidateListKind('notes');
             await sendText(jid, text);
           }
         });
       } else {
-        const text = await handleNoteCommand(command);
+        const text = await handleNoteCommand(command, state.notesFile);
         if (isNamedMutation(command)) invalidateListKind('notes');
         await sendText(jid, text);
       }
@@ -3170,17 +3240,18 @@ async function handleCommand(message, command, context = commandContext(message)
       } else if (command.args[0]?.toLowerCase() === 'del') {
         const query = command.args.slice(1).join(' ').trim();
         if (!query) throw new UserInputError(HELP_DETAILS.link.join('\n'));
+        const linksFile = state.linksFile;
         await requestConfirmation(jid, context.actorJid, {
           title: `Hapus link "${query}"`,
           description: 'Link ini akan dihapus permanen.',
           execute: async () => {
-            const text = await handleLinkCommand(command);
+            const text = await handleLinkCommand(command, linksFile);
             invalidateListKind('links');
             await sendText(jid, text);
           }
         });
       } else {
-        const text = await handleLinkCommand(command);
+        const text = await handleLinkCommand(command, state.linksFile);
         if (isNamedMutation(command)) invalidateListKind('links');
         await sendText(jid, text);
       }
@@ -3294,8 +3365,12 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'admin':
       await handleAdminCommand(message, command, context);
       break;
-    case 'bot':
-      await handleBotCommand(message, command, context);
+    case 'pause':
+    case 'resume':
+      await handlePauseCommand(message, command, context);
+      break;
+    case 'worker':
+      await handleWorkerAdminCommand(message, command, context);
       break;
     case 'update':
       await requestConfirmation(jid, context.actorJid, {
@@ -3306,6 +3381,9 @@ async function handleCommand(message, command, context = commandContext(message)
       break;
     case 'end':
       await handleEndSession(jid, context.actorJid);
+      break;
+    case 'cinta':
+      await sendText(jid, 'Command ,cinta dipakai di dalam worker. Masuk dulu dengan ,worker session <id|nomor>, lalu ketik ,cinta di chat dengan nomor worker.');
       break;
     default:
       await sendText(jid, `Command tidak dikenal: ${COMMAND_PREFIX}${command.name}\nKetik ,help`);
@@ -3325,14 +3403,16 @@ async function onMessageUpsert(event) {
     const jid = message.key.remoteJid;
     const isOwner = Boolean(message.key?.fromMe);
     if (isOwner && isIgnoredOwnOutput(message)) continue;
+    if (!isOwner && isWorkerBotOutput(message)) continue;
     const text = getMessageText(message);
     const command = parseCommand(text);
     const context = commandContext(message);
     try {
       if (!isBotEnabled()) {
-        if (context.isOwner && command?.name === 'bot') await handleCommand(message, command, context);
+        if (context.isOwner && command?.name === 'resume') await handleCommand(message, command, context);
         continue;
       }
+      if (context.isOwner && isAdminSessionChat(message)) continue;
 
       rememberMessageDirectory(message);
       state.viewOnceCache.remember(message);
@@ -3378,10 +3458,17 @@ async function onMessageUpsert(event) {
         await collectStimpaItem(message);
         continue;
       }
+      if (!command && context.isOwner && await maybeHandleJadibotTextApproval(message, text)) {
+        continue;
+      }
       if (!command && !state.pdfSessions.has(jid) && context.isOwner && await maybeForwardRepliedViewOnce(message, text)) {
         continue;
       }
       if (command) {
+        if (command.name === 'jadibot') {
+          await handleJadibot(message, command, context);
+          continue;
+        }
         if (!state.commandAccess?.canUseAs(command.name, jid, context.actorJid, { owner: context.isOwner }) && !(sessionActive && canControlSession)) continue;
         if (canControlSession && !sessionActorMatches) {
           await handleCommand(message, command, { ...context, actorJid: sessionControlActor(jid, context.actorJid, context.isOwner) });
@@ -3438,30 +3525,35 @@ async function onMessagesReaction(updates) {
   if (!isBotEnabled()) return;
   for (const update of updates || []) {
     try {
+      if (await maybeHandleJadibotReaction(update)) continue;
       if (await maybeForwardReactedViewOnce(update)) continue;
-      const intent = reactionIntent(update?.reaction?.text);
-      if (!intent) continue;
-      const actorJid = reactionActorJid(update);
-      let action = state.reactionActions.get(update.key, actorJid);
-      const jid = update.key?.remoteJid;
-      const prompt = state.sessionPrompts.get(jid);
-      if (!action && prompt?.key?.id === update.key?.id && prompt.key.remoteJid === jid
-        && isSessionController(jid, actorJid, Boolean(update.reaction?.key?.fromMe))) {
-        action = state.reactionActions.get(update.key, prompt.actorJid);
-      }
-      if (!action) {
-        if (intent === 'cancel' && update.reaction?.key?.fromMe && update.key?.fromMe && !state.reactionActions.isPrompt(update.key)) await sendBotMessage(update.key.remoteJid, { delete: update.key });
-        continue;
-      }
-      const handler = intent === 'confirm' ? action.onConfirm : action.onCancel;
-      if (!handler) continue;
-      await handler(update);
-      if (action.scope?.startsWith('session:') && activeSessionType(jid)) action.expiresAt = Date.now() + 30 * 60 * 1000;
-      else state.reactionActions.delete(update.key);
+      await handleReactionAction(update);
     } catch (error) {
       await handleFailure(error, { jid: update?.key?.remoteJid, messageId: update.key?.id });
     }
   }
+}
+
+async function handleReactionAction(update) {
+  const intent = reactionIntent(update?.reaction?.text);
+  if (!intent) return;
+  const actorJid = reactionActorJid(update);
+  let action = state.reactionActions.get(update.key, actorJid);
+  const jid = update.key?.remoteJid;
+  const prompt = state.sessionPrompts.get(jid);
+  if (!action && prompt?.key?.id === update.key?.id && prompt.key.remoteJid === jid
+    && isSessionController(jid, actorJid, Boolean(update.reaction?.key?.fromMe))) {
+    action = state.reactionActions.get(update.key, prompt.actorJid);
+  }
+  if (!action) {
+    if (intent === 'cancel' && update.reaction?.key?.fromMe && update.key?.fromMe && !state.reactionActions.isPrompt(update.key)) await sendBotMessage(update.key.remoteJid, { delete: update.key });
+    return;
+  }
+  const handler = intent === 'confirm' ? action.onConfirm : action.onCancel;
+  if (!handler) return;
+  await handler(update);
+  if (action.scope?.startsWith('session:') && activeSessionType(jid)) action.expiresAt = Date.now() + 30 * 60 * 1000;
+  else state.reactionActions.delete(update.key);
 }
 
 function rememberMessageDirectory(message) {
@@ -3615,6 +3707,847 @@ async function connect() {
   });
 }
 
+const JADIBOT_REQUEST_TTL_MS = 10 * 60 * 1000;
+const JADIBOT_QR_TTL_MS = 60 * 1000;
+const JADIBOT_LOGIN_WAIT_LIMIT = 4;
+const JADIBOT_APPROVE_WORDS = ['accept', 'yes', 'ya'];
+const JADIBOT_REJECT_WORDS = ['no', 'tolak', 'reject', 'tidak'];
+
+const workerRuntimes = new Map();
+const jadibotRequests = new Map();
+const jadibotApprovals = new Map();
+const jadibotCooldowns = new Map();
+const jadibotPairings = new Map();
+let nextJadibotRequestId = 1;
+let adminWorkerSession = null;
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function runAsOwner(fn) {
+  return workerScope.exit(fn);
+}
+
+function ownerAccountJids() {
+  const user = ownerState.sock?.user;
+  return [user?.id, user?.lid].filter(Boolean).map((jid) => jidNormalizedUser(jid));
+}
+
+function isOwnerAccountJid(jid) {
+  if (!jid) return false;
+  return ownerAccountJids().some((ownerJid) => sameActor(ownerJid, jid));
+}
+
+async function notifyOwner(text) {
+  await runAsOwner(async () => {
+    if (!state.connected) return;
+    try {
+      await sendText(ownUserJid(), text);
+    } catch (error) {
+      await logger.warn('Owner notification failed', { error: error.message });
+    }
+  });
+}
+
+async function safeSendText(jid, text) {
+  try {
+    await sendText(jid, text);
+  } catch (error) {
+    await logger.warn('Send text failed', { jid, error: error.message });
+  }
+}
+
+async function handleJadibot(message, command, context) {
+  const jid = message.key.remoteJid;
+  if (context.isOwner) throw new UserInputError('Akun admin utama tidak bisa menjadi worker.');
+  const firstArg = (command.args[0] || '').toLowerCase();
+  const mode = ['kode', 'code'].includes(firstArg) ? 'code' : 'qr';
+  const requesterJid = context.actorJid;
+  const phoneJid = await resolveRequesterPhoneJid(message, requesterJid);
+
+  if (phoneJid) {
+    const existing = state.workerStore.findByPhone(phoneJid);
+    if (existing && existing.status !== 'logged_out') {
+      throw new UserInputError(`Nomor kamu sudah terhubung sebagai worker #${existing.id}. Untuk berhenti, logout perangkat tertaut di WhatsApp.`);
+    }
+  }
+  if (mode === 'code' && !phoneJid) throw new UserInputError('Nomor kamu tidak terbaca untuk kode tautan. Pakai ,jadibot untuk QR.');
+  await cleanupJadibotState();
+  if (jadibotPairings.has(requesterJid)) throw new UserInputError('QR/kode kamu masih aktif. Cek chat atau tunggu sampai kedaluwarsa.');
+
+  const request = { requesterJid, phoneJid, chatJid: jid, messageKey: message.key, mode, name: message.pushName || '' };
+  if ((jadibotApprovals.get(requesterJid) || 0) > Date.now()) {
+    await startJadibotPairing(request);
+    return;
+  }
+  if (findJadibotRequestByRequester(requesterJid)) throw new UserInputError('Permintaan jadibot kamu masih menunggu persetujuan admin.');
+  if ((jadibotCooldowns.get(requesterJid) || 0) > Date.now()) throw new UserInputError('Permintaan jadibot kamu baru saja ditolak. Coba lagi nanti.');
+
+  request.id = nextJadibotRequestId++;
+  request.createdAt = Date.now();
+  jadibotRequests.set(request.id, request);
+  await sendText(jid, 'Permintaan jadibot dikirim ke admin. Tunggu persetujuan, ya.');
+  const notice = await sendText(ownUserJid(), formatJadibotNotice(request));
+  request.noticeKey = notice?.key || null;
+}
+
+async function resolveRequesterPhoneJid(message, actorJid) {
+  const candidates = [actorJid, message.key?.participantAlt, message.key?.remoteJidAlt];
+  for (const candidate of candidates) {
+    if (candidate && candidate.endsWith('@s.whatsapp.net')) return jidNormalizedUser(candidate);
+  }
+  if (actorJid?.endsWith('@lid')) {
+    try {
+      const phoneJid = await state.sock?.signalRepository?.lidMapping?.getPNForLID(actorJid);
+      if (phoneJid) return jidNormalizedUser(phoneJid);
+    } catch (error) {
+      await logger.warn('LID lookup failed', { jid: actorJid, error: error.message });
+    }
+  }
+  return null;
+}
+
+function formatJadibotNotice(request) {
+  const phone = request.phoneJid
+    ? `+${displayPhoneFromJid(request.phoneJid)} (wa.me/${displayPhoneFromJid(request.phoneJid)})`
+    : `nomor tidak terbaca (${request.requesterJid})`;
+  const chat = request.chatJid.endsWith('@g.us')
+    ? `grup ${state.chatDirectory.nameFor(request.chatJid) || request.chatJid}`
+    : 'chat pribadi';
+  return [
+    `*Permintaan jadibot #${request.id}*`,
+    `Dari: ${request.name || '-'} ${phone}`,
+    `Chat: ${chat}`,
+    `Mode: ${request.mode === 'code' ? 'kode tautan' : 'QR'}`,
+    '',
+    'Setujui: reply pesan ini dengan accept/yes/ya, atau react ✅/👍/❤️ di pesan ini atau di pesan ,jadibot user.',
+    'Tolak: reply no/tolak, atau react ❌/👎/❎.',
+    'Kedaluwarsa dalam 10 menit.'
+  ].join('\n');
+}
+
+function findJadibotRequestByRequester(requesterJid) {
+  return [...jadibotRequests.values()].find((request) => sameActor(request.requesterJid, requesterJid)) || null;
+}
+
+function findJadibotRequestByMessage(key) {
+  if (!key?.id) return null;
+  return [...jadibotRequests.values()].find((request) => request.messageKey?.id === key.id || request.noticeKey?.id === key.id) || null;
+}
+
+async function maybeHandleJadibotReaction(update) {
+  if (!jadibotRequests.size || !update.reaction?.key?.fromMe) return false;
+  const request = findJadibotRequestByMessage(update.key);
+  if (!request) return false;
+  const intent = reactionIntent(update.reaction.text);
+  if (!intent) return false;
+  if (intent === 'confirm') await approveJadibotRequest(request);
+  else await rejectJadibotRequest(request);
+  return true;
+}
+
+async function maybeHandleJadibotTextApproval(message, text) {
+  if (!jadibotRequests.size) return false;
+  const answer = String(text || '').trim().toLowerCase().replace(/[.!]+$/, '');
+  const approve = JADIBOT_APPROVE_WORDS.includes(answer);
+  const reject = JADIBOT_REJECT_WORDS.includes(answer);
+  if (!approve && !reject) return false;
+
+  const quoted = extractQuotedMessage(message);
+  let request = quoted ? findJadibotRequestByMessage(quoted.key) : null;
+  // Without a reply, a plain answer in the owner's own chat is accepted only when one request is waiting.
+  if (!request && !quoted && isOwnerAccountJid(message.key.remoteJid) && jadibotRequests.size === 1) {
+    request = [...jadibotRequests.values()][0];
+  }
+  if (!request) return false;
+  if (approve) await approveJadibotRequest(request);
+  else await rejectJadibotRequest(request);
+  return true;
+}
+
+async function approveJadibotRequest(request) {
+  jadibotRequests.delete(request.id);
+  jadibotApprovals.set(request.requesterJid, Date.now() + JADIBOT_REQUEST_TTL_MS);
+  await sendText(ownUserJid(), `Permintaan jadibot #${request.id} disetujui.`);
+  await startJadibotPairing(request);
+}
+
+async function rejectJadibotRequest(request) {
+  jadibotRequests.delete(request.id);
+  jadibotCooldowns.set(request.requesterJid, Date.now() + JADIBOT_REQUEST_TTL_MS);
+  await sendText(ownUserJid(), `Permintaan jadibot #${request.id} ditolak.`);
+  await safeSendText(request.chatJid, 'Permintaan jadibot kamu ditolak admin.');
+}
+
+async function cleanupJadibotState() {
+  const now = Date.now();
+  for (const request of [...jadibotRequests.values()]) {
+    if (now - request.createdAt < JADIBOT_REQUEST_TTL_MS) continue;
+    jadibotRequests.delete(request.id);
+    await safeSendText(request.chatJid, 'Permintaan jadibot kedaluwarsa karena belum disetujui admin. Coba lagi nanti.');
+  }
+  for (const map of [jadibotApprovals, jadibotCooldowns]) {
+    for (const [jid, until] of map) if (until <= now) map.delete(jid);
+  }
+}
+
+async function startJadibotPairing(request) {
+  const isPrivateChat = !request.chatJid.endsWith('@g.us');
+  const dmJid = isPrivateChat ? request.chatJid : (request.phoneJid || request.requesterJid);
+  const pairing = {
+    request,
+    dmJid,
+    authDir: path.join(WORKERS_PENDING_DIR, `${Date.now()}-${displayPhoneFromJid(request.requesterJid)}`),
+    qrKey: null,
+    codeSent: false,
+    finished: false,
+    loginWaits: 0,
+    timer: null,
+    connection: null
+  };
+  pairing.connection = new WorkerConnection({
+    authDir: pairing.authDir,
+    logger,
+    label: `pairing-${displayPhoneFromJid(request.requesterJid)}`,
+    handlers: {
+      onQr: (qr, sock) => sendPairingQr(pairing, qr, sock),
+      onOpen: (sock) => finishJadibotPairing(pairing, sock),
+      onLoggedOut: () => failJadibotPairing(pairing, 'Login dibatalkan dari WhatsApp. Ketik ,jadibot untuk mencoba lagi.')
+    }
+  });
+  jadibotPairings.set(request.requesterJid, pairing);
+  const target = request.mode === 'code' ? 'Kode tautan' : 'QR';
+  await sendText(request.chatJid, isPrivateChat
+    ? `Disetujui admin! ${target} dikirim di chat ini.`
+    : `Disetujui admin! ${target} dikirim lewat chat pribadi.`);
+  pairing.timer = setTimeout(() => expireJadibotPairing(pairing).catch((error) => handleFailure(error)), JADIBOT_QR_TTL_MS);
+  await runAsOwner(() => pairing.connection.start());
+}
+
+async function sendPairingQr(pairing, qr, sock) {
+  if (pairing.finished) return;
+  if (pairing.request.mode === 'code') {
+    if (pairing.codeSent) return;
+    pairing.codeSent = true;
+    const code = await sock.requestPairingCode(displayPhoneFromJid(pairing.request.phoneJid));
+    const formattedCode = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+    await sendText(pairing.dmJid, [
+      `Kode tautan worker: *${formattedCode}*`,
+      'Buka WhatsApp > Perangkat tertaut > Tautkan perangkat > Tautkan dengan nomor telepon, lalu masukkan kode ini.',
+      'Berlaku 60 detik.'
+    ].join('\n'));
+    return;
+  }
+  const image = await QRCode.toBuffer(qr, { type: 'png', width: 512, margin: 2 });
+  if (pairing.qrKey) await sendBotMessage(pairing.dmJid, { delete: pairing.qrKey }).catch(() => {});
+  const sent = await sendBotMessage(pairing.dmJid, {
+    image,
+    mimetype: 'image/png',
+    caption: [
+      'Scan QR ini untuk menjadi worker.',
+      'WhatsApp > Perangkat tertaut > Tautkan perangkat.',
+      'QR diperbarui otomatis dan berlaku 60 detik.'
+    ].join('\n')
+  });
+  pairing.qrKey = sent?.key || null;
+}
+
+async function expireJadibotPairing(pairing) {
+  if (pairing.finished) return;
+  // The QR was scanned and WhatsApp is still finishing the login, so wait a little longer.
+  if (pairing.connection.isRegistered() && pairing.loginWaits < JADIBOT_LOGIN_WAIT_LIMIT) {
+    pairing.loginWaits += 1;
+    pairing.timer = setTimeout(() => expireJadibotPairing(pairing).catch((error) => handleFailure(error)), 15000);
+    return;
+  }
+  await failJadibotPairing(pairing, 'QR/kode kedaluwarsa. Ketik ,jadibot lagi untuk mendapatkan yang baru (tanpa persetujuan ulang selama 10 menit).');
+}
+
+async function closePairing(pairing) {
+  pairing.finished = true;
+  clearTimeout(pairing.timer);
+  jadibotPairings.delete(pairing.request.requesterJid);
+  if (pairing.qrKey) await sendBotMessage(pairing.dmJid, { delete: pairing.qrKey }).catch(() => {});
+}
+
+async function failJadibotPairing(pairing, text) {
+  if (pairing.finished) return;
+  await closePairing(pairing);
+  pairing.connection.stop();
+  await fs.rm(pairing.authDir, { recursive: true, force: true });
+  await safeSendText(pairing.dmJid, text);
+}
+
+async function rejectPairedAccount(pairing, text) {
+  await pairing.connection.logout();
+  await fs.rm(pairing.authDir, { recursive: true, force: true });
+  await safeSendText(pairing.dmJid, text);
+}
+
+async function finishJadibotPairing(pairing, sock) {
+  if (pairing.finished) return;
+  await closePairing(pairing);
+  const phoneJid = jidNormalizedUser(sock.user.id);
+  const lidJid = sock.user?.lid ? jidNormalizedUser(sock.user.lid) : null;
+  const name = sock.user?.name || pairing.request.name || '';
+
+  if (isOwnerAccountJid(phoneJid)) {
+    await rejectPairedAccount(pairing, 'Nomor admin utama tidak bisa dipakai sebagai worker. Login dibatalkan.');
+    return;
+  }
+  const existing = state.workerStore.findByPhone(phoneJid);
+  if (existing && existing.status !== 'logged_out') {
+    await rejectPairedAccount(pairing, `Nomor ini sudah terhubung sebagai worker #${existing.id}. Login baru dibatalkan.`);
+    return;
+  }
+
+  pairing.connection.stop();
+  // Give Baileys a moment to finish writing the login files before the folder is moved.
+  await wait(1000);
+  const requestedBy = pairing.request.phoneJid || pairing.request.requesterJid;
+  const worker = existing
+    ? await state.workerStore.restore(existing.id)
+    : await state.workerStore.create({ phoneJid, lidJid, name, requestedBy });
+  const authDir = state.workerStore.authDir(worker);
+  await fs.rm(authDir, { recursive: true, force: true });
+  await fs.mkdir(path.dirname(authDir), { recursive: true });
+  await fs.rename(pairing.authDir, authDir);
+  await state.workerStore.update(worker.id, { lidJid, name, requestedBy, approvedAt: new Date().toISOString() });
+  await startWorker(worker);
+
+  await safeSendText(pairing.dmJid, [
+    `Berhasil! Nomor kamu sekarang terhubung sebagai worker #${worker.id}.`,
+    'Ketik ,help di chat "Pesan ke diri sendiri" untuk melihat command worker.',
+    'Untuk berhenti, logout perangkat "IrOBot Worker" di WhatsApp > Perangkat tertaut.'
+  ].join('\n'));
+  await notifyOwner(`Worker #${worker.id} terhubung: ${name || '-'} (+${worker.phone}, ${waLink(worker)}).${existing ? ' Folder lama dipakai lagi.' : ''}`);
+}
+
+function createWorkerAccess(workerId) {
+  return {
+    canUseAs: (commandName) => workerCommandAllowed(ownerState.workerStore.get(workerId), commandName),
+    isOpen: () => false,
+    isAdmin: () => false
+  };
+}
+
+function createWorkerScope(worker, connection) {
+  const dataDir = ownerState.workerStore.dataDir(worker);
+  return {
+    workerId: worker.id,
+    state: {
+      get sock() { return connection.sock; },
+      get connected() { return connection.connected; },
+      chatDirectory: new ChatDirectory(),
+      viewOnceCache: new ViewOnceCache(),
+      sessionPrompts: new Map(),
+      confirmStore: new PendingConfirmStore(),
+      reactionActions: new ReactionActionStore(),
+      ignoredOwnMessageIds: new Set(),
+      pdfSessions: new PdfSessions(ownerState.tools),
+      toVideoSessions: new ToVideoSessions(ownerState.tools),
+      stimpaSessions: new StimpaSessions(),
+      qrSessions: new QrSessions(),
+      restoreSessions: new RestoreSessions(),
+      saveRecorder: new SaveRecorder({ file: path.join(dataDir, 'saved-messages.json'), mediaDir: path.join(dataDir, 'saved-messages') }),
+      taskRecorder: new TaskRecorder(),
+      anticall: new AnticallStore(path.join(dataDir, 'anticall.json'), path.join(dataDir, 'anticall-media')),
+      commandAccess: createWorkerAccess(worker.id),
+      notesFile: path.join(dataDir, 'notes.json'),
+      linksFile: path.join(dataDir, 'links.json'),
+      promptKeysFile: path.join(dataDir, 'prompt-keys.json'),
+      cintaSessions: new Map()
+    }
+  };
+}
+
+async function startWorker(worker) {
+  if (workerRuntimes.has(worker.id)) return workerRuntimes.get(worker.id);
+  const runtime = { workerId: worker.id, connection: null, scope: null, limiter: new ReplyLimiter() };
+  runtime.connection = new WorkerConnection({
+    authDir: state.workerStore.authDir(worker),
+    logger,
+    label: `worker-${worker.id}`,
+    handlers: {
+      onOpen: (sock) => handleWorkerOpen(runtime, sock),
+      onClose: () => handleWorkerClose(runtime),
+      onLoggedOut: () => handleWorkerLoggedOut(runtime),
+      onMessages: (event) => workerScope.run(runtime.scope, () => onWorkerMessageUpsert(runtime, event)),
+      onReactions: (updates) => workerScope.run(runtime.scope, () => onWorkerReactions(runtime, updates))
+    }
+  });
+  runtime.scope = createWorkerScope(worker, runtime.connection);
+  workerRuntimes.set(worker.id, runtime);
+  await runAsOwner(() => runtime.connection.start());
+  return runtime;
+}
+
+async function startAllWorkers() {
+  await fs.rm(WORKERS_PENDING_DIR, { recursive: true, force: true });
+  for (const worker of state.workerStore.activeWorkers()) {
+    await state.workerStore.update(worker.id, { status: 'offline' });
+    startWorker(worker).catch((error) => logger.error('Worker start failed', { worker: worker.id, error: error.message }));
+  }
+}
+
+async function handleWorkerOpen(runtime, sock) {
+  const worker = state.workerStore.get(runtime.workerId);
+  if (!worker) return;
+  const now = new Date().toISOString();
+  await state.workerStore.update(worker.id, {
+    status: 'online',
+    connectedAt: now,
+    lastSeenAt: now,
+    lidJid: sock.user?.lid ? jidNormalizedUser(sock.user.lid) : worker.lidJid,
+    name: sock.user?.name || worker.name
+  });
+  if (!worker.hasProfilePicture) await saveWorkerProfilePicture(worker, sock);
+}
+
+async function saveWorkerProfilePicture(worker, sock) {
+  try {
+    const url = await sock.profilePictureUrl(worker.phoneJid, 'image');
+    if (!url) return;
+    const response = await fetch(url);
+    if (!response.ok) return;
+    await fs.writeFile(state.workerStore.profilePath(worker), Buffer.from(await response.arrayBuffer()));
+    await state.workerStore.update(worker.id, { hasProfilePicture: true });
+  } catch (error) {
+    await logger.warn('Worker profile picture unavailable', { worker: worker.id, error: error.message });
+  }
+}
+
+async function handleWorkerClose(runtime) {
+  const worker = state.workerStore.get(runtime.workerId);
+  if (worker?.status === 'online') await state.workerStore.update(worker.id, { status: 'offline', lastSeenAt: new Date().toISOString() });
+}
+
+async function handleWorkerLoggedOut(runtime) {
+  workerRuntimes.delete(runtime.workerId);
+  if (adminWorkerSession?.workerId === runtime.workerId) adminWorkerSession = null;
+  const worker = await state.workerStore.archive(runtime.workerId);
+  if (worker) await notifyOwner(`Worker #${worker.id} (${worker.name || worker.phone}, ${waLink(worker)}) logout dari WhatsApp. Folder diarsipkan.`);
+}
+
+async function runWorkerHousekeeping() {
+  await cleanupJadibotState();
+  for (const runtime of workerRuntimes.values()) {
+    runtime.limiter.cleanup(CINTA_REPLY_WINDOW_MS);
+    await workerScope.run(runtime.scope, () => expireListeningSessions());
+  }
+}
+
+async function showWorkerTyping(jid, delayRange) {
+  await state.sock.sendPresenceUpdate('composing', jid).catch(() => {});
+  await wait(randomDelayMs(delayRange));
+  await state.sock.sendPresenceUpdate('paused', jid).catch(() => {});
+}
+
+async function onWorkerMessageUpsert(runtime, event) {
+  if (event.type !== 'notify') return;
+  for (const message of event.messages || []) {
+    if (!message.message || !message.key?.remoteJid) continue;
+    const jid = message.key.remoteJid;
+    if (jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) continue;
+    if (message.message.protocolMessage || message.message.reactionMessage) continue;
+    if (message.key.fromMe && isIgnoredOwnOutput(message)) continue;
+    const text = getMessageText(message);
+    try {
+      const worker = state.workerStore.get(runtime.workerId);
+      if (!worker) return;
+      rememberMessageDirectory(message);
+      state.viewOnceCache.remember(message);
+      const fromAdmin = !message.key.fromMe && isAdminInWorkerSession(runtime, message);
+      if (message.key.fromMe || fromAdmin) await handleWorkerOperatorMessage(runtime, worker, message, text, fromAdmin);
+      else await maybeReplyWorkerService(runtime, worker, message, text);
+    } catch (error) {
+      await handleFailure(error, { jid, text, messageId: message.key?.id });
+    }
+  }
+}
+
+async function onWorkerReactions(runtime, updates) {
+  for (const update of updates || []) {
+    try {
+      const fromAdmin = adminWorkerSession?.workerId === runtime.workerId && isOwnerAccountJid(update.key?.remoteJid);
+      if (!update.reaction?.key?.fromMe && !fromAdmin) continue;
+      await handleReactionAction(update);
+    } catch (error) {
+      await handleFailure(error, { jid: update?.key?.remoteJid, messageId: update.key?.id });
+    }
+  }
+}
+
+// Message ids are the same for sender and receiver, so bot replies can be recognized on the other account.
+function isWorkerBotOutput(message) {
+  const id = message.key?.id;
+  if (!id) return false;
+  for (const runtime of workerRuntimes.values()) {
+    if (runtime.scope.state.ignoredOwnMessageIds.has(id)) return true;
+  }
+  return false;
+}
+
+function isAdminInWorkerSession(runtime, message) {
+  if (adminWorkerSession?.workerId !== runtime.workerId) return false;
+  if (ownerState.ignoredOwnMessageIds.has(message.key.id)) return false;
+  if (message.key.remoteJid.endsWith('@g.us')) return false;
+  return isOwnerAccountJid(message.key.remoteJid) || isOwnerAccountJid(message.key.remoteJidAlt);
+}
+
+async function handleWorkerOperatorMessage(runtime, worker, message, text, fromAdmin) {
+  const jid = message.key.remoteJid;
+  const command = parseCommand(text);
+  const actorJid = messageActorJid(message);
+  if (state.cintaSessions.has(jid) && await handleCintaSessionInput(worker, message, text, command, actorJid)) return;
+
+  const sessionActorMatches = activeSessionActorMatches(jid, actorJid);
+  const isControlCommand = ['end', 'cancel'].includes(command?.name);
+  if (sessionActorMatches && !isControlCommand) {
+    if (state.qrSessions.has(jid)) {
+      await maybeCollectQrItem(message, text);
+      return;
+    }
+    if (state.toVideoSessions.has(jid)) {
+      await collectToVideoItem(message, text);
+      return;
+    }
+    if (state.stimpaSessions.has(jid)) {
+      await collectStimpaItem(message);
+      return;
+    }
+  }
+  if (!command) {
+    if (sessionActorMatches) await maybeCollectPdfItem(message, text);
+    return;
+  }
+  await runWorkerCommand(runtime, worker, message, command, { actorJid, fromAdmin });
+}
+
+async function runWorkerCommand(runtime, worker, message, command, { actorJid, fromAdmin }) {
+  const jid = message.key.remoteJid;
+  const isExit = command.name === 'worker' && (command.args[0] || '').toLowerCase() === 'exit';
+  if (fromAdmin && (isExit || (command.name === 'end' && !activeSessionType(jid)))) {
+    await exitAdminWorkerSession(jid);
+    return;
+  }
+  if (!workerCommandAllowed(worker, command.name)) {
+    await sendText(jid, `Command ${COMMAND_PREFIX}${command.name} tidak tersedia untuk worker ini. Ketik ,help`);
+    return;
+  }
+  if (!['end', 'cancel', 'confirm'].includes(command.name)) {
+    const limitKey = `command:${actorJid}:${normalizeLookupText(getMessageText(message))}`;
+    if (!runtime.limiter.allow(limitKey, WORKER_COMMAND_LIMIT, WORKER_COMMAND_WINDOW_MS)) return;
+    await showWorkerTyping(jid, WORKER_COMMAND_DELAY_MS);
+  }
+  if (command.name === 'cinta') {
+    await startCintaSession(worker, jid, actorJid);
+  } else if (command.name === 'status') {
+    await handleWorkerStatus(jid, worker);
+  } else {
+    await handleCommand(message, command, { actorJid, isOwner: false, isAdmin: false, publicOpen: false });
+  }
+}
+
+async function handleWorkerStatus(jid, worker) {
+  await sendText(jid, [
+    `*Status worker #${worker.id}*`,
+    `Nomor: +${worker.phone}`,
+    `Koneksi: ${state.connected ? 'online' : 'offline'}`,
+    `Service: ${worker.service || 'default'}`,
+    `Terhubung sejak: ${worker.connectedAt ? formatWib(worker.connectedAt) : '-'}`,
+    worker.service === 'cinta' ? `Balasan cinta terkirim: ${worker.stats?.cintaReplies || 0}` : null,
+    '',
+    'Berhenti jadi worker: logout perangkat tertaut di WhatsApp.'
+  ].filter((line) => line !== null).join('\n'));
+}
+
+function isAdminSessionChat(message) {
+  if (!adminWorkerSession) return false;
+  const worker = state.workerStore?.get(adminWorkerSession.workerId);
+  if (!worker) return false;
+  const chatJids = [message.key.remoteJid, message.key.remoteJidAlt].filter(Boolean);
+  return [worker.phoneJid, worker.lidJid]
+    .filter(Boolean)
+    .some((workerJid) => chatJids.some((chatJid) => sameActor(workerJid, chatJid)));
+}
+
+async function startAdminWorkerSession(jid, worker) {
+  const runtime = workerRuntimes.get(worker.id);
+  if (!runtime?.connection.connected) throw new UserInputError(`Worker #${worker.id} sedang tidak online.`);
+  const previous = adminWorkerSession?.workerId;
+  const ownerJid = ownUserJid();
+  adminWorkerSession = { workerId: worker.id, startedAt: Date.now() };
+  await sendText(jid, [
+    previous && previous !== worker.id ? `Sesi worker #${previous} ditutup.` : null,
+    `Masuk sesi worker #${worker.id} (${worker.name || worker.phone}).`,
+    `Buka chat dengan ${waLink(worker)} lalu ketik command di sana. Command dijalankan sebagai worker.`,
+    'Keluar: ,end atau ,worker exit'
+  ].filter(Boolean).join('\n'));
+  await workerScope.run(runtime.scope, () => sendText(ownerJid, [
+    `Sesi admin aktif di worker #${worker.id}.`,
+    'Ketik command di chat ini. Ketik ,help untuk daftar command worker.',
+    'Keluar: ,end atau ,worker exit'
+  ].join('\n')));
+}
+
+async function exitAdminWorkerSession(jid) {
+  if (!adminWorkerSession) {
+    await sendText(jid, 'Tidak ada sesi worker yang aktif.');
+    return;
+  }
+  const workerId = adminWorkerSession.workerId;
+  adminWorkerSession = null;
+  await sendText(jid, `Keluar dari sesi worker #${workerId}.`);
+}
+
+async function handleWorkerAdminCommand(message, command, context) {
+  if (!context.isOwner) throw new UserInputError('Command ,worker hanya bisa dipakai akun admin utama.');
+  const jid = message.key.remoteJid;
+  const action = (command.args[0] || 'list').toLowerCase();
+  if (action === 'list') {
+    await sendText(jid, formatWorkerList(state.workerStore.list()));
+  } else if (action === 'info') {
+    await sendWorkerInfo(jid, state.workerStore.find(command.args[1]));
+  } else if (action === 'session') {
+    await startAdminWorkerSession(jid, state.workerStore.find(command.args[1]));
+  } else if (action === 'exit') {
+    await exitAdminWorkerSession(jid);
+  } else if (action === 'service') {
+    await handleWorkerServiceCommand(jid, command.args.slice(1));
+  } else if (action === 'default') {
+    await handleWorkerDefaultCommand(jid, command.args.slice(1));
+  } else {
+    throw new UserInputError(HELP_DETAILS.worker.join('\n'));
+  }
+}
+
+async function sendWorkerInfo(jid, worker) {
+  const dataDir = state.workerStore.dataDir(worker);
+  const [notes, links] = await Promise.all([
+    listNotes(path.join(dataDir, 'notes.json')),
+    listLinks(path.join(dataDir, 'links.json'))
+  ]);
+  const caption = formatWorkerInfo(worker, {
+    folder: path.relative(ROOT_DIR, state.workerStore.dirFor(worker)),
+    notesCount: notes.length,
+    linksCount: links.length,
+    adminSession: adminWorkerSession?.workerId === worker.id
+  });
+  const profilePath = state.workerStore.profilePath(worker);
+  if (worker.hasProfilePicture && await fileExists(profilePath)) {
+    await sendBotMessage(jid, { image: { url: profilePath }, caption });
+  } else {
+    await sendText(jid, `${caption}\nFoto profil: tidak tersedia`);
+  }
+}
+
+async function handleWorkerServiceCommand(jid, args) {
+  if (!args.length || args[0].toLowerCase() === 'list') {
+    await sendText(jid, formatWorkerServiceList());
+    return;
+  }
+  const worker = state.workerStore.find(args[0]);
+  const serviceName = (args[1] || '').toLowerCase();
+  if (!serviceName) throw new UserInputError('Format: ,worker service <id|nomor> <nama|off>');
+  if (serviceName === 'off') {
+    await state.workerStore.update(worker.id, { service: null });
+    await sendText(jid, `Service worker #${worker.id} dilepas. Worker kembali memakai command default.`);
+    return;
+  }
+  const service = findWorkerService(serviceName);
+  if (!service) throw new UserInputError(`Service "${serviceName}" tidak ada. Lihat ,worker service list`);
+  await state.workerStore.update(worker.id, { service: service.name });
+  await sendText(jid, [
+    `Worker #${worker.id} sekarang memakai service ${service.name}.`,
+    `Atur service: ,worker session ${worker.id}, lalu ketik ,${service.commands[0]} di chat dengan worker.`
+  ].join('\n'));
+}
+
+async function handleWorkerDefaultCommand(jid, args) {
+  const worker = state.workerStore.find(args[0]);
+  const value = (args[1] || '').toLowerCase();
+  if (!['on', 'off'].includes(value)) throw new UserInputError('Format: ,worker default <id|nomor> on|off');
+  await state.workerStore.update(worker.id, { allowDefaultCommands: value === 'on' });
+  await sendText(jid, `Command default worker #${worker.id} ${value === 'on' ? 'diaktifkan' : 'dinonaktifkan'}.${worker.service ? '' : ' Worker tanpa service selalu memakai command default.'}`);
+}
+
+const CINTA_MENU = [
+  '*Pengaturan service cinta*',
+  '1. Ganti trigger',
+  '2. Ganti pesan otomatis (teks dan/atau gambar)',
+  '3. Ganti emoji reaksi',
+  '4. Tes balasan',
+  '5. Hapus gambar',
+  '',
+  'Ketik angka pilihan. ,cancel untuk batal, ,end untuk selesai.'
+].join('\n');
+
+function cintaImagePath(worker) {
+  const { imageFile } = cintaConfig(worker);
+  return imageFile ? path.join(state.workerStore.dataDir(worker), imageFile) : null;
+}
+
+async function sendCintaReply(jid, worker) {
+  const config = cintaConfig(worker);
+  const imagePath = cintaImagePath(worker);
+  if (imagePath && await fileExists(imagePath)) {
+    await sendBotMessage(jid, { image: { url: imagePath }, caption: config.caption });
+  } else if (config.caption) {
+    await sendText(jid, config.caption);
+  }
+}
+
+async function maybeReplyWorkerService(runtime, worker, message, text) {
+  if (worker.service !== 'cinta') return;
+  const jid = message.key.remoteJid;
+  if (!jid.endsWith('@s.whatsapp.net') && !jid.endsWith('@lid')) return;
+  if (Date.now() - timestampMs(message) > CINTA_MAX_MESSAGE_AGE_MS) return;
+  const config = cintaConfig(worker);
+  if (!matchCintaTrigger(text, config.triggers)) return;
+  if (!runtime.limiter.allow(`cinta:${jidNormalizedUser(jid)}`, CINTA_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS)) return;
+
+  if (config.reactionEmoji) await sendBotMessage(jid, { react: { text: config.reactionEmoji, key: message.key } });
+  await state.sock.readMessages([message.key]).catch(() => {});
+  await showWorkerTyping(jid, CINTA_DELAY_MS);
+  await sendCintaReply(jid, worker);
+  await state.workerStore.update(worker.id, {
+    stats: { ...worker.stats, cintaReplies: (worker.stats?.cintaReplies || 0) + 1 },
+    lastSeenAt: new Date().toISOString()
+  });
+}
+
+function formatCintaConfig(worker) {
+  const config = cintaConfig(worker);
+  return [
+    '*Konfigurasi cinta saat ini*',
+    `Trigger: ${config.triggers.map((trigger) => `"${trigger}"`).join(', ')}`,
+    `Gambar: ${config.imageFile ? 'ada' : 'belum ada'}`,
+    `Emoji reaksi: ${config.reactionEmoji || 'tidak ada'}`,
+    `Pesan: ${truncateText(config.caption, 120) || '(kosong)'}`
+  ].join('\n');
+}
+
+async function updateCintaConfig(worker, changes) {
+  const current = worker.serviceConfig?.cinta || {};
+  const serviceConfig = { ...worker.serviceConfig, cinta: { ...current, ...changes } };
+  return state.workerStore.update(worker.id, { serviceConfig });
+}
+
+async function startCintaSession(worker, jid, actorJid) {
+  state.cintaSessions.set(jid, { actorJid, step: 'menu' });
+  await sendText(jid, `${formatCintaConfig(worker)}\n\n${CINTA_MENU}`);
+}
+
+async function handleCintaSessionInput(worker, message, text, command, actorJid) {
+  const jid = message.key.remoteJid;
+  const session = state.cintaSessions.get(jid);
+  if (!sameActor(session.actorJid, actorJid)) return false;
+  if (command?.name === 'end') {
+    state.cintaSessions.delete(jid);
+    await sendText(jid, 'Sesi pengaturan cinta selesai. Semua perubahan sudah tersimpan.');
+    return true;
+  }
+  if (command?.name === 'cancel') {
+    if (session.step === 'menu') {
+      state.cintaSessions.delete(jid);
+      await sendText(jid, 'Sesi pengaturan cinta ditutup.');
+    } else {
+      session.step = 'menu';
+      await sendText(jid, `Langkah dibatalkan.\n\n${CINTA_MENU}`);
+    }
+    return true;
+  }
+  if (command) {
+    await sendText(jid, 'Sesi pengaturan cinta masih aktif. Selesaikan dengan ,end atau batalkan dengan ,cancel.');
+    return true;
+  }
+
+  if (session.step === 'menu') await handleCintaMenuChoice(worker, jid, session, text);
+  else if (session.step === 'trigger') await saveCintaTriggers(worker, jid, session, text);
+  else if (session.step === 'message') await saveCintaMessage(worker, jid, session, message, text);
+  else if (session.step === 'emoji') await saveCintaEmoji(worker, jid, session, text);
+  return true;
+}
+
+async function handleCintaMenuChoice(worker, jid, session, text) {
+  const choice = String(text || '').trim();
+  if (choice === '1') {
+    session.step = 'trigger';
+    await sendText(jid, [
+      'Kirim trigger baru, satu baris untuk satu trigger. Contoh:',
+      'Aku mau pesan kak',
+      'Aku mau pesan kak!',
+      '',
+      'Trigger cocok jika pesan persis sama, boleh huruf kecil semua atau kapital semua.'
+    ].join('\n'));
+  } else if (choice === '2') {
+    session.step = 'message';
+    await sendText(jid, [
+      'Kirim pesan otomatis baru:',
+      '- Teks saja: mengganti caption.',
+      '- Gambar dengan caption: mengganti gambar dan caption.',
+      '- Gambar tanpa caption: hanya mengganti gambar.'
+    ].join('\n'));
+  } else if (choice === '3') {
+    session.step = 'emoji';
+    await sendText(jid, 'Kirim satu emoji untuk reaksi pada pesan trigger, atau - untuk mematikan reaksi.');
+  } else if (choice === '4') {
+    await sendCintaReply(jid, worker);
+    await sendText(jid, CINTA_MENU);
+  } else if (choice === '5') {
+    await removeCintaImage(worker);
+    await sendText(jid, `Gambar dihapus. Balasan sekarang hanya teks.\n\n${CINTA_MENU}`);
+  } else {
+    await sendText(jid, 'Pilih angka 1-5, atau ,end untuk selesai.');
+  }
+}
+
+async function saveCintaTriggers(worker, jid, session, text) {
+  const triggers = parseCintaTriggers(text);
+  await updateCintaConfig(worker, { triggers });
+  session.step = 'menu';
+  await sendText(jid, `Trigger tersimpan: ${triggers.map((trigger) => `"${trigger}"`).join(', ')}\n\n${CINTA_MENU}`);
+}
+
+async function saveCintaMessage(worker, jid, session, message, text) {
+  const changes = {};
+  if (mediaNode(message)?.type === 'imageMessage') {
+    const media = await downloadMessageMedia(state.sock, message, 'cinta-image');
+    try {
+      const oldImagePath = cintaImagePath(worker);
+      if (oldImagePath) await fs.rm(oldImagePath, { force: true });
+      const imageFile = path.join('cinta', `menu${path.extname(media.path) || '.jpg'}`);
+      const imagePath = path.join(state.workerStore.dataDir(worker), imageFile);
+      await fs.mkdir(path.dirname(imagePath), { recursive: true });
+      await fs.copyFile(media.path, imagePath);
+      changes.imageFile = imageFile;
+    } finally {
+      await cleanupFiles([media.path]);
+    }
+  }
+  const caption = String(text || '').trim();
+  if (caption) changes.caption = caption;
+  if (!Object.keys(changes).length) throw new UserInputError('Kirim teks atau gambar untuk pesan otomatis.');
+  await updateCintaConfig(worker, changes);
+  session.step = 'menu';
+  await sendText(jid, `Pesan otomatis tersimpan.\n\n${CINTA_MENU}`);
+}
+
+async function saveCintaEmoji(worker, jid, session, text) {
+  const reactionEmoji = parseReactionEmoji(text);
+  await updateCintaConfig(worker, { reactionEmoji });
+  session.step = 'menu';
+  await sendText(jid, `${reactionEmoji ? `Emoji reaksi diganti menjadi ${reactionEmoji}.` : 'Reaksi emoji dimatikan.'}\n\n${CINTA_MENU}`);
+}
+
+async function removeCintaImage(worker) {
+  const imagePath = cintaImagePath(worker);
+  if (imagePath) await fs.rm(imagePath, { force: true });
+  await updateCintaConfig(worker, { imageFile: null });
+}
+
 async function maybeLogSystemdTip() {
   if (process.platform !== 'linux' || process.env.INVOCATION_ID) return;
   const hasSystemctl = await fileExists('/bin/systemctl') || await fileExists('/usr/bin/systemctl');
@@ -3665,6 +4598,7 @@ async function main() {
   setInterval(() => state.statusInbox.serial(() => state.statusInbox.save()).catch((error) => handleFailure(error)), 60000).unref();
   try { state.reactionActions.prompts = new Set(JSON.parse(await fs.readFile(path.join(ROOT_DIR, 'data', 'prompt-keys.json'), 'utf8'))); } catch {}
   state.tools = await detectTools();
+  state.workerStore = await new WorkerStore().load();
   state.pdfSessions = new PdfSessions(state.tools);
   state.toVideoSessions = new ToVideoSessions(state.tools);
   state.stimpaSessions = new StimpaSessions();
@@ -3694,6 +4628,8 @@ async function main() {
     magick: Boolean(state.tools.magick)
   });
   await connect();
+  await startAllWorkers();
+  setInterval(() => runWorkerHousekeeping().catch((error) => handleFailure(error)), 30000).unref();
 }
 
 process.on('SIGINT', async () => {
@@ -3709,7 +4645,7 @@ process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled rejection', { error: reason?.message || String(reason) });
 });
 
-export { state, onMessageUpsert, onMessagesReaction, onMessagesUpdate, handleSetup, handleFailure, storageTarget, archiveStatus, handleStatusBrowse, resolveErrorGroup, runConfiguredBackup, expireListeningSessions, rememberContacts };
+export { state, workerScope, createWorkerScope, onWorkerMessageUpsert, onMessageUpsert, onMessagesReaction, onMessagesUpdate, handleSetup, handleFailure, storageTarget, archiveStatus, handleStatusBrowse, resolveErrorGroup, runConfiguredBackup, expireListeningSessions, rememberContacts };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main().catch(async (error) => {
   await logger.error('Fatal startup error', { error: error.message });

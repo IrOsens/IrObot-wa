@@ -137,7 +137,8 @@ systemctl --user disable --now irobot-wa
 - Reminder/task: `,task list|add|loop|repeat|record|pause|stop|resume|del`, `,remindme <teks> <durasi>`
 - Save: `,save`, `,save update`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load rename <id|judul> <judul-baru>`
 - Note/link: `,note list|add|get|del|rename`, `,link list|add|get|del|rename`
-- Utility: `,info`, `,typing`, `,status`, `,status bot`, `,health`, `,wol`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,bot`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
+- Utility: `,info`, `,typing`, `,status`, `,status bot`, `,health`, `,wol`, `,backup`, `,restore`, `,clear`, `,update`, `,restartbot`, `,allow`, `,admin`, `,pause`, `,resume`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
+- Worker: `,jadibot`, `,jadibot kode`, `,worker list|info|session|exit|service|default`, `,cinta`
 - Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
@@ -179,8 +180,8 @@ Operasional:
 - `,tovideo` juga tersedia pada chat yang diberi akses publik.
 - `,help` dinamis: publik hanya melihat command publik, admin tambahan melihat command yang boleh dia pakai, owner melihat semuanya. `,help <command|prefix>` menampilkan detail atau kandidat command.
 - `,admin list|add|del <nomor|id>` mengelola admin tambahan. Hanya owner/session WhatsApp yang bisa menjalankannya.
-- Admin tambahan hanya aktif saat akses publik chat/all terbuka, dan tetap tidak bisa memakai command server/security seperti `,admin`, `,bot`, `,backup`, `,restore`, `,update`, dan `,restartbot`.
-- `,bot` mengecek status. `,bot off` mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall; hanya owner bisa `,bot on`.
+- Admin tambahan hanya aktif saat akses publik chat/all terbuka, dan tetap tidak bisa memakai command server/security seperti `,admin`, `,pause`, `,worker`, `,backup`, `,restore`, `,update`, dan `,restartbot`.
+- `,pause` mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall akun utama; hanya owner bisa `,resume`. Worker tetap berjalan saat akun utama di-pause.
 - `,status bot` menampilkan status fitur bot, destination, scheduler, dan warning jika nama grup duplikat atau destination tidak valid.
 - Semua destination grup disimpan sebagai JID + nama saat disimpan. Jika nama grup sama lebih dari satu, bot menolak auto-pilih dan meminta JID.
 
@@ -298,6 +299,61 @@ Update/restart:
 - Jika restart systemd butuh authentication, bot mencoba `sudo -S systemctl` memakai `LINUX_SUDO_PASSWORD` dari `.env`.
 - Default service systemd adalah `irobot-wa.service`; ubah di `data/config.json` bagian `update.systemdService`.
 - Agar bot benar-benar hidup lagi setelah reboot/crash, pakai `npm run service:install` di Linux/Armbian.
+
+## Multi Login (Worker)
+
+Akun yang login lewat terminal tetap menjadi admin utama (owner). Akun lain bisa ikut terhubung ke server ini sebagai **worker**.
+
+Mendaftar jadi worker:
+
+1. User mengetik `,jadibot` (QR) atau `,jadibot kode` (kode tautan) di chat mana pun dengan akun utama. Command ini terbuka untuk semua user.
+2. Owner menerima notifikasi di chat pribadinya. Setujui dengan reply `accept`/`yes`/`ya`, atau react `✅`/`👍`/`❤️` pada notifikasi atau pada pesan `,jadibot` user. Tolak dengan reply `no`/`tolak` atau react `❌`/`👎`/`❎`. Permintaan kedaluwarsa setelah 10 menit.
+3. Setelah disetujui, QR dikirim ke chat yang sama (chat pribadi) atau ke chat pribadi user (jika `,jadibot` dikirim di grup). QR diperbarui otomatis dan berlaku 60 detik. Jika kedaluwarsa, user bisa `,jadibot` lagi tanpa persetujuan ulang selama 10 menit.
+4. Satu nomor hanya bisa menjadi satu worker. Worker tidak bisa dihapus dari bot; berhenti hanya dengan logout perangkat tertaut di WhatsApp.
+
+Command owner:
+
+- `,worker` atau `,worker list`: daftar worker dengan status dan link `wa.me`.
+- `,worker info <id|nomor>`: detail worker beserta foto profil (disimpan saat pertama login).
+- `,worker session <id|nomor>`: masuk sesi worker. Buka chat dengan nomor worker dan ketik command di sana; command dijalankan sebagai worker. Keluar dengan `,end` atau `,worker exit`.
+- `,worker service list`: daftar service yang tersedia.
+- `,worker service <id|nomor> <nama|off>`: pasang atau lepas service.
+- `,worker default <id|nomor> on|off`: izinkan command default untuk worker yang memakai service.
+
+Command worker (diketik dari akun worker sendiri, misalnya di chat "Pesan ke diri sendiri"):
+
+- Tanpa service: `,help`, `,status`, `,s`, `,stext`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,tovideo`, `,stimpa`, `,toimg`, `,note`, `,link`, `,end`, `,cancel`, `,confirm`.
+- Dengan service: hanya `,help`, `,status`, command service, dan kontrol sesi, kecuali owner mengaktifkan `,worker default`.
+- Pesan dari orang lain ke nomor worker tidak menjalankan command; hanya service (misalnya `cinta`) yang membalas.
+
+Service `cinta`:
+
+- Membalas pesan pribadi yang isinya persis `Aku mau pesan kak` atau `Aku mau pesan kak!` (boleh huruf kecil semua atau kapital semua). Pesan dengan karakter lain tidak memicu balasan.
+- Balasan berupa gambar menu + caption Tako-Wae. Selama gambar belum diunggah, balasan hanya caption.
+- `,cinta` membuka sesi pengaturan: ganti trigger, ganti pesan/gambar, ganti emoji reaksi, tes balasan, dan hapus gambar. `,cancel` membatalkan langkah, `,end` menutup sesi.
+- Gambar disimpan di `workers/<id>/data/cinta/`.
+
+Pengaman anti-banned (khusus worker):
+
+- Balasan service hanya ke chat pribadi, bukan grup/status, dan hanya untuk pesan yang masuk dalam 5 menit terakhir.
+- Satu nomor maksimal 2 balasan `cinta` per 24 jam; setelah itu tidak dibalas lagi.
+- Command yang sama dari pengirim yang sama maksimal 2 kali per menit.
+- Balasan didahului tanda dibaca dan indikator mengetik dengan jeda acak (3-8 detik untuk service, 1-2,5 detik untuk command).
+- Batas di atas disimpan di memori dan kembali kosong setelah bot restart.
+
+Struktur folder:
+
+```
+auth/                 sesi WhatsApp akun utama (tidak berubah)
+data/workers.json     daftar worker
+workers/<id>/auth/    sesi WhatsApp worker
+workers/<id>/data/    note, link, dan konfigurasi service worker
+workers/<id>/profile.jpg
+workers/archive/<id>/ folder worker yang sudah logout; dipakai lagi jika nomor yang sama login ulang
+workers/pending/      sesi QR sementara, dibersihkan saat startup
+```
+
+Folder `workers/` tidak ikut `,backup` (backup hanya mencakup `data/`).
 
 ## Fitur yang Bergantung Tool Sistem
 

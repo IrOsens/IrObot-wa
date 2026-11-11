@@ -23,6 +23,10 @@ export const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
 export const LINKS_FILE = path.join(DATA_DIR, 'links.json');
 export const REMINDERS_FILE = path.join(DATA_DIR, 'reminders.json');
 export const WOL_FILE = path.join(DATA_DIR, 'wol.json');
+export const WORKERS_FILE = path.join(DATA_DIR, 'workers.json');
+export const WORKERS_DIR = path.join(ROOT_DIR, 'workers');
+export const WORKERS_ARCHIVE_DIR = path.join(WORKERS_DIR, 'archive');
+export const WORKERS_PENDING_DIR = path.join(WORKERS_DIR, 'pending');
 export const ENV_FILE = path.join(ROOT_DIR, '.env');
 
 export const DEFAULT_APP_CONFIG = {
@@ -120,7 +124,8 @@ export async function ensureRuntimeDirs() {
     fs.mkdir(SAVED_MESSAGES_DIR, { recursive: true }),
     fs.mkdir(ANTICALL_MEDIA_DIR, { recursive: true }),
     fs.mkdir(LOG_DIR, { recursive: true }),
-    fs.mkdir(TEMP_DIR, { recursive: true })
+    fs.mkdir(TEMP_DIR, { recursive: true }),
+    fs.mkdir(WORKERS_ARCHIVE_DIR, { recursive: true })
   ]);
   await Promise.all([
     ensureEnvFile(ENV_FILE),
@@ -136,7 +141,8 @@ export async function ensureRuntimeDirs() {
     ensureJsonFile(NOTES_FILE, { nextId: 1, items: [] }),
     ensureJsonFile(LINKS_FILE, { nextId: 1, items: [] }),
     ensureJsonFile(REMINDERS_FILE, { nextId: 1, items: [] }),
-    ensureJsonFile(WOL_FILE, { nextId: 1, items: [] })
+    ensureJsonFile(WOL_FILE, { nextId: 1, items: [] }),
+    ensureJsonFile(WORKERS_FILE, { nextId: 1, workers: [] })
   ]);
 }
 
