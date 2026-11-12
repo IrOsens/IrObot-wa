@@ -3807,7 +3807,11 @@ async function handleJadibot(message, command, context) {
   }
   if (mode === 'code' && !phoneJid) throw new UserInputError('Nomor kamu tidak terbaca untuk kode tautan. Pakai ,jadibot untuk QR.');
   await cleanupJadibotState();
-  if (jadibotPairings.has(requesterJid)) throw new UserInputError('QR/kode kamu masih aktif. Cek chat atau tunggu sampai kedaluwarsa.');
+  const activePairing = jadibotPairings.get(requesterJid);
+  if (activePairing) {
+    if (mode !== 'code' || activePairing.request.mode === 'code') throw new UserInputError('QR/kode kamu masih aktif. Cek chat atau tunggu sampai kedaluwarsa.');
+    await failJadibotPairing(activePairing, null);
+  }
 
   const request = { requesterJid, phoneJid, chatJid: jid, messageKey: message.key, mode, name: message.pushName || '' };
   if ((jadibotApprovals.get(requesterJid) || 0) > Date.now()) {
@@ -3960,30 +3964,56 @@ async function startJadibotPairing(request) {
 
 async function sendPairingQr(pairing, qr, sock) {
   if (pairing.finished) return;
-  if (pairing.request.mode === 'code') {
-    if (pairing.codeSent) return;
-    pairing.codeSent = true;
-    const code = await sock.requestPairingCode(displayPhoneFromJid(pairing.request.phoneJid));
-    const formattedCode = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
-    await sendText(pairing.dmJid, [
-      `Kode tautan worker: *${formattedCode}*`,
-      'Buka WhatsApp > Perangkat tertaut > Tautkan perangkat > Tautkan dengan nomor telepon, lalu masukkan kode ini.',
-      'Berlaku 60 detik.'
-    ].join('\n'));
+  try {
+    if (pairing.request.mode === 'code') {
+      if (pairing.codeSent) return;
+      pairing.codeSent = true;
+      await sendPairingCode(pairing, sock);
+    } else {
+      await sendPairingImage(pairing, qr);
+    }
+  } catch (error) {
+    await logger.error('Pairing delivery failed', { requester: pairing.request.requesterJid, dmJid: pairing.dmJid, mode: pairing.request.mode, error: error.message });
+    await failJadibotPairing(pairing, 'Gagal mengirim QR/kode ke chat pribadi kamu. Kirim pesan apa saja ke nomor bot ini lewat chat pribadi, lalu ketik ,jadibot lagi.', pairing.request.chatJid);
     return;
   }
-  const image = await QRCode.toBuffer(qr, { type: 'png', width: 512, margin: 2 });
-  if (pairing.qrKey) await sendBotMessage(pairing.dmJid, { delete: pairing.qrKey }).catch(() => {});
+  // The countdown starts when the QR/code reaches the user, not when the connection is opened.
+  if (!pairing.deliveredAt) {
+    pairing.deliveredAt = Date.now();
+    clearTimeout(pairing.timer);
+    pairing.timer = setTimeout(() => expireJadibotPairing(pairing).catch((error) => handleFailure(error)), JADIBOT_QR_TTL_MS);
+    await logger.info('Pairing QR/code delivered', { requester: pairing.request.requesterJid, dmJid: pairing.dmJid, mode: pairing.request.mode });
+  }
+}
+
+async function sendPairingCode(pairing, sock) {
+  const code = await sock.requestPairingCode(displayPhoneFromJid(pairing.request.phoneJid));
+  const formattedCode = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+  await sendText(pairing.dmJid, [
+    'Kode tautan worker ada di pesan berikutnya. Salin kodenya (tekan lama pesan, lalu Salin).',
+    'Buka WhatsApp > Perangkat tertaut > Tautkan perangkat > Tautkan dengan nomor telepon, lalu tempel kodenya.',
+    'Berlaku 60 detik.'
+  ].join('\n'));
+  await sendText(pairing.dmJid, formattedCode);
+}
+
+async function sendPairingImage(pairing, qr) {
+  const image = await QRCode.toBuffer(qr, { type: 'png', width: 1024, margin: 4 });
   const sent = await sendBotMessage(pairing.dmJid, {
     image,
     mimetype: 'image/png',
     caption: [
       'Scan QR ini untuk menjadi worker.',
       'WhatsApp > Perangkat tertaut > Tautkan perangkat.',
-      'QR diperbarui otomatis dan berlaku 60 detik.'
+      'QR harus discan dari HP/perangkat lain. Berlaku 60 detik.'
     ].join('\n')
   });
+  if (pairing.qrKey) await sendBotMessage(pairing.dmJid, { delete: pairing.qrKey }).catch(() => {});
   pairing.qrKey = sent?.key || null;
+  if (!pairing.hintSent) {
+    pairing.hintSent = true;
+    await sendText(pairing.dmJid, 'Tidak bisa scan QR (misalnya hanya punya satu HP)? Bisa login pakai kode: ketik *,jadibot kode*, nanti kodenya dikirim dan tinggal disalin untuk login.');
+  }
 }
 
 async function expireJadibotPairing(pairing) {
@@ -3994,7 +4024,9 @@ async function expireJadibotPairing(pairing) {
     pairing.timer = setTimeout(() => expireJadibotPairing(pairing).catch((error) => handleFailure(error)), 15000);
     return;
   }
-  await failJadibotPairing(pairing, 'QR/kode kedaluwarsa. Ketik ,jadibot lagi untuk mendapatkan yang baru (tanpa persetujuan ulang selama 10 menit).');
+  await logger.warn('Pairing expired', { requester: pairing.request.requesterJid, mode: pairing.request.mode, delivered: Boolean(pairing.deliveredAt), registered: pairing.connection.isRegistered() });
+  const hint = pairing.request.mode === 'qr' ? ' Jika QR tidak bisa discan, coba ,jadibot kode.' : '';
+  await failJadibotPairing(pairing, `QR/kode kedaluwarsa. Ketik ,jadibot lagi untuk mendapatkan yang baru (tanpa persetujuan ulang selama 10 menit).${hint}`, pairing.deliveredAt ? pairing.dmJid : pairing.request.chatJid);
 }
 
 async function closePairing(pairing) {
@@ -4004,12 +4036,12 @@ async function closePairing(pairing) {
   if (pairing.qrKey) await sendBotMessage(pairing.dmJid, { delete: pairing.qrKey }).catch(() => {});
 }
 
-async function failJadibotPairing(pairing, text) {
+async function failJadibotPairing(pairing, text, noticeJid = pairing.dmJid) {
   if (pairing.finished) return;
   await closePairing(pairing);
   pairing.connection.stop();
   await fs.rm(pairing.authDir, { recursive: true, force: true });
-  await safeSendText(pairing.dmJid, text);
+  if (text) await safeSendText(noticeJid, text);
 }
 
 async function rejectPairedAccount(pairing, text) {

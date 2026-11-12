@@ -309,6 +309,7 @@ Mendaftar jadi worker:
 1. User mengetik `,jadibot` (QR) atau `,jadibot kode` (kode tautan) di chat mana pun dengan akun utama. Command ini terbuka untuk semua user.
 2. Owner menerima notifikasi di chat pribadinya. Setujui dengan reply `accept`/`yes`/`ya`, atau react `✅`/`👍`/`❤️` pada notifikasi atau pada pesan `,jadibot` user. Tolak dengan reply `no`/`tolak` atau react `❌`/`👎`/`❎`. Permintaan kedaluwarsa setelah 10 menit.
 3. Setelah disetujui, QR dikirim ke chat yang sama (chat pribadi) atau ke chat pribadi user (jika `,jadibot` dikirim di grup). QR diperbarui otomatis dan berlaku 60 detik. Jika kedaluwarsa, user bisa `,jadibot` lagi tanpa persetujuan ulang selama 10 menit.
+   QR harus discan dari HP/perangkat lain. Pesan terakhir setelah QR menjelaskan alternatif: ketik `,jadibot kode` (bisa langsung saat QR masih aktif) lalu salin kode yang dikirim dan tempel di WhatsApp > Perangkat tertaut > Tautkan dengan nomor telepon.
 4. Satu nomor hanya bisa menjadi satu worker. Worker tidak bisa dihapus dari bot; berhenti hanya dengan logout perangkat tertaut di WhatsApp.
 
 Command owner:
