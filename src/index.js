@@ -128,6 +128,8 @@ import {
   WORKER_COMMAND_DELAY_MS,
   WORKER_COMMAND_LIMIT,
   WORKER_COMMAND_WINDOW_MS,
+  WORKER_REPLY_KEY,
+  WORKER_REPLY_LIMIT,
   cintaConfig,
   findWorkerService,
   formatWorkerServiceList,
@@ -399,10 +401,19 @@ async function editText(jid, messageKey, text) {
   return sendBotMessage(jid, { text, edit: messageKey });
 }
 
-async function sendBotMessage(jid, content, options = {}) {
+function withAdminHeader(content) {
+  const header = workerScope.getStore()?.adminHeader;
+  if (!header || content.react || content.delete) return content;
+  if (typeof content.text === 'string') return { ...content, text: `${header}\n${content.text}` };
+  if (typeof content.caption === 'string' && content.caption) return { ...content, caption: `${header}\n${content.caption}` };
+  if (content.image || content.video || content.document) return { ...content, caption: header };
+  return content;
+}
+
+async function sendBotMessage(jid, content, { plain = false, ...options } = {}) {
   const messageId = options.messageId || generateMessageIDV2(ownUserJid());
   rememberOwnOutput({ key: { id: messageId } });
-  const sent = await state.sock.sendMessage(jid, content, { ...options, messageId });
+  const sent = await state.sock.sendMessage(jid, plain ? content : withAdminHeader(content), { ...options, messageId });
   rememberOwnOutput(sent);
   return sent;
 }
@@ -3445,11 +3456,11 @@ async function onMessageUpsert(event) {
         if (context.isOwner && command?.name === 'resume') await handleCommand(message, command, context);
         continue;
       }
-      if (context.isOwner && await isAdminSessionChat(message)) continue;
 
       rememberMessageDirectory(message);
       state.viewOnceCache.remember(message);
       if (!message.message?.protocolMessage) await maybeMirrorChangedMessage(message);
+      if (context.isOwner && adminWorkerSession && await handleAdminSessionMessage(message, text, command)) continue;
 
       const sessionActive = activeSessionType(jid);
       const sessionActorMatches = activeSessionActorMatches(jid, context.actorJid);
@@ -3559,6 +3570,7 @@ async function onMessagesReaction(updates) {
   for (const update of updates || []) {
     try {
       if (await maybeHandleJadibotReaction(update)) continue;
+      if (adminWorkerSession && update.reaction?.key?.fromMe && await handleAdminSessionReaction(update)) continue;
       if (await maybeForwardReactedViewOnce(update)) continue;
       await handleReactionAction(update);
     } catch (error) {
@@ -3567,9 +3579,9 @@ async function onMessagesReaction(updates) {
   }
 }
 
-async function handleReactionAction(update) {
+async function handleReactionAction(update, { allowDelete = true } = {}) {
   const intent = reactionIntent(update?.reaction?.text);
-  if (!intent) return;
+  if (!intent) return false;
   const actorJid = reactionActorJid(update);
   let action = state.reactionActions.get(update.key, actorJid);
   const jid = update.key?.remoteJid;
@@ -3579,14 +3591,15 @@ async function handleReactionAction(update) {
     action = state.reactionActions.get(update.key, prompt.actorJid);
   }
   if (!action) {
-    if (intent === 'cancel' && update.reaction?.key?.fromMe && update.key?.fromMe && !state.reactionActions.isPrompt(update.key)) await sendBotMessage(update.key.remoteJid, { delete: update.key });
-    return;
+    if (allowDelete && intent === 'cancel' && update.reaction?.key?.fromMe && update.key?.fromMe && !state.reactionActions.isPrompt(update.key)) await sendBotMessage(update.key.remoteJid, { delete: update.key });
+    return false;
   }
   const handler = intent === 'confirm' ? action.onConfirm : action.onCancel;
-  if (!handler) return;
+  if (!handler) return false;
   await handler(update);
   if (action.scope?.startsWith('session:') && activeSessionType(jid)) action.expiresAt = Date.now() + 30 * 60 * 1000;
   else state.reactionActions.delete(update.key);
+  return true;
 }
 
 function rememberMessageDirectory(message) {
@@ -4201,6 +4214,7 @@ async function runWorkerHousekeeping() {
     runtime.limiter.cleanup(CINTA_REPLY_WINDOW_MS);
     await workerScope.run(runtime.scope, () => expireListeningSessions());
   }
+  if (adminWorkerSession) await workerScope.run(adminWorkerSession.scope, () => expireListeningSessions());
 }
 
 async function showWorkerTyping(jid, delayRange) {
@@ -4223,8 +4237,7 @@ async function onWorkerMessageUpsert(runtime, event) {
       if (!worker) return;
       rememberMessageDirectory(message);
       state.viewOnceCache.remember(message);
-      const fromAdmin = !message.key.fromMe && await isAdminInWorkerSession(runtime, message);
-      if (message.key.fromMe || fromAdmin) await handleWorkerOperatorMessage(runtime, worker, message, text, fromAdmin);
+      if (message.key.fromMe) await handleWorkerOperatorMessage(runtime, worker, message, text);
       else await maybeReplyWorkerService(runtime, worker, message, text);
     } catch (error) {
       await handleFailure(error, { jid, text, messageId: message.key?.id });
@@ -4235,8 +4248,7 @@ async function onWorkerMessageUpsert(runtime, event) {
 async function onWorkerReactions(runtime, updates) {
   for (const update of updates || []) {
     try {
-      const fromAdmin = adminWorkerSession?.workerId === runtime.workerId && await isOwnerChat(runtime.connection.sock, update);
-      if (!update.reaction?.key?.fromMe && !fromAdmin) continue;
+      if (!update.reaction?.key?.fromMe) continue;
       await handleReactionAction(update);
     } catch (error) {
       await handleFailure(error, { jid: update?.key?.remoteJid, messageId: update.key?.id });
@@ -4254,46 +4266,7 @@ function isWorkerBotOutput(message) {
   return false;
 }
 
-async function toPhoneJid(sock, jid) {
-  if (!jid || !jid.endsWith('@lid')) return jid || null;
-  try {
-    return (await sock?.signalRepository?.lidMapping?.getPNForLID(jid)) || null;
-  } catch {
-    return null;
-  }
-}
-
-// WhatsApp can address the same account by phone JID or LID, so a LID is converted to a phone JID before comparing.
-async function isSameAccount(sock, left, right) {
-  if (!left || !right) return false;
-  if (sameActor(left, right)) return true;
-  const [leftPhone, rightPhone] = await Promise.all([toPhoneJid(sock, left), toPhoneJid(sock, right)]);
-  return Boolean(leftPhone && rightPhone && sameActor(leftPhone, rightPhone));
-}
-
-async function isOwnerChat(sock, message) {
-  const chatJids = [message.key.remoteJid, message.key.remoteJidAlt].filter(Boolean);
-  const ownerJids = ownerAccountJids();
-  for (const chatJid of chatJids) {
-    for (const ownerJid of ownerJids) {
-      if (await isSameAccount(sock, chatJid, ownerJid)) return true;
-    }
-  }
-  return false;
-}
-
-async function isAdminInWorkerSession(runtime, message) {
-  if (adminWorkerSession?.workerId !== runtime.workerId) return false;
-  if (ownerState.ignoredOwnMessageIds.has(message.key.id)) return false;
-  if (message.key.remoteJid.endsWith('@g.us')) return false;
-  const matched = await isOwnerChat(runtime.connection.sock, message);
-  if (!matched) {
-    await logger.info('Worker message ignored during admin session', { worker: runtime.workerId, remoteJid: message.key.remoteJid, remoteJidAlt: message.key.remoteJidAlt || null, owner: ownerAccountJids() });
-  }
-  return matched;
-}
-
-async function handleWorkerOperatorMessage(runtime, worker, message, text, fromAdmin) {
+async function handleWorkerOperatorMessage(runtime, worker, message, text, viaAdmin = false) {
   const jid = message.key.remoteJid;
   const command = parseCommand(text);
   const actorJid = messageActorJid(message);
@@ -4321,21 +4294,17 @@ async function handleWorkerOperatorMessage(runtime, worker, message, text, fromA
     if (sessionActorMatches) await maybeCollectPdfItem(message, text);
     return;
   }
-  await runWorkerCommand(runtime, worker, message, command, { actorJid, fromAdmin });
+  await runWorkerCommand(runtime, worker, message, command, { actorJid, viaAdmin });
 }
 
-async function runWorkerCommand(runtime, worker, message, command, { actorJid, fromAdmin }) {
+async function runWorkerCommand(runtime, worker, message, command, { actorJid, viaAdmin }) {
   const jid = message.key.remoteJid;
-  const isExit = command.name === 'worker' && (command.args[0] || '').toLowerCase() === 'exit';
-  if (fromAdmin && (isExit || (command.name === 'end' && !activeSessionType(jid)))) {
-    await exitAdminWorkerSession(jid);
-    return;
-  }
   if (!workerCommandAllowed(worker, command.name)) {
-    await sendText(jid, `Command ${COMMAND_PREFIX}${command.name} tidak tersedia untuk worker ini. Ketik ,help`);
+    const exitHint = viaAdmin ? ' Keluar dari sesi worker dengan ,worker exit.' : '';
+    await sendText(jid, `Command ${COMMAND_PREFIX}${command.name} tidak tersedia untuk worker ini. Ketik ,help${exitHint}`);
     return;
   }
-  if (!['end', 'cancel', 'confirm'].includes(command.name)) {
+  if (!viaAdmin && !['end', 'cancel', 'confirm'].includes(command.name)) {
     const limitKey = `command:${actorJid}:${normalizeLookupText(getMessageText(message))}`;
     if (!runtime.limiter.allow(limitKey, WORKER_COMMAND_LIMIT, WORKER_COMMAND_WINDOW_MS)) return;
     await showWorkerTyping(jid, WORKER_COMMAND_DELAY_MS);
@@ -4353,7 +4322,7 @@ async function handleWorkerStatus(jid, worker) {
   await sendText(jid, [
     `*Status worker #${worker.id}*`,
     `Nomor: +${worker.phone}`,
-    `Koneksi: ${state.connected ? 'online' : 'offline'}`,
+    `Koneksi: ${workerRuntimes.get(worker.id)?.connection.connected ? 'online' : 'offline'}`,
     `Service: ${worker.service || 'default'}`,
     `Terhubung sejak: ${worker.connectedAt ? formatWib(worker.connectedAt) : '-'}`,
     worker.service === 'cinta' ? `Balasan cinta terkirim: ${worker.stats?.cintaReplies || 0}` : null,
@@ -4362,29 +4331,29 @@ async function handleWorkerStatus(jid, worker) {
   ].filter((line) => line !== null).join('\n'));
 }
 
-async function isAdminSessionChat(message) {
-  if (!adminWorkerSession) return false;
-  const worker = state.workerStore?.get(adminWorkerSession.workerId);
-  if (!worker) return false;
-  const chatJids = [message.key.remoteJid, message.key.remoteJidAlt].filter(Boolean);
-  for (const workerJid of [worker.phoneJid, worker.lidJid].filter(Boolean)) {
-    for (const chatJid of chatJids) {
-      if (await isSameAccount(ownerState.sock, workerJid, chatJid)) return true;
-    }
-  }
-  return false;
+function createAdminSessionScope(worker) {
+  const ownerSockView = { get sock() { return ownerState.sock; }, get connected() { return ownerState.connected; } };
+  const scope = createWorkerScope(worker, ownerSockView);
+  // Replies are sent by the owner account, so its own message ids must be ignored by the owner pipeline.
+  scope.state.ignoredOwnMessageIds = ownerState.ignoredOwnMessageIds;
+  scope.adminHeader = `*Admin sebagai Worker #${worker.id} - +${worker.phone}*`;
+  return scope;
+}
+
+function adminSessionHasActiveSession() {
+  return Boolean(adminWorkerSession && workerScope.run(adminWorkerSession.scope, () => hasAnyTempSession()));
 }
 
 async function startAdminWorkerSession(jid, worker) {
-  const runtime = workerRuntimes.get(worker.id);
-  if (!runtime?.connection.connected) throw new UserInputError(`Worker #${worker.id} sedang tidak online.`);
+  if (worker.status === 'logged_out') throw new UserInputError(`Worker #${worker.id} sudah logout dan diarsipkan.`);
+  if (adminSessionHasActiveSession()) throw new UserInputError(`Masih ada sesi aktif di worker #${adminWorkerSession.workerId}. Selesaikan dengan ,end atau batalkan dengan ,cancel dulu.`);
   const previous = adminWorkerSession?.workerId;
-  adminWorkerSession = { workerId: worker.id, startedAt: Date.now() };
+  adminWorkerSession = { workerId: worker.id, startedAt: Date.now(), scope: createAdminSessionScope(worker) };
   await sendText(jid, [
     previous && previous !== worker.id ? `Sesi worker #${previous} ditutup.` : null,
     `Masuk sesi worker #${worker.id} (${worker.name || worker.phone}).`,
-    `Buka chat dengan ${waLink(worker)} lalu ketik command di sana. Command dijalankan sebagai worker.`,
-    'Keluar: ,end atau ,worker exit'
+    'Command di chat mana pun sekarang dijalankan sebagai worker ini, dan balasannya diberi tanda status di baris paling atas.',
+    'Keluar: ,worker exit'
   ].filter(Boolean).join('\n'));
 }
 
@@ -4393,9 +4362,29 @@ async function exitAdminWorkerSession(jid) {
     await sendText(jid, 'Tidak ada sesi worker yang aktif.');
     return;
   }
+  if (adminSessionHasActiveSession()) throw new UserInputError(`Masih ada sesi aktif di worker #${adminWorkerSession.workerId}. Selesaikan dengan ,end atau batalkan dengan ,cancel dulu, lalu ,worker exit.`);
   const workerId = adminWorkerSession.workerId;
   adminWorkerSession = null;
   await sendText(jid, `Keluar dari sesi worker #${workerId}.`);
+}
+
+async function handleAdminSessionMessage(message, text, command) {
+  const worker = state.workerStore.get(adminWorkerSession.workerId);
+  if (!worker || worker.status === 'logged_out') {
+    adminWorkerSession = null;
+    return false;
+  }
+  if (command?.name === 'worker') return false;
+  return workerScope.run(adminWorkerSession.scope, async () => {
+    if (!command && !activeSessionType(message.key.remoteJid)) return false;
+    const runtime = workerRuntimes.get(worker.id) || { limiter: new ReplyLimiter() };
+    await handleWorkerOperatorMessage(runtime, worker, message, text, true);
+    return true;
+  });
+}
+
+async function handleAdminSessionReaction(update) {
+  return workerScope.run(adminWorkerSession.scope, () => handleReactionAction(update, { allowDelete: false }));
 }
 
 async function handleWorkerAdminCommand(message, command, context) {
@@ -4477,10 +4466,11 @@ function currentWorker() {
 async function sendCintaReply(jid, worker) {
   const { entries } = cintaConfig(worker);
   if (!entries.length) {
-    await sendText(jid, DEFAULT_CINTA_CAPTION);
+    await sendBotMessage(jid, { text: DEFAULT_CINTA_CAPTION }, { plain: true });
     return;
   }
-  await sendRecordedEntries(botSender(), jid, absoluteEntries(entries, state.workerStore.dataDir(worker)));
+  const plainSender = { sendMessage: (target, content, options) => sendBotMessage(target, content, { ...options, plain: true }) };
+  await sendRecordedEntries(plainSender, jid, absoluteEntries(entries, state.workerStore.dataDir(worker)));
 }
 
 async function maybeReplyWorkerService(runtime, worker, message, text) {
@@ -4490,7 +4480,12 @@ async function maybeReplyWorkerService(runtime, worker, message, text) {
   if (Date.now() - timestampMs(message) > CINTA_MAX_MESSAGE_AGE_MS) return;
   const config = cintaConfig(worker);
   if (!matchCintaTrigger(text, config.triggers)) return;
-  if (!runtime.limiter.allow(`cinta:${jidNormalizedUser(jid)}`, CINTA_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS)) return;
+  const numberKey = `cinta:${jidNormalizedUser(jid)}`;
+  const workerHasRoom = runtime.limiter.hasRoom(WORKER_REPLY_KEY, WORKER_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
+  const numberHasRoom = runtime.limiter.hasRoom(numberKey, CINTA_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
+  if (!workerHasRoom || !numberHasRoom) return;
+  runtime.limiter.allow(WORKER_REPLY_KEY, WORKER_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
+  runtime.limiter.allow(numberKey, CINTA_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
 
   if (config.reactionEmoji) await sendBotMessage(jid, { react: { text: config.reactionEmoji, key: message.key } });
   await state.sock.readMessages([message.key]).catch(() => {});

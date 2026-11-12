@@ -13,8 +13,10 @@ export const WORKER_SERVICES = [
   }
 ];
 
-export const CINTA_REPLY_LIMIT = 2;
-export const CINTA_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const CINTA_REPLY_LIMIT = 3;
+export const CINTA_REPLY_WINDOW_MS = 60 * 60 * 1000;
+export const WORKER_REPLY_LIMIT = 40;
+export const WORKER_REPLY_KEY = 'worker-replies';
 export const CINTA_MAX_MESSAGE_AGE_MS = 5 * 60 * 1000;
 export const CINTA_DELAY_MS = { min: 3000, max: 8000 };
 export const WORKER_COMMAND_LIMIT = 2;
@@ -135,6 +137,11 @@ export class ReplyLimiter {
     recent.push(now);
     this.history.set(key, recent);
     return true;
+  }
+
+  hasRoom(key, limit, windowMs, now = Date.now()) {
+    const recent = (this.history.get(key) || []).filter((time) => now - time < windowMs);
+    return recent.length < limit;
   }
 
   cleanup(maxWindowMs, now = Date.now()) {

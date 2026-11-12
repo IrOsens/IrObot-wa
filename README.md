@@ -316,7 +316,7 @@ Command owner:
 
 - `,worker` atau `,worker list`: daftar worker dengan status dan link `wa.me`.
 - `,worker info <id|nomor>`: detail worker beserta foto profil (disimpan saat pertama login).
-- `,worker session <id|nomor>`: masuk sesi worker. Buka chat dengan nomor worker dan ketik command di sana; command dijalankan sebagai worker. Keluar dengan `,end` atau `,worker exit`.
+- `,worker session <id|nomor>`: masuk sesi worker. Setelah itu command yang diketik admin di chat mana pun (pribadi atau grup) dijalankan dengan konteks worker (service, command, dan data worker). Balasan tetap dikirim dari akun utama dan diberi tanda status di baris paling atas, misalnya `Admin sebagai Worker #2 - +62811...`. Command akun utama lain (`,pause`, `,backup`, dll.) tidak tersedia selama sesi. Keluar dengan `,worker exit` setelah sesi rekam/PDF/dll. yang sedang berjalan selesai (`,end`) atau dibatalkan (`,cancel`).
 - `,worker service list`: daftar service yang tersedia.
 - `,worker service <id|nomor> <nama|off>`: pasang atau lepas service.
 - `,worker default <id|nomor> on|off`: izinkan command default untuk worker yang memakai service.
@@ -339,7 +339,7 @@ Service `cinta`:
 Pengaman anti-banned (khusus worker):
 
 - Balasan service hanya ke chat pribadi, bukan grup/status, dan hanya untuk pesan yang masuk dalam 5 menit terakhir.
-- Satu nomor maksimal 2 balasan `cinta` per 24 jam; setelah itu tidak dibalas lagi.
+- Satu nomor maksimal 3 balasan `cinta` yang sama per jam, dan satu worker maksimal 40 balasan service per jam; setelah batas tercapai tidak ada balasan sampai jamnya bergeser.
 - Command yang sama dari pengirim yang sama maksimal 2 kali per menit.
 - Balasan didahului tanda dibaca dan indikator mengetik dengan jeda acak (3-8 detik untuk service, 1-2,5 detik untuk command).
 - Batas di atas disimpan di memori dan kembali kosong setelah bot restart.

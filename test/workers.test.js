@@ -9,6 +9,7 @@ import {
   DEFAULT_CINTA_CAPTION,
   ReplyLimiter,
   WORKER_COMMAND_DELAY_MS,
+  WORKER_REPLY_KEY,
   matchCintaTrigger,
   parseCintaTriggers,
   parseReactionEmoji,
@@ -151,10 +152,16 @@ test('worker messages are answered through the worker socket only', async () => 
     await deliver(incoming('AKU MAU PESAN KAK'));
     await deliver(incoming('aku mau pesan kak!'));
     await deliver(incoming('Aku mau pesan kak'));
-    assert.equal(workerSent.length, 2);
+    await deliver(incoming('Aku mau pesan kak'));
+    assert.equal(workerSent.length, 3);
     assert.equal(workerSent[0].jid, customer);
     assert.equal(workerSent[0].content.text, DEFAULT_CINTA_CAPTION);
-    assert.equal(worker.stats.cintaReplies, 2);
+    assert.equal(worker.stats.cintaReplies, 3);
+
+    const otherCustomer = '628444444444@s.whatsapp.net';
+    for (let index = 0; index < 37; index += 1) runtime.limiter.allow(WORKER_REPLY_KEY, 40, 3600000);
+    await deliver(incoming('Aku mau pesan kak', { remoteJid: otherCustomer }));
+    assert.equal(workerSent.length, 3);
 
     await deliver(incoming(',status', { remoteJid: workerPhone, fromMe: true }));
     assert.match(workerSent.at(-1).content.text, /Status worker #1/);
@@ -291,13 +298,12 @@ test('cinta recording session saves the recorded messages as the automatic reply
   }
 });
 
-test('admin session reaches the worker even when WhatsApp addresses the owner by LID', async () => {
+test('admin session runs worker commands from the owner account in any chat with a status header', async () => {
   const dir = await tmp();
   const ownerJid = '628999999999@s.whatsapp.net';
-  const ownerLid = '99999999999@lid';
+  const groupJid = 'any-chat@g.us';
   const previous = { sock: state.sock, workerStore: state.workerStore };
-  Object.assign(WORKER_COMMAND_DELAY_MS, { min: 0, max: 0 });
-  const idle = { has: () => false, finish: async () => null, end: () => null, get: () => null };
+  const idle = { has: () => false, finish: async () => null, end: () => null, get: () => null, cancel: async () => false, sessions: new Map(), count: () => 0 };
   try {
     const ownerSent = [];
     Object.assign(state, {
@@ -317,38 +323,38 @@ test('admin session reaches the worker even when WhatsApp addresses the owner by
     const worker = await state.workerStore.create({ phoneJid: workerPhone, name: 'Tako' });
     await state.workerStore.update(worker.id, { service: 'cinta' });
 
-    const workerSent = [];
-    const workerSock = {
-      user: { id: workerPhone },
-      signalRepository: { lidMapping: { getPNForLID: async (lid) => (lid === ownerLid ? ownerJid : null) } },
-      sendMessage: async (jid, content) => { workerSent.push({ jid, content }); return { key: { remoteJid: jid, id: `worker-${workerSent.length}`, fromMe: true } }; },
-      sendPresenceUpdate: async () => {},
-      readMessages: async () => {}
-    };
-    const connection = { sock: workerSock, connected: true };
-    const runtime = { workerId: worker.id, connection, scope: createWorkerScope(worker, connection), limiter: new ReplyLimiter() };
-    workerRuntimes.set(worker.id, runtime);
-
     let id = 0;
-    const timestamp = () => Math.floor(Date.now() / 1000);
-    await onMessageUpsert({ messages: [{ key: { remoteJid: ownerJid, id: `own-${++id}`, fromMe: true }, messageTimestamp: timestamp(), message: { conversation: ',worker session 1' } }] });
+    const send = (chat, text) => onMessageUpsert({ messages: [{ key: { remoteJid: chat, id: `own-${++id}`, fromMe: true }, messageTimestamp: Math.floor(Date.now() / 1000), message: { conversation: text } }] });
+    const header = '*Admin sebagai Worker #1 - +628111111111*';
+
+    await send(ownerJid, ',worker session 1');
     assert.match(ownerSent.at(-1).content.text, /Masuk sesi worker #1/);
-    const ownerRepliesBefore = ownerSent.length;
-    assert.equal(workerSent.length, 0);
 
-    await onMessageUpsert({ messages: [{ key: { remoteJid: workerPhone, id: `own-${++id}`, fromMe: true }, messageTimestamp: timestamp(), message: { conversation: ',help' } }] });
-    assert.equal(ownerSent.length, ownerRepliesBefore);
+    await send(groupJid, ',help');
+    assert.equal(ownerSent.at(-1).jid, groupJid);
+    assert.ok(ownerSent.at(-1).content.text.startsWith(`${header}\n`));
+    assert.match(ownerSent.at(-1).content.text, /,cinta/);
 
-    await workerScope.run(runtime.scope, () => onWorkerMessageUpsert(runtime, {
-      type: 'notify',
-      messages: [{ key: { remoteJid: ownerLid, id: `in-${++id}`, fromMe: false }, messageTimestamp: timestamp(), message: { conversation: ',help' } }]
-    }));
-    assert.equal(workerSent.at(-1).jid, ownerLid);
-    assert.match(workerSent.at(-1).content.text, /,cinta/);
-    assert.equal(ownerSent.length, ownerRepliesBefore);
+    await send(groupJid, ',backup');
+    assert.match(ownerSent.at(-1).content.text, /tidak tersedia untuk worker ini/);
+    assert.match(ownerSent.at(-1).content.text, /,worker exit/);
+
+    await send(groupJid, ',cinta');
+    assert.match(ownerSent.at(-1).content.text, /Mulai rekam pesan otomatis cinta/);
+    await send(groupJid, 'Pesan dari admin');
+    await send(groupJid, ',worker exit');
+    assert.match(ownerSent.at(-1).content.text, /Masih ada sesi aktif/);
+    await send(groupJid, ',end');
+    assert.match(ownerSent.at(-1).content.text, /tersimpan \(1 item\)/);
+    assert.equal(worker.serviceConfig.cinta.entries.length, 1);
+
+    await send(ownerJid, ',worker exit');
+    assert.match(ownerSent.at(-1).content.text, /Keluar dari sesi worker #1/);
+    assert.ok(!ownerSent.at(-1).content.text.includes(header));
+
+    await send(groupJid, ',help');
+    assert.ok(!ownerSent.at(-1).content.text.includes(header));
   } finally {
-    workerRuntimes.delete(1);
-    Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
     state.sock = previous.sock;
     state.workerStore = previous.workerStore;
     await fs.rm(dir, { recursive: true, force: true });
