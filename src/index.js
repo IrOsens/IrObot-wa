@@ -511,7 +511,8 @@ const HELP_SECTIONS = [
     title: 'Multiakun',
     items: [
       { name: 'jadibot', text: ',jadibot  Daftar jadi worker' },
-      { name: 'cinta', text: ',cinta    Rekam pesan otomatis cinta' }
+      { name: 'cinta', text: ',cinta    Rekam pesan otomatis cinta' },
+      { name: 'test', text: ',test     Worker membalas test (service audit)' }
     ]
   },
   {
@@ -584,7 +585,12 @@ const HELP_DETAILS = {
   jadibot: [
     'Format: ,jadibot atau ,jadibot kode',
     'Permintaan dikirim ke admin. Setelah disetujui, QR (atau kode tautan) dikirim dan berlaku 60 detik.',
-    'Satu nomor hanya bisa menjadi satu worker. Berhenti jadi worker: logout perangkat tertaut di WhatsApp.'
+    'Satu nomor hanya bisa menjadi satu worker. Berhenti jadi worker: logout perangkat tertaut di WhatsApp.',
+    'Admin: ,jadibot (QR) atau ,jadibot kode <nomor calon worker> tanpa persetujuan. QR/kode dikirim ke admin untuk diteruskan ke calon worker.'
+  ],
+  test: [
+    'Format: ,test (hanya admin lewat ,worker session pada worker dengan service audit)',
+    'Worker membalas test dari nomornya sendiri di grup yang sama, atau di DM jika chat itu adalah DM dengan nomor worker.'
   ],
   cinta: [
     'Format: ,cinta (mulai sesi rekam pesan otomatis)',
@@ -663,7 +669,7 @@ async function handleHelpDetail(jid, query, context) {
 }
 
 function canShowHelpItem(commandName, jid, context) {
-  if (commandName === 'cinta' && !workerScope.getStore()) return false;
+  if (['cinta', 'test'].includes(commandName) && !workerScope.getStore()) return false;
   return Boolean(state.commandAccess?.canUseAs(commandName, jid, context?.actorJid, { owner: context?.isOwner }));
 }
 
@@ -3811,9 +3817,12 @@ async function safeSendText(jid, text) {
 
 async function handleJadibot(message, command, context) {
   const jid = message.key.remoteJid;
-  if (context.isOwner) throw new UserInputError('Akun admin utama tidak bisa menjadi worker.');
   const firstArg = (command.args[0] || '').toLowerCase();
   const mode = ['kode', 'code'].includes(firstArg) ? 'code' : 'qr';
+  if (context.isOwner) {
+    await handleAdminJadibot(message, command, mode);
+    return;
+  }
   const requesterJid = context.actorJid;
   const phoneJid = await resolveRequesterPhoneJid(message, requesterJid);
 
@@ -3825,11 +3834,7 @@ async function handleJadibot(message, command, context) {
   }
   if (mode === 'code' && !phoneJid) throw new UserInputError('Nomor kamu tidak terbaca untuk kode tautan. Pakai ,jadibot untuk QR.');
   await cleanupJadibotState();
-  const activePairing = jadibotPairings.get(requesterJid);
-  if (activePairing) {
-    if (mode !== 'code' || activePairing.request.mode === 'code') throw new UserInputError('QR/kode kamu masih aktif. Cek chat atau tunggu sampai kedaluwarsa.');
-    await failJadibotPairing(activePairing, null);
-  }
+  await replaceActivePairing(requesterJid, mode);
 
   const request = { requesterJid, phoneJid, chatJid: jid, messageKey: message.key, mode, name: message.pushName || '' };
   if ((jadibotApprovals.get(requesterJid) || 0) > Date.now()) {
@@ -3845,6 +3850,30 @@ async function handleJadibot(message, command, context) {
   await sendText(jid, 'Permintaan jadibot dikirim ke admin. Tunggu persetujuan, ya.');
   const notice = await sendText(ownUserJid(), formatJadibotNotice(request));
   request.noticeKey = notice?.key || null;
+}
+
+async function replaceActivePairing(requesterJid, mode) {
+  const activePairing = jadibotPairings.get(requesterJid);
+  if (!activePairing) return;
+  if (mode !== 'code' || activePairing.request.mode === 'code') throw new UserInputError('QR/kode masih aktif. Cek chat atau tunggu sampai kedaluwarsa.');
+  await failJadibotPairing(activePairing, null);
+}
+
+// The admin starts the login for someone else: no approval is needed and the QR/code is meant for the prospective worker.
+async function handleAdminJadibot(message, command, mode) {
+  const requesterJid = ownUserJid();
+  let phoneJid = null;
+  if (mode === 'code') {
+    const phoneInput = command.args.slice(1).join(' ').trim();
+    if (!phoneInput) throw new UserInputError('Format: ,jadibot kode <nomor calon worker>');
+    phoneJid = normalizePhoneToWhatsAppJid(phoneInput);
+    if (isOwnerAccountJid(phoneJid)) throw new UserInputError('Nomor admin utama tidak bisa menjadi worker.');
+    const existing = state.workerStore.findByPhone(phoneJid);
+    if (existing && existing.status !== 'logged_out') throw new UserInputError(`Nomor +${existing.phone} sudah terhubung sebagai worker #${existing.id}.`);
+  }
+  await cleanupJadibotState();
+  await replaceActivePairing(requesterJid, mode);
+  await startJadibotPairing({ requesterJid, phoneJid, chatJid: message.key.remoteJid, messageKey: message.key, mode, name: '', byAdmin: true });
 }
 
 async function resolveRequesterPhoneJid(message, actorJid) {
@@ -3949,7 +3978,8 @@ async function cleanupJadibotState() {
 
 async function startJadibotPairing(request) {
   const isPrivateChat = !request.chatJid.endsWith('@g.us');
-  const dmJid = isPrivateChat ? request.chatJid : (request.phoneJid || request.requesterJid);
+  const groupDmJid = request.byAdmin ? ownUserJid() : (request.phoneJid || request.requesterJid);
+  const dmJid = isPrivateChat ? request.chatJid : groupDmJid;
   const pairing = {
     request,
     dmJid,
@@ -3973,9 +4003,13 @@ async function startJadibotPairing(request) {
   });
   jadibotPairings.set(request.requesterJid, pairing);
   const target = request.mode === 'code' ? 'Kode tautan' : 'QR';
-  await sendText(request.chatJid, isPrivateChat
-    ? `Disetujui admin! ${target} dikirim di chat ini.`
-    : `Disetujui admin! ${target} dikirim lewat chat pribadi.`);
+  if (request.byAdmin) {
+    await sendText(request.chatJid, `${target} untuk calon worker dikirim ${isPrivateChat ? 'di chat ini' : 'ke chat pribadi kamu'}. Berlaku 60 detik.`);
+  } else {
+    await sendText(request.chatJid, isPrivateChat
+      ? `Disetujui admin! ${target} dikirim di chat ini.`
+      : `Disetujui admin! ${target} dikirim lewat chat pribadi.`);
+  }
   pairing.timer = setTimeout(() => expireJadibotPairing(pairing).catch((error) => handleFailure(error)), JADIBOT_QR_TTL_MS);
   await runAsOwner(() => pairing.connection.start());
 }
@@ -4030,7 +4064,9 @@ async function sendPairingImage(pairing, qr) {
   pairing.qrKey = sent?.key || null;
   if (!pairing.hintSent) {
     pairing.hintSent = true;
-    await sendText(pairing.dmJid, 'Tidak bisa scan QR (misalnya hanya punya satu HP)? Bisa login pakai kode: ketik *,jadibot kode*, nanti kodenya dikirim dan tinggal disalin untuk login.');
+    await sendText(pairing.dmJid, pairing.request.byAdmin
+      ? 'Calon worker tidak bisa scan QR? Ketik *,jadibot kode <nomor calon worker>*, lalu kirim kodenya ke calon worker untuk dimasukkan di WhatsApp > Perangkat tertaut > Tautkan dengan nomor telepon.'
+      : 'Tidak bisa scan QR (misalnya hanya punya satu HP)? Bisa login pakai kode: ketik *,jadibot kode*, nanti kodenya dikirim dan tinggal disalin untuk login.');
   }
 }
 
@@ -4043,8 +4079,10 @@ async function expireJadibotPairing(pairing) {
     return;
   }
   await logger.warn('Pairing expired', { requester: pairing.request.requesterJid, mode: pairing.request.mode, delivered: Boolean(pairing.deliveredAt), registered: pairing.connection.isRegistered() });
-  const hint = pairing.request.mode === 'qr' ? ' Jika QR tidak bisa discan, coba ,jadibot kode.' : '';
-  await failJadibotPairing(pairing, `QR/kode kedaluwarsa. Ketik ,jadibot lagi untuk mendapatkan yang baru (tanpa persetujuan ulang selama 10 menit).${hint}`, pairing.deliveredAt ? pairing.dmJid : pairing.request.chatJid);
+  const byAdmin = Boolean(pairing.request.byAdmin);
+  const hint = pairing.request.mode === 'qr' ? ` Jika QR tidak bisa discan, coba ,jadibot kode${byAdmin ? ' <nomor>' : ''}.` : '';
+  const approvalNote = byAdmin ? '' : ' (tanpa persetujuan ulang selama 10 menit)';
+  await failJadibotPairing(pairing, `QR/kode kedaluwarsa. Ketik ,jadibot lagi untuk mendapatkan yang baru${approvalNote}.${hint}`, pairing.deliveredAt ? pairing.dmJid : pairing.request.chatJid);
 }
 
 async function closePairing(pairing) {
@@ -4099,12 +4137,17 @@ async function finishJadibotPairing(pairing, sock) {
   await state.workerStore.update(worker.id, { lidJid, name, requestedBy, approvedAt: new Date().toISOString() });
   await startWorker(worker);
 
+  const connectedText = `Worker #${worker.id} terhubung: ${name || '-'} (+${worker.phone}, ${waLink(worker)}).${existing ? ' Folder lama dipakai lagi.' : ''}`;
+  if (pairing.request.byAdmin) {
+    await safeSendText(pairing.dmJid, `${connectedText}\nUntuk berhenti, logout perangkat "My device" di WhatsApp worker > Perangkat tertaut.`);
+    return;
+  }
   await safeSendText(pairing.dmJid, [
     `Berhasil! Nomor kamu sekarang terhubung sebagai worker #${worker.id}.`,
     'Ketik ,help di chat "Pesan ke diri sendiri" untuk melihat command worker.',
-    'Untuk berhenti, logout perangkat "IrOBot Worker" di WhatsApp > Perangkat tertaut.'
+    'Untuk berhenti, logout perangkat "My device" di WhatsApp > Perangkat tertaut.'
   ].join('\n'));
-  await notifyOwner(`Worker #${worker.id} terhubung: ${name || '-'} (+${worker.phone}, ${waLink(worker)}).${existing ? ' Folder lama dipakai lagi.' : ''}`);
+  await notifyOwner(connectedText);
 }
 
 function createWorkerAccess(workerId) {
@@ -4254,6 +4297,7 @@ async function onWorkerReactions(runtime, updates) {
   for (const update of updates || []) {
     try {
       if (!update.reaction?.key?.fromMe) continue;
+      if (state.workerStore.get(runtime.workerId)?.service === 'audit') continue;
       if (await maybeReplyCintaReaction(runtime, update)) continue;
       await handleReactionAction(update);
     } catch (error) {
@@ -4276,6 +4320,7 @@ async function handleWorkerOperatorMessage(runtime, worker, message, text, viaAd
   const jid = message.key.remoteJid;
   const command = parseCommand(text);
   const actorJid = messageActorJid(message);
+  if (worker.service === 'audit' && !viaAdmin) return;
   const sessionActorMatches = activeSessionActorMatches(jid, actorJid);
   const isControlCommand = ['end', 'cancel'].includes(command?.name);
   if (sessionActorMatches && !isControlCommand) {
@@ -4317,6 +4362,8 @@ async function runWorkerCommand(runtime, worker, message, command, { actorJid, v
   }
   if (command.name === 'cinta') {
     await handleCintaCommand(worker, jid, command, actorJid);
+  } else if (command.name === 'test' && worker.service === 'audit') {
+    await handleAuditCommand(worker, message);
   } else if (command.name === 'status') {
     await handleWorkerStatus(jid, worker);
   } else {
@@ -4335,6 +4382,59 @@ async function handleWorkerStatus(jid, worker) {
     '',
     'Berhenti jadi worker: logout perangkat tertaut di WhatsApp.'
   ].filter((line) => line !== null).join('\n'));
+}
+
+async function toPhoneJid(sock, jid) {
+  if (!jid || !jid.endsWith('@lid')) return jid || null;
+  try {
+    return (await sock?.signalRepository?.lidMapping?.getPNForLID(jid)) || null;
+  } catch {
+    return null;
+  }
+}
+
+// WhatsApp can address the same account by phone JID or LID, so a LID is converted to a phone JID before comparing.
+async function isSameAccount(sock, left, right) {
+  if (!left || !right) return false;
+  if (sameActor(left, right)) return true;
+  const [leftPhone, rightPhone] = await Promise.all([toPhoneJid(sock, left), toPhoneJid(sock, right)]);
+  return Boolean(leftPhone && rightPhone && sameActor(leftPhone, rightPhone));
+}
+
+async function isWorkerDm(message, worker) {
+  const chatJids = [message.key.remoteJid, message.key.remoteJidAlt].filter(Boolean);
+  for (const workerJid of [worker.phoneJid, worker.lidJid].filter(Boolean)) {
+    for (const chatJid of chatJids) {
+      if (await isSameAccount(ownerState.sock, workerJid, chatJid)) return true;
+    }
+  }
+  return false;
+}
+
+async function resolveAuditTarget(runtime, worker, message) {
+  const chatJid = message.key.remoteJid;
+  if (chatJid.endsWith('@g.us')) {
+    try {
+      await runtime.connection.sock.groupMetadata(chatJid);
+    } catch {
+      throw new UserInputError(`Worker #${worker.id} tidak berada di grup ini.`);
+    }
+    return chatJid;
+  }
+  if (await isWorkerDm(message, worker)) return ownUserJid();
+  throw new UserInputError(`Worker #${worker.id} bukan peserta chat ini. Jalankan di DM dengan nomor worker atau di grup yang sama.`);
+}
+
+// The audit service answers from the worker's own account, so it only works where the worker is a participant.
+async function handleAuditCommand(worker, message) {
+  const runtime = workerRuntimes.get(worker.id);
+  if (!runtime?.connection.connected) throw new UserInputError(`Worker #${worker.id} sedang offline.`);
+  const targetJid = await resolveAuditTarget(runtime, worker, message);
+  try {
+    await workerScope.run(runtime.scope, () => sendText(targetJid, 'test'));
+  } catch (error) {
+    throw new UserInputError(`Worker #${worker.id} gagal mengirim ke chat ini: ${error.message}`);
+  }
 }
 
 function createAdminSessionScope(worker) {
@@ -4380,7 +4480,7 @@ async function handleAdminSessionMessage(message, text, command) {
     adminWorkerSession = null;
     return false;
   }
-  if (command?.name === 'worker') return false;
+  if (command?.name === 'worker' || command?.name === 'jadibot') return false;
   return workerScope.run(adminWorkerSession.scope, async () => {
     if (!command && !activeSessionType(message.key.remoteJid)) return false;
     const runtime = workerRuntimes.get(worker.id) || { limiter: new ReplyLimiter() };
@@ -4452,8 +4552,9 @@ async function handleWorkerServiceCommand(jid, args) {
   await state.workerStore.update(worker.id, { service: service.name });
   await sendText(jid, [
     `Worker #${worker.id} sekarang memakai service ${service.name}.`,
-    `Atur service: ,worker session ${worker.id}, lalu ketik ,${service.commands[0]} di chat dengan worker.`
-  ].join('\n'));
+    `Pakai service: ,worker session ${worker.id}, lalu ketik ,${service.commands[0]} di chat mana pun.`,
+    service.name === 'audit' ? 'Worker audit pasif dan hanya membalas di DM dengan nomor worker atau di grup yang sama.' : null
+  ].filter(Boolean).join('\n'));
 }
 
 async function handleWorkerDefaultCommand(jid, args) {

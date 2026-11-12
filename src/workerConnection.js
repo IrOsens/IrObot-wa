@@ -31,7 +31,7 @@ export class WorkerConnection {
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
       logger: pino({ level: 'silent' }),
-      browser: ['IrOBot Worker', 'Chrome', '1.0.0']
+      browser: ['My device', 'Chrome', '1.0.0']
     });
     this.sock = sock;
 

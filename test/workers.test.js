@@ -234,8 +234,15 @@ test('jadibot request notifies the owner and can be rejected by replying to the 
     await send(fromRequester, { conversation: ',jadibot' });
     assert.match(sent.at(-1).content.text, /baru saja ditolak/);
 
-    await send({ remoteJid: ownerJid, fromMe: true }, { conversation: ',jadibot' });
-    assert.match(sent.at(-1).content.text, /tidak bisa menjadi worker/);
+    await send({ remoteJid: ownerJid, fromMe: true }, { conversation: ',jadibot kode' });
+    assert.match(sent.at(-1).content.text, /Format: ,jadibot kode <nomor calon worker>/);
+
+    await state.workerStore.create({ phoneJid: workerPhone, name: 'Tako' });
+    await send({ remoteJid: ownerJid, fromMe: true }, { conversation: ',jadibot kode 08111111111' });
+    assert.match(sent.at(-1).content.text, /sudah terhubung sebagai worker #1/);
+
+    await send({ remoteJid: ownerJid, fromMe: true }, { conversation: ',jadibot kode 08999999999' });
+    assert.match(sent.at(-1).content.text, /Nomor admin utama tidak bisa menjadi worker/);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
@@ -450,6 +457,97 @@ test('worker reaction with a trigger emoji sends the automatic reply and the cin
     assert.doesNotMatch(log, /628555555555/);
   } finally {
     Object.assign(CINTA_DELAY_MS, { min: 3000, max: 8000 });
+    Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
+    state.sock = previous.sock;
+    state.workerStore = previous.workerStore;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('audit service is passive for the worker and only answers admin commands from the worker account', async () => {
+  const dir = await tmp();
+  const ownerJid = '628999999999@s.whatsapp.net';
+  const ownerLid = '99999999999@lid';
+  const workerLid = '11111111111@lid';
+  const groupJid = 'audit-group@g.us';
+  const previous = { sock: state.sock, workerStore: state.workerStore };
+  Object.assign(WORKER_COMMAND_DELAY_MS, { min: 0, max: 0 });
+  const idle = { has: () => false, finish: async () => null, end: () => null, get: () => null, cancel: async () => false, sessions: new Map(), count: () => 0 };
+  try {
+    const ownerSent = [];
+    Object.assign(state, {
+      sock: {
+        user: { id: ownerJid },
+        signalRepository: { lidMapping: { getPNForLID: async (lid) => (lid === workerLid ? workerPhone : lid === ownerLid ? ownerJid : null) } },
+        sendMessage: async (jid, content) => { ownerSent.push({ jid, content }); return { key: { remoteJid: jid, id: `owner-${ownerSent.length}`, fromMe: true } }; }
+      },
+      saveRecorder: idle, taskRecorder: idle, anticall: idle, qrSessions: idle, toVideoSessions: idle,
+      stimpaSessions: idle, pdfSessions: idle, restoreSessions: idle,
+      commandAccess: { canUseAs: () => true, isOpen: () => false, isAdmin: () => false }
+    });
+    state.workerStore = await new WorkerStore({
+      file: path.join(dir, 'workers.json'),
+      rootDir: path.join(dir, 'workers'),
+      archiveDir: path.join(dir, 'workers', 'archive')
+    }).load();
+    const worker = await state.workerStore.create({ phoneJid: workerPhone, name: 'Audit' });
+    await state.workerStore.update(worker.id, { service: 'audit' });
+
+    const workerSent = [];
+    const joinedGroups = new Set([groupJid]);
+    const workerSock = {
+      user: { id: workerPhone },
+      groupMetadata: async (jid) => { if (!joinedGroups.has(jid)) throw new Error('forbidden'); return {}; },
+      sendMessage: async (jid, content) => { workerSent.push({ jid, content }); return { key: { remoteJid: jid, id: `worker-${workerSent.length}`, fromMe: true } }; },
+      sendPresenceUpdate: async () => {},
+      readMessages: async () => {}
+    };
+    const connection = { sock: workerSock, connected: true };
+    const runtime = { workerId: worker.id, connection, scope: createWorkerScope(worker, connection), limiter: new ReplyLimiter() };
+    workerRuntimes.set(worker.id, runtime);
+
+    let id = 0;
+    const timestamp = () => Math.floor(Date.now() / 1000);
+    const workerOwn = (text) => workerScope.run(runtime.scope, () => onWorkerMessageUpsert(runtime, {
+      type: 'notify',
+      messages: [{ key: { remoteJid: workerPhone, id: `w-${++id}`, fromMe: true }, messageTimestamp: timestamp(), message: { conversation: text } }]
+    }));
+    const admin = (chat, text, extra = {}) => onMessageUpsert({ messages: [{ key: { remoteJid: chat, id: `own-${++id}`, fromMe: true, ...extra }, messageTimestamp: timestamp(), message: { conversation: text } }] });
+
+    await workerOwn(',help');
+    await workerOwn(',test');
+    await workerOwn(',cinta');
+    assert.equal(workerSent.length, 0);
+
+    await admin(ownerJid, ',worker session 1');
+    assert.match(ownerSent.at(-1).content.text, /Masuk sesi worker #1/);
+
+    await admin(groupJid, ',test');
+    assert.deepEqual(workerSent.at(-1), { jid: groupJid, content: workerSent.at(-1).content });
+    assert.equal(workerSent.at(-1).content.text, 'test');
+
+    await admin(workerLid, ',test');
+    assert.equal(workerSent.at(-1).jid, ownerJid);
+    assert.equal(workerSent.at(-1).content.text, 'test');
+
+    const sentBefore = workerSent.length;
+    await admin('628333333333@s.whatsapp.net', ',test');
+    assert.equal(workerSent.length, sentBefore);
+    assert.match(ownerSent.at(-1).content.text, /bukan peserta chat ini/);
+
+    await admin('other-group@g.us', ',test');
+    assert.equal(workerSent.length, sentBefore);
+    assert.match(ownerSent.at(-1).content.text, /tidak berada di grup ini/);
+
+    await admin(groupJid, ',help');
+    assert.match(ownerSent.at(-1).content.text, /,test/);
+    assert.ok(!/,cinta/.test(ownerSent.at(-1).content.text));
+    assert.equal(workerSent.length, sentBefore);
+
+    await admin(groupJid, ',cinta');
+    assert.match(ownerSent.at(-1).content.text, /tidak tersedia untuk worker ini/);
+  } finally {
+    workerRuntimes.delete(1);
     Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
     state.sock = previous.sock;
     state.workerStore = previous.workerStore;

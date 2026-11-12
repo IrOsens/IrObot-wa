@@ -10,6 +10,11 @@ export const WORKER_SERVICES = [
     name: 'cinta',
     description: 'Balas otomatis gambar menu + caption saat pesan berisi trigger pemesanan.',
     commands: ['cinta']
+  },
+  {
+    name: 'audit',
+    description: 'Pasif: worker tidak punya command. Admin menjalankan command lewat sesi worker (mis. ,test) dan worker membalas dari nomornya.',
+    commands: ['test']
   }
 ];
 

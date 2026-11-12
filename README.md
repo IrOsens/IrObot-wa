@@ -310,7 +310,8 @@ Mendaftar jadi worker:
 2. Owner menerima notifikasi di chat pribadinya. Setujui dengan reply `accept`/`yes`/`ya`, atau react `✅`/`👍`/`❤️` pada notifikasi atau pada pesan `,jadibot` user. Tolak dengan reply `no`/`tolak` atau react `❌`/`👎`/`❎`. Permintaan kedaluwarsa setelah 10 menit.
 3. Setelah disetujui, QR dikirim ke chat yang sama (chat pribadi) atau ke chat pribadi user (jika `,jadibot` dikirim di grup). QR diperbarui otomatis dan berlaku 60 detik. Jika kedaluwarsa, user bisa `,jadibot` lagi tanpa persetujuan ulang selama 10 menit.
    QR harus discan dari HP/perangkat lain. Pesan terakhir setelah QR menjelaskan alternatif: ketik `,jadibot kode` (bisa langsung saat QR masih aktif) lalu salin kode yang dikirim dan tempel di WhatsApp > Perangkat tertaut > Tautkan dengan nomor telepon.
-4. Satu nomor hanya bisa menjadi satu worker. Worker tidak bisa dihapus dari bot; berhenti hanya dengan logout perangkat tertaut di WhatsApp.
+4. Admin juga bisa memakai `,jadibot` (QR) atau `,jadibot kode <nomor calon worker>` tanpa persetujuan. QR atau kodenya dikirim ke admin (di chat tempat command diketik, atau chat pribadi admin jika diketik di grup) untuk diteruskan ke calon worker, bukan untuk akun admin. Akun admin sendiri tidak bisa didaftarkan sebagai worker, dan admin hanya bisa memiliki satu QR/kode aktif dalam satu waktu.
+5. Satu nomor hanya bisa menjadi satu worker. Worker tidak bisa dihapus dari bot; berhenti hanya dengan logout perangkat tertaut (bernama "My device") di WhatsApp.
 
 Command owner:
 
@@ -337,6 +338,13 @@ Service `cinta`:
 - `,cinta log` menampilkan jumlah pemakaian trigger (lewat teks atau reaksi), jumlah yang dibalas atau ditahan batas anti-banned, daftar nomor beserta jumlahnya, dan 5 pemakaian terbaru. Data disimpan di `workers/<id>/data/cinta-log.json`.
 - Media rekaman disimpan di `workers/<id>/data/cinta/`.
 - Command `,cinta` hanya muncul dan bisa dipakai pada worker yang memakai service cinta.
+
+Service `audit`:
+
+- Pasif: worker tidak punya command sama sekali (tidak ada `,help`, `,cinta`, dan lainnya) dan semua pesan serta reaksi dari akun worker diabaikan.
+- Hanya admin yang menjalankan command lewat `,worker session <id>`. Contoh `,test`: jika admin mengetik `,test` di grup yang sama dengan worker, atau di DM dengan nomor worker, worker membalas `test` dari nomornya sendiri. Di DM, balasan dikirim ke admin.
+- Jika chat itu bukan DM dengan worker atau grup yang diikuti worker, admin diberi tahu bahwa worker bukan peserta chat tersebut dan tidak ada yang dikirim. `,help` di sesi audit menampilkan `,test`.
+- Pasang dengan `,worker service <id|nomor> audit`.
 
 Pengaman anti-banned (khusus worker):
 
