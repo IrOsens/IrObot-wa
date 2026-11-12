@@ -3445,7 +3445,7 @@ async function onMessageUpsert(event) {
         if (context.isOwner && command?.name === 'resume') await handleCommand(message, command, context);
         continue;
       }
-      if (context.isOwner && isAdminSessionChat(message)) continue;
+      if (context.isOwner && await isAdminSessionChat(message)) continue;
 
       rememberMessageDirectory(message);
       state.viewOnceCache.remember(message);
@@ -4223,7 +4223,7 @@ async function onWorkerMessageUpsert(runtime, event) {
       if (!worker) return;
       rememberMessageDirectory(message);
       state.viewOnceCache.remember(message);
-      const fromAdmin = !message.key.fromMe && isAdminInWorkerSession(runtime, message);
+      const fromAdmin = !message.key.fromMe && await isAdminInWorkerSession(runtime, message);
       if (message.key.fromMe || fromAdmin) await handleWorkerOperatorMessage(runtime, worker, message, text, fromAdmin);
       else await maybeReplyWorkerService(runtime, worker, message, text);
     } catch (error) {
@@ -4235,7 +4235,7 @@ async function onWorkerMessageUpsert(runtime, event) {
 async function onWorkerReactions(runtime, updates) {
   for (const update of updates || []) {
     try {
-      const fromAdmin = adminWorkerSession?.workerId === runtime.workerId && isOwnerAccountJid(update.key?.remoteJid);
+      const fromAdmin = adminWorkerSession?.workerId === runtime.workerId && await isOwnerChat(runtime.connection.sock, update);
       if (!update.reaction?.key?.fromMe && !fromAdmin) continue;
       await handleReactionAction(update);
     } catch (error) {
@@ -4254,11 +4254,43 @@ function isWorkerBotOutput(message) {
   return false;
 }
 
-function isAdminInWorkerSession(runtime, message) {
+async function toPhoneJid(sock, jid) {
+  if (!jid || !jid.endsWith('@lid')) return jid || null;
+  try {
+    return (await sock?.signalRepository?.lidMapping?.getPNForLID(jid)) || null;
+  } catch {
+    return null;
+  }
+}
+
+// WhatsApp can address the same account by phone JID or LID, so a LID is converted to a phone JID before comparing.
+async function isSameAccount(sock, left, right) {
+  if (!left || !right) return false;
+  if (sameActor(left, right)) return true;
+  const [leftPhone, rightPhone] = await Promise.all([toPhoneJid(sock, left), toPhoneJid(sock, right)]);
+  return Boolean(leftPhone && rightPhone && sameActor(leftPhone, rightPhone));
+}
+
+async function isOwnerChat(sock, message) {
+  const chatJids = [message.key.remoteJid, message.key.remoteJidAlt].filter(Boolean);
+  const ownerJids = ownerAccountJids();
+  for (const chatJid of chatJids) {
+    for (const ownerJid of ownerJids) {
+      if (await isSameAccount(sock, chatJid, ownerJid)) return true;
+    }
+  }
+  return false;
+}
+
+async function isAdminInWorkerSession(runtime, message) {
   if (adminWorkerSession?.workerId !== runtime.workerId) return false;
   if (ownerState.ignoredOwnMessageIds.has(message.key.id)) return false;
   if (message.key.remoteJid.endsWith('@g.us')) return false;
-  return isOwnerAccountJid(message.key.remoteJid) || isOwnerAccountJid(message.key.remoteJidAlt);
+  const matched = await isOwnerChat(runtime.connection.sock, message);
+  if (!matched) {
+    await logger.info('Worker message ignored during admin session', { worker: runtime.workerId, remoteJid: message.key.remoteJid, remoteJidAlt: message.key.remoteJidAlt || null, owner: ownerAccountJids() });
+  }
+  return matched;
 }
 
 async function handleWorkerOperatorMessage(runtime, worker, message, text, fromAdmin) {
@@ -4330,14 +4362,17 @@ async function handleWorkerStatus(jid, worker) {
   ].filter((line) => line !== null).join('\n'));
 }
 
-function isAdminSessionChat(message) {
+async function isAdminSessionChat(message) {
   if (!adminWorkerSession) return false;
   const worker = state.workerStore?.get(adminWorkerSession.workerId);
   if (!worker) return false;
   const chatJids = [message.key.remoteJid, message.key.remoteJidAlt].filter(Boolean);
-  return [worker.phoneJid, worker.lidJid]
-    .filter(Boolean)
-    .some((workerJid) => chatJids.some((chatJid) => sameActor(workerJid, chatJid)));
+  for (const workerJid of [worker.phoneJid, worker.lidJid].filter(Boolean)) {
+    for (const chatJid of chatJids) {
+      if (await isSameAccount(ownerState.sock, workerJid, chatJid)) return true;
+    }
+  }
+  return false;
 }
 
 async function startAdminWorkerSession(jid, worker) {
@@ -4642,7 +4677,7 @@ process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled rejection', { error: reason?.message || String(reason) });
 });
 
-export { state, workerScope, createWorkerScope, onWorkerMessageUpsert, onMessageUpsert, onMessagesReaction, onMessagesUpdate, handleSetup, handleFailure, storageTarget, archiveStatus, handleStatusBrowse, resolveErrorGroup, runConfiguredBackup, expireListeningSessions, rememberContacts };
+export { state, workerRuntimes, workerScope, createWorkerScope, onWorkerMessageUpsert, onMessageUpsert, onMessagesReaction, onMessagesUpdate, handleSetup, handleFailure, storageTarget, archiveStatus, handleStatusBrowse, resolveErrorGroup, runConfiguredBackup, expireListeningSessions, rememberContacts };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main().catch(async (error) => {
   await logger.error('Fatal startup error', { error: error.message });

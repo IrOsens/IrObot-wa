@@ -15,7 +15,7 @@ import {
   workerCommandAllowed
 } from '../src/workerServices.js';
 import { UserInputError } from '../src/errors.js';
-import { state, workerScope, createWorkerScope, onWorkerMessageUpsert, onMessageUpsert } from '../src/index.js';
+import { state, workerRuntimes, workerScope, createWorkerScope, onWorkerMessageUpsert, onMessageUpsert } from '../src/index.js';
 
 const tmp = () => fs.mkdtemp(path.join(os.tmpdir(), 'iro-workers-'));
 const workerPhone = '628111111111@s.whatsapp.net';
@@ -284,6 +284,70 @@ test('cinta recording session saves the recorded messages as the automatic reply
     assert.equal(worker.serviceConfig.cinta.entries.length, 2);
   } finally {
     Object.assign(CINTA_DELAY_MS, { min: 3000, max: 8000 });
+    Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
+    state.sock = previous.sock;
+    state.workerStore = previous.workerStore;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('admin session reaches the worker even when WhatsApp addresses the owner by LID', async () => {
+  const dir = await tmp();
+  const ownerJid = '628999999999@s.whatsapp.net';
+  const ownerLid = '99999999999@lid';
+  const previous = { sock: state.sock, workerStore: state.workerStore };
+  Object.assign(WORKER_COMMAND_DELAY_MS, { min: 0, max: 0 });
+  const idle = { has: () => false, finish: async () => null, end: () => null, get: () => null };
+  try {
+    const ownerSent = [];
+    Object.assign(state, {
+      sock: {
+        user: { id: ownerJid },
+        sendMessage: async (jid, content) => { ownerSent.push({ jid, content }); return { key: { remoteJid: jid, id: `owner-${ownerSent.length}`, fromMe: true } }; }
+      },
+      saveRecorder: idle, taskRecorder: idle, anticall: idle, qrSessions: idle, toVideoSessions: idle,
+      stimpaSessions: idle, pdfSessions: idle, restoreSessions: idle,
+      commandAccess: { canUseAs: () => true, isOpen: () => false, isAdmin: () => false }
+    });
+    state.workerStore = await new WorkerStore({
+      file: path.join(dir, 'workers.json'),
+      rootDir: path.join(dir, 'workers'),
+      archiveDir: path.join(dir, 'workers', 'archive')
+    }).load();
+    const worker = await state.workerStore.create({ phoneJid: workerPhone, name: 'Tako' });
+    await state.workerStore.update(worker.id, { service: 'cinta' });
+
+    const workerSent = [];
+    const workerSock = {
+      user: { id: workerPhone },
+      signalRepository: { lidMapping: { getPNForLID: async (lid) => (lid === ownerLid ? ownerJid : null) } },
+      sendMessage: async (jid, content) => { workerSent.push({ jid, content }); return { key: { remoteJid: jid, id: `worker-${workerSent.length}`, fromMe: true } }; },
+      sendPresenceUpdate: async () => {},
+      readMessages: async () => {}
+    };
+    const connection = { sock: workerSock, connected: true };
+    const runtime = { workerId: worker.id, connection, scope: createWorkerScope(worker, connection), limiter: new ReplyLimiter() };
+    workerRuntimes.set(worker.id, runtime);
+
+    let id = 0;
+    const timestamp = () => Math.floor(Date.now() / 1000);
+    await onMessageUpsert({ messages: [{ key: { remoteJid: ownerJid, id: `own-${++id}`, fromMe: true }, messageTimestamp: timestamp(), message: { conversation: ',worker session 1' } }] });
+    assert.match(ownerSent.at(-1).content.text, /Masuk sesi worker #1/);
+    const ownerRepliesBefore = ownerSent.length;
+    assert.equal(workerSent.length, 0);
+
+    await onMessageUpsert({ messages: [{ key: { remoteJid: workerPhone, id: `own-${++id}`, fromMe: true }, messageTimestamp: timestamp(), message: { conversation: ',help' } }] });
+    assert.equal(ownerSent.length, ownerRepliesBefore);
+
+    await workerScope.run(runtime.scope, () => onWorkerMessageUpsert(runtime, {
+      type: 'notify',
+      messages: [{ key: { remoteJid: ownerLid, id: `in-${++id}`, fromMe: false }, messageTimestamp: timestamp(), message: { conversation: ',help' } }]
+    }));
+    assert.equal(workerSent.at(-1).jid, ownerLid);
+    assert.match(workerSent.at(-1).content.text, /,cinta/);
+    assert.equal(ownerSent.length, ownerRepliesBefore);
+  } finally {
+    workerRuntimes.delete(1);
     Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
     state.sock = previous.sock;
     state.workerStore = previous.workerStore;
