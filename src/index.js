@@ -4344,7 +4344,6 @@ async function startAdminWorkerSession(jid, worker) {
   const runtime = workerRuntimes.get(worker.id);
   if (!runtime?.connection.connected) throw new UserInputError(`Worker #${worker.id} sedang tidak online.`);
   const previous = adminWorkerSession?.workerId;
-  const ownerJid = ownUserJid();
   adminWorkerSession = { workerId: worker.id, startedAt: Date.now() };
   await sendText(jid, [
     previous && previous !== worker.id ? `Sesi worker #${previous} ditutup.` : null,
@@ -4352,11 +4351,6 @@ async function startAdminWorkerSession(jid, worker) {
     `Buka chat dengan ${waLink(worker)} lalu ketik command di sana. Command dijalankan sebagai worker.`,
     'Keluar: ,end atau ,worker exit'
   ].filter(Boolean).join('\n'));
-  await workerScope.run(runtime.scope, () => sendText(ownerJid, [
-    `Sesi admin aktif di worker #${worker.id}.`,
-    'Ketik command di chat ini. Ketik ,help untuk daftar command worker.',
-    'Keluar: ,end atau ,worker exit'
-  ].join('\n')));
 }
 
 async function exitAdminWorkerSession(jid) {
