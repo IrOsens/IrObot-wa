@@ -11,12 +11,14 @@ import {
   WORKER_COMMAND_DELAY_MS,
   WORKER_REPLY_KEY,
   matchCintaTrigger,
+  matchReactionTrigger,
+  parseReactionTriggers,
   parseCintaTriggers,
   parseReactionEmoji,
   workerCommandAllowed
 } from '../src/workerServices.js';
 import { UserInputError } from '../src/errors.js';
-import { state, workerRuntimes, workerScope, createWorkerScope, onWorkerMessageUpsert, onMessageUpsert } from '../src/index.js';
+import { state, workerRuntimes, workerScope, createWorkerScope, onWorkerMessageUpsert, onWorkerReactions, onMessageUpsert } from '../src/index.js';
 
 const tmp = () => fs.mkdtemp(path.join(os.tmpdir(), 'iro-workers-'));
 const workerPhone = '628111111111@s.whatsapp.net';
@@ -355,6 +357,100 @@ test('admin session runs worker commands from the owner account in any chat with
     await send(groupJid, ',help');
     assert.ok(!ownerSent.at(-1).content.text.includes(header));
   } finally {
+    state.sock = previous.sock;
+    state.workerStore = previous.workerStore;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('reaction trigger emoji parsing and matching', () => {
+  assert.deepEqual(parseReactionTriggers('🥢, 🍢,🥢'), ['🥢', '🍢']);
+  assert.deepEqual(parseReactionTriggers('🥢🍢'), ['🥢', '🍢']);
+  assert.deepEqual(parseReactionTriggers('-'), []);
+  assert.throws(() => parseReactionTriggers('abc'), UserInputError);
+  assert.throws(() => parseReactionTriggers(''), UserInputError);
+  assert.equal(matchReactionTrigger('🥢', ['🥢']), true);
+  assert.equal(matchReactionTrigger('❤️', ['❤']), true);
+  assert.equal(matchReactionTrigger('👍', ['🥢']), false);
+  assert.equal(matchReactionTrigger('', ['🥢']), false);
+});
+
+test('worker reaction with a trigger emoji sends the automatic reply and the cinta log records who used it', async () => {
+  const dir = await tmp();
+  const previous = { sock: state.sock, workerStore: state.workerStore };
+  Object.assign(CINTA_DELAY_MS, { min: 0, max: 0 });
+  Object.assign(WORKER_COMMAND_DELAY_MS, { min: 0, max: 0 });
+  try {
+    state.sock = { user: { id: '628999999999@s.whatsapp.net' }, sendMessage: async () => ({ key: {} }) };
+    state.workerStore = await new WorkerStore({
+      file: path.join(dir, 'workers.json'),
+      rootDir: path.join(dir, 'workers'),
+      archiveDir: path.join(dir, 'workers', 'archive')
+    }).load();
+    const worker = await state.workerStore.create({ phoneJid: workerPhone, name: 'Tako' });
+    await state.workerStore.update(worker.id, { service: 'cinta' });
+
+    const sent = [];
+    const workerSock = {
+      user: { id: workerPhone },
+      sendMessage: async (jid, content) => { sent.push({ jid, content }); return { key: { remoteJid: jid, id: `worker-${sent.length}`, fromMe: true } }; },
+      sendPresenceUpdate: async () => {},
+      readMessages: async () => {}
+    };
+    const connection = { sock: workerSock, connected: true };
+    const runtime = { workerId: worker.id, connection, scope: createWorkerScope(worker, connection), limiter: new ReplyLimiter() };
+    let id = 0;
+    const timestamp = () => Math.floor(Date.now() / 1000);
+    const react = (emoji, chat = customer, messageFromMe = false) => workerScope.run(runtime.scope, () => onWorkerReactions(runtime, [{
+      key: { remoteJid: chat, id: `msg-${++id}`, fromMe: messageFromMe },
+      reaction: { text: emoji, key: { remoteJid: chat, id: `react-${++id}`, fromMe: true } }
+    }]));
+    const operator = (text) => workerScope.run(runtime.scope, () => onWorkerMessageUpsert(runtime, {
+      type: 'notify',
+      messages: [{ key: { remoteJid: workerPhone, id: `op-${++id}`, fromMe: true }, messageTimestamp: timestamp(), message: { conversation: text } }]
+    }));
+
+    await react('👍');
+    assert.equal(sent.length, 0);
+
+    await react('🥢');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].jid, customer);
+    assert.equal(sent[0].content.text, DEFAULT_CINTA_CAPTION);
+
+    await react('🥢', customer, true);
+    await react('🥢', 'group-chat@g.us');
+    assert.equal(sent.length, 2);
+
+    await workerScope.run(runtime.scope, () => onWorkerMessageUpsert(runtime, {
+      type: 'notify',
+      messages: [{ key: { remoteJid: customer, id: `in-${++id}`, fromMe: false }, pushName: 'Budi', messageTimestamp: timestamp(), message: { conversation: 'Aku mau pesan kak' } }]
+    }));
+    assert.equal(sent.length, 3);
+
+    await react('🥢');
+    assert.equal(sent.length, 3);
+
+    await operator(',cinta emojitrigger 🍢,❤️');
+    assert.match(sent.at(-1).content.text, /Emoji pemicu tersimpan: 🍢,❤️/);
+    await react('🥢', '628555555555@s.whatsapp.net');
+    assert.equal(sent.length, 4);
+    await react('🍢', '628666666666@s.whatsapp.net');
+    assert.equal(sent.length, 5);
+    await operator(',cinta emojitrigger -');
+    await react('🍢', '628777777777@s.whatsapp.net');
+    assert.equal(sent.length, 6);
+
+    await operator(',cinta log');
+    const log = sent.at(-1).content.text;
+    assert.match(log, /Total pemakaian trigger: 5/);
+    assert.match(log, /Dibalas: 4, ditahan batas anti-banned: 1/);
+    assert.match(log, /\+628222222222 \(Budi\) - 4x \(dibalas 3, teks 1, reaksi 3\)/);
+    assert.match(log, /\+628666666666 - 1x/);
+    assert.doesNotMatch(log, /628555555555/);
+  } finally {
+    Object.assign(CINTA_DELAY_MS, { min: 3000, max: 8000 });
+    Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
     state.sock = previous.sock;
     state.workerStore = previous.workerStore;
     await fs.rm(dir, { recursive: true, force: true });

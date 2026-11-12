@@ -24,6 +24,7 @@ export const WORKER_COMMAND_WINDOW_MS = 60 * 1000;
 export const WORKER_COMMAND_DELAY_MS = { min: 1000, max: 2500 };
 
 export const DEFAULT_CINTA_TRIGGERS = ['Aku mau pesan kak', 'Aku mau pesan kak!'];
+export const DEFAULT_CINTA_REACTION_TRIGGERS = ['🥢'];
 export const DEFAULT_CINTA_CAPTION = `🐙 *SELAMAT DATANG DI TAKO-WAE!* 🥢
 
 Japanese Street Food 🇯🇵
@@ -88,7 +89,8 @@ export function cintaConfig(worker) {
   return {
     triggers: Array.isArray(saved.triggers) && saved.triggers.length ? saved.triggers : DEFAULT_CINTA_TRIGGERS,
     entries: Array.isArray(saved.entries) ? saved.entries : [],
-    reactionEmoji: saved.reactionEmoji || ''
+    reactionEmoji: saved.reactionEmoji || '',
+    reactionTriggers: Array.isArray(saved.reactionTriggers) ? saved.reactionTriggers : DEFAULT_CINTA_REACTION_TRIGGERS
   };
 }
 
@@ -121,6 +123,33 @@ export function parseReactionEmoji(text) {
     && /\p{Extended_Pictographic}/u.test(value);
   if (!isEmoji || value.length > 16) throw new UserInputError('Kirim satu emoji saja, atau - untuk mematikan reaksi.');
   return value;
+}
+
+function removeVariationSelector(emoji) {
+  return String(emoji || '').replace(/\ufe0f/g, '');
+}
+
+// Emoji are split by commas or spaces; several emoji written together without a separator count as separate emoji.
+export function parseReactionTriggers(text) {
+  const value = String(text || '').trim();
+  if (value === '-') return [];
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  const emojis = [];
+  for (const token of value.split(/[,\s]+/).filter(Boolean)) {
+    for (const { segment } of segmenter.segment(token)) {
+      if (!/\p{Extended_Pictographic}/u.test(segment)) throw new UserInputError('Kirim emoji dipisah koma, contoh: ,cinta emojitrigger 🥢,🍢. Gunakan - untuk mematikan.');
+      emojis.push(segment);
+    }
+  }
+  if (!emojis.length) throw new UserInputError('Kirim emoji dipisah koma, contoh: ,cinta emojitrigger 🥢,🍢. Gunakan - untuk mematikan.');
+  if (emojis.length > 10) throw new UserInputError('Maksimal 10 emoji pemicu.');
+  return [...new Set(emojis)];
+}
+
+export function matchReactionTrigger(emoji, reactionTriggers) {
+  const reacted = removeVariationSelector(emoji);
+  if (!reacted) return false;
+  return (reactionTriggers || []).some((trigger) => removeVariationSelector(trigger) === reacted);
 }
 
 export class ReplyLimiter {

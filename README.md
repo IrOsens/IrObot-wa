@@ -333,13 +333,15 @@ Service `cinta`:
 - Balasan berupa pesan otomatis hasil rekaman `,cinta`. Selama belum ada rekaman, balasan memakai teks Tako-Wae bawaan tanpa gambar.
 - `,cinta` membuka sesi rekam seperti `,save` atau `,anticall new`: kirim teks, gambar, atau media lain, lalu `,end` atau reaksi `✅`/`👍`/`❤️` untuk menyimpannya sebagai pesan otomatis. `,cancel` atau reaksi `❌`/`👎`/`❎` membatalkan. Rekaman baru menggantikan yang lama. Selama belum ada rekaman, balasan memakai teks Tako-Wae bawaan.
 - `,cinta trigger <teks>` mengganti trigger (satu trigger per baris), `,cinta emoji <emoji|->` mengganti emoji reaksi, `,cinta info` melihat pengaturan, `,cinta test` mencoba balasan, `,cinta reset` mengembalikan ke bawaan.
+- Emoji pemicu: jika worker memberi reaksi emoji pemicu (default `🥢`) ke pesan mana pun di chat pribadi, baik pesan sendiri maupun pesan orang lain, pesan otomatis dikirim ke chat itu. Atur dengan `,cinta emojitrigger <emoji,emoji>` (pisahkan dengan koma) atau `,cinta emojitrigger -` untuk mematikan. `,cinta emoji` tetap dipakai untuk emoji reaksi yang diberikan bot pada pesan trigger teks. Reaksi di grup diabaikan.
+- `,cinta log` menampilkan jumlah pemakaian trigger (lewat teks atau reaksi), jumlah yang dibalas atau ditahan batas anti-banned, daftar nomor beserta jumlahnya, dan 5 pemakaian terbaru. Data disimpan di `workers/<id>/data/cinta-log.json`.
 - Media rekaman disimpan di `workers/<id>/data/cinta/`.
 - Command `,cinta` hanya muncul dan bisa dipakai pada worker yang memakai service cinta.
 
 Pengaman anti-banned (khusus worker):
 
 - Balasan service hanya ke chat pribadi, bukan grup/status, dan hanya untuk pesan yang masuk dalam 5 menit terakhir.
-- Satu nomor maksimal 3 balasan `cinta` yang sama per jam, dan satu worker maksimal 40 balasan service per jam; setelah batas tercapai tidak ada balasan sampai jamnya bergeser.
+- Batas ini juga berlaku untuk balasan yang dipicu reaksi emoji worker. Satu nomor maksimal 3 balasan `cinta` yang sama per jam, dan satu worker maksimal 40 balasan service per jam; setelah batas tercapai tidak ada balasan sampai jamnya bergeser.
 - Command yang sama dari pengirim yang sama maksimal 2 kali per menit.
 - Balasan didahului tanda dibaca dan indikator mengetik dengan jeda acak (3-8 detik untuk service, 1-2,5 detik untuk command).
 - Batas di atas disimpan di memori dan kembali kosong setelah bot restart.

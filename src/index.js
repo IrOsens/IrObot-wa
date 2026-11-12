@@ -118,6 +118,7 @@ import { TypingController } from './typing.js';
 import { WorkerStore, formatWorkerInfo, formatWorkerList, waLink } from './workers.js';
 import { WorkerConnection } from './workerConnection.js';
 import { CintaRecorder, absoluteEntries, relativeEntries, removeStoredMedia } from './cintaRecorder.js';
+import { cintaLogFor, formatCintaLog } from './cintaLog.js';
 import {
   CINTA_DELAY_MS,
   CINTA_MAX_MESSAGE_AGE_MS,
@@ -134,8 +135,10 @@ import {
   findWorkerService,
   formatWorkerServiceList,
   matchCintaTrigger,
+  matchReactionTrigger,
   parseCintaTriggers,
   parseReactionEmoji,
+  parseReactionTriggers,
   randomDelayMs,
   workerCommandAllowed
 } from './workerServices.js';
@@ -587,7 +590,9 @@ const HELP_DETAILS = {
     'Format: ,cinta (mulai sesi rekam pesan otomatis)',
     'Kirim teks, gambar, atau media lain lalu ,end atau ✅/👍/❤️ untuk simpan. Batal: ,cancel atau ❌/👎/❎.',
     'Format: ,cinta trigger <teks> (satu trigger per baris)',
-    'Format: ,cinta emoji <emoji|->',
+    'Format: ,cinta emoji <emoji|-> (emoji reaksi bot pada pesan trigger)',
+    'Format: ,cinta emojitrigger <emoji,emoji|-> (default 🥢): jika worker memberi reaksi emoji ini ke pesan mana pun di chat pribadi, pesan otomatis dikirim ke chat itu.',
+    'Format: ,cinta log (jumlah pemakaian trigger dan siapa saja)',
     'Format: ,cinta info, ,cinta test, ,cinta reset'
   ],
   pull: ['Format: ,pull', 'Menjalankan git pull pada branch yang sedang aktif tanpa restart. Restart manual dengan ,restartbot agar perubahan dipakai.'],
@@ -4249,6 +4254,7 @@ async function onWorkerReactions(runtime, updates) {
   for (const update of updates || []) {
     try {
       if (!update.reaction?.key?.fromMe) continue;
+      if (await maybeReplyCintaReaction(runtime, update)) continue;
       await handleReactionAction(update);
     } catch (error) {
       await handleFailure(error, { jid: update?.key?.remoteJid, messageId: update.key?.id });
@@ -4473,28 +4479,93 @@ async function sendCintaReply(jid, worker) {
   await sendRecordedEntries(plainSender, jid, absoluteEntries(entries, state.workerStore.dataDir(worker)));
 }
 
+async function describeCintaCustomer(jid, altJid, name = '') {
+  let phoneJid = [jid, altJid].find((item) => item?.endsWith('@s.whatsapp.net')) || null;
+  if (!phoneJid && jid.endsWith('@lid')) {
+    try {
+      phoneJid = (await state.sock?.signalRepository?.lidMapping?.getPNForLID(jid)) || null;
+    } catch {
+      phoneJid = null;
+    }
+  }
+  return {
+    key: jidNormalizedUser(phoneJid || jid),
+    phone: phoneJid ? displayPhoneFromJid(phoneJid) : null,
+    name: name || state.chatDirectory.nameFor(jid)
+  };
+}
+
+function reserveCintaReply(runtime, customerKey) {
+  const numberKey = `cinta:${customerKey}`;
+  const workerHasRoom = runtime.limiter.hasRoom(WORKER_REPLY_KEY, WORKER_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
+  const numberHasRoom = runtime.limiter.hasRoom(numberKey, CINTA_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
+  if (!workerHasRoom || !numberHasRoom) return false;
+  runtime.limiter.allow(WORKER_REPLY_KEY, WORKER_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
+  runtime.limiter.allow(numberKey, CINTA_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
+  return true;
+}
+
+async function recordCintaUse(worker, customer, via, replied) {
+  const logFile = path.join(state.workerStore.dataDir(worker), 'cinta-log.json');
+  await cintaLogFor(logFile).record({ ...customer, via, replied });
+}
+
+async function countCintaReply(worker) {
+  await state.workerStore.update(worker.id, {
+    stats: { ...worker.stats, cintaReplies: (worker.stats?.cintaReplies || 0) + 1 },
+    lastSeenAt: new Date().toISOString()
+  });
+}
+
+function isPrivateChatJid(jid) {
+  return Boolean(jid) && (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid'));
+}
+
 async function maybeReplyWorkerService(runtime, worker, message, text) {
   if (worker.service !== 'cinta') return;
   const jid = message.key.remoteJid;
-  if (!jid.endsWith('@s.whatsapp.net') && !jid.endsWith('@lid')) return;
+  if (!isPrivateChatJid(jid)) return;
   if (Date.now() - timestampMs(message) > CINTA_MAX_MESSAGE_AGE_MS) return;
   const config = cintaConfig(worker);
   if (!matchCintaTrigger(text, config.triggers)) return;
-  const numberKey = `cinta:${jidNormalizedUser(jid)}`;
-  const workerHasRoom = runtime.limiter.hasRoom(WORKER_REPLY_KEY, WORKER_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
-  const numberHasRoom = runtime.limiter.hasRoom(numberKey, CINTA_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
-  if (!workerHasRoom || !numberHasRoom) return;
-  runtime.limiter.allow(WORKER_REPLY_KEY, WORKER_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
-  runtime.limiter.allow(numberKey, CINTA_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS);
+  const customer = await describeCintaCustomer(jid, message.key.remoteJidAlt, message.pushName);
+  const canReply = reserveCintaReply(runtime, customer.key);
+  await recordCintaUse(worker, customer, 'teks', canReply);
+  if (!canReply) return;
 
   if (config.reactionEmoji) await sendBotMessage(jid, { react: { text: config.reactionEmoji, key: message.key } });
   await state.sock.readMessages([message.key]).catch(() => {});
   await showWorkerTyping(jid, CINTA_DELAY_MS);
   await sendCintaReply(jid, worker);
-  await state.workerStore.update(worker.id, {
-    stats: { ...worker.stats, cintaReplies: (worker.stats?.cintaReplies || 0) + 1 },
-    lastSeenAt: new Date().toISOString()
-  });
+  await countCintaReply(worker);
+}
+
+// The worker reacts to any message with a trigger emoji (for example chopsticks), so the automatic reply is sent to that chat.
+async function maybeReplyCintaReaction(runtime, update) {
+  const worker = state.workerStore.get(runtime.workerId);
+  if (worker?.service !== 'cinta') return false;
+  const config = cintaConfig(worker);
+  if (!matchReactionTrigger(update.reaction?.text, config.reactionTriggers)) return false;
+  if (isIgnoredOwnOutput({ key: update.reaction.key })) return true;
+  const jid = update.key?.remoteJid;
+  if (!isPrivateChatJid(jid)) return true;
+
+  runtime.handledReactions ??= new Set();
+  const reactionId = update.reaction.key?.id;
+  if (reactionId) {
+    if (runtime.handledReactions.has(reactionId)) return true;
+    runtime.handledReactions.add(reactionId);
+    setTimeout(() => runtime.handledReactions.delete(reactionId), 10 * 60 * 1000).unref?.();
+  }
+
+  const customer = await describeCintaCustomer(jid, update.key.remoteJidAlt);
+  const canReply = reserveCintaReply(runtime, customer.key);
+  await recordCintaUse(worker, customer, 'reaksi', canReply);
+  if (!canReply) return true;
+  await showWorkerTyping(jid, CINTA_DELAY_MS);
+  await sendCintaReply(jid, worker);
+  await countCintaReply(worker);
+  return true;
 }
 
 function formatCintaConfig(worker) {
@@ -4502,12 +4573,15 @@ function formatCintaConfig(worker) {
   return [
     '*Pengaturan service cinta*',
     `Trigger: ${config.triggers.map((trigger) => `"${trigger}"`).join(', ')}`,
-    `Emoji reaksi: ${config.reactionEmoji || 'tidak ada'}`,
+    `Emoji reaksi bot: ${config.reactionEmoji || 'tidak ada'}`,
+    `Emoji pemicu (reaksi worker): ${config.reactionTriggers.length ? config.reactionTriggers.join(',') : 'nonaktif'}`,
     `Pesan otomatis: ${config.entries.length ? `${config.entries.length} item rekaman` : 'bawaan (teks Tako-Wae)'}`,
     '',
     ',cinta rekam pesan otomatis baru',
     ',cinta trigger <teks> (satu trigger per baris)',
     ',cinta emoji <emoji|->',
+    ',cinta emojitrigger <emoji,emoji|->',
+    ',cinta log',
     ',cinta test',
     ',cinta reset'
   ].join('\n');
@@ -4533,6 +4607,11 @@ async function handleCintaCommand(worker, jid, command, actorJid) {
     const reactionEmoji = parseReactionEmoji(command.args[1]);
     await updateCintaConfig(worker, { reactionEmoji });
     await sendText(jid, reactionEmoji ? `Emoji reaksi diganti menjadi ${reactionEmoji}.` : 'Reaksi emoji dimatikan.');
+  } else if (action === 'emojitrigger') {
+    await handleCintaEmojiTrigger(worker, jid, command);
+  } else if (action === 'log') {
+    const logFile = path.join(state.workerStore.dataDir(worker), 'cinta-log.json');
+    await sendText(jid, formatCintaLog(await cintaLogFor(logFile).snapshot()));
   } else if (action === 'test') {
     await sendCintaReply(jid, worker);
   } else if (action === 'reset') {
@@ -4540,6 +4619,20 @@ async function handleCintaCommand(worker, jid, command, actorJid) {
   } else {
     throw new UserInputError(HELP_DETAILS.cinta.join('\n'));
   }
+}
+
+async function handleCintaEmojiTrigger(worker, jid, command) {
+  const input = command.rawArgs.replace(/^\S+/, '').trim();
+  if (!input) {
+    const current = cintaConfig(worker).reactionTriggers;
+    await sendText(jid, `Emoji pemicu: ${current.length ? current.join(',') : 'nonaktif'}\nUbah: ,cinta emojitrigger <emoji,emoji> atau - untuk mematikan.`);
+    return;
+  }
+  const reactionTriggers = parseReactionTriggers(input);
+  await updateCintaConfig(worker, { reactionTriggers });
+  await sendText(jid, reactionTriggers.length
+    ? `Emoji pemicu tersimpan: ${reactionTriggers.join(',')}. Reaksi worker dengan emoji ini ke pesan di chat pribadi akan mengirim pesan otomatis.`
+    : 'Emoji pemicu dimatikan.');
 }
 
 async function startCintaRecording(jid, actorJid) {
@@ -4672,7 +4765,7 @@ process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled rejection', { error: reason?.message || String(reason) });
 });
 
-export { state, workerRuntimes, workerScope, createWorkerScope, onWorkerMessageUpsert, onMessageUpsert, onMessagesReaction, onMessagesUpdate, handleSetup, handleFailure, storageTarget, archiveStatus, handleStatusBrowse, resolveErrorGroup, runConfiguredBackup, expireListeningSessions, rememberContacts };
+export { state, workerRuntimes, workerScope, createWorkerScope, onWorkerMessageUpsert, onWorkerReactions, onMessageUpsert, onMessagesReaction, onMessagesUpdate, handleSetup, handleFailure, storageTarget, archiveStatus, handleStatusBrowse, resolveErrorGroup, runConfiguredBackup, expireListeningSessions, rememberContacts };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main().catch(async (error) => {
   await logger.error('Fatal startup error', { error: error.message });
