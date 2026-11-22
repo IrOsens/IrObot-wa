@@ -1,9 +1,12 @@
 import { UserInputError } from './errors.js';
 
-export const WORKER_BASE_COMMANDS = new Set(['help', 'status', 'end', 'cancel', 'confirm']);
+export const WORKER_BASE_COMMANDS = new Set(['help', 'status', 'end', 'cancel', 'confirm', 'allow']);
 export const WORKER_DEFAULT_COMMANDS = new Set([
   's', 'stext', 'smeme', 'rs', 'resend', 'qr', 'topdf', 'tovideo', 'stimpa', 'toimg', 'note', 'link'
 ]);
+
+// Commands other people may use in a chat the worker operator opened with ,allow here on.
+export const WORKER_PUBLIC_COMMANDS = new Set(['help', 's', 'stext', 'smeme', 'rs', 'resend', 'qr', 'tovideo', 'stimpa']);
 
 export const WORKER_SERVICES = [
   {
@@ -87,6 +90,11 @@ export function workerCommandAllowed(worker, commandName) {
   if (!service) return WORKER_DEFAULT_COMMANDS.has(name);
   if (service.commands.includes(name)) return true;
   return Boolean(worker.allowDefaultCommands) && WORKER_DEFAULT_COMMANDS.has(name);
+}
+
+export function workerPublicCommandAllowed(worker, commandName) {
+  const name = String(commandName || '').toLowerCase();
+  return WORKER_PUBLIC_COMMANDS.has(name) && workerCommandAllowed(worker, name);
 }
 
 export function cintaConfig(worker) {

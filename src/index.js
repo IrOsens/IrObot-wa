@@ -140,7 +140,9 @@ import {
   parseReactionEmoji,
   parseReactionTriggers,
   randomDelayMs,
-  workerCommandAllowed
+  workerCommandAllowed,
+  workerPublicCommandAllowed,
+  WORKER_PUBLIC_COMMANDS
 } from './workerServices.js';
 
 class ChatDirectory {
@@ -570,7 +572,7 @@ const HELP_DETAILS = {
   backup: ['Format: ,backup', 'Backup data/ ke satu tujuan aktif. Pilih grup/server dengan ,setup backup.'],
   restore: ['Format: ,restore atau ,restore save', ',restore memulihkan seluruh data/. ,restore save hanya memulihkan koleksi save.', 'Kirim ZIP/semua part, lalu ,end. Pada restore save pilih semua atau beberapa save dengan angka; 0 kembali. Pilih timpa/gabung lalu ,confirm.'],
   anticall: ['Listening: ,anticall new, kirim teks/media/VN/lokasi, lalu ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.', 'Format: ,anticall', 'Format: ,anticall new|on|off', 'Format: ,anticall except list|add|del <nomor|id>'],
-  allow: ['Format: ,allow here on|off', 'Format: ,allow all on|off', 'Legacy true|false tetap didukung.'],
+  allow: ['Format: ,allow here on|off', 'Format: ,allow all on|off', 'Legacy true|false tetap didukung.', 'Di worker hanya ,allow here on|off. Satu grup hanya bisa dibuka satu worker; allow here bot admin selalu didahulukan.'],
   admin: ['Format: ,admin list', 'Format: ,admin add <nomor>', 'Format: ,admin del <nomor|id>'],
   pause: ['Format: ,pause', 'Mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall akun utama. Worker tetap berjalan.'],
   resume: ['Format: ,resume', 'Mengaktifkan lagi bot setelah ,pause.'],
@@ -669,6 +671,7 @@ async function handleHelpDetail(jid, query, context) {
 }
 
 function canShowHelpItem(commandName, jid, context) {
+  if (context?.workerPublic) return workerPublicCommandAllowed(currentWorker(), commandName);
   if (['cinta', 'test'].includes(commandName) && !workerScope.getStore()) return false;
   return Boolean(state.commandAccess?.canUseAs(commandName, jid, context?.actorJid, { owner: context?.isOwner }));
 }
@@ -2885,9 +2888,11 @@ async function handleAllow(message, command) {
   }
 
   const snapshot = await state.commandAccess.setHere(jid, enabled);
+  const holder = enabled && jid.endsWith('@g.us') ? state.workerStore?.publicChatHolder(jid) : null;
   await sendText(jid, [
     `Akses publik chat ini: ${snapshot.chats[jid] ? 'aktif' : 'nonaktif'}.`,
     `Command publik: ${commands}.`,
+    holder ? `Catatan: worker #${holder.id} juga membuka grup ini, tapi command publik sekarang dijawab bot admin.` : null,
     snapshot.all ? 'Catatan: akses all sedang aktif, jadi semua chat tetap diizinkan.' : null
   ].filter(Boolean).join('\n'));
 }
@@ -3524,7 +3529,10 @@ async function onMessageUpsert(event) {
           await handleJadibot(message, command, context);
           continue;
         }
+        if (!context.isOwner && isBotActor(context.actorJid, { skipOwner: true })) continue;
+        if (!context.isOwner && !context.isAdmin && groupHeldByWorker(jid)) continue;
         if (!state.commandAccess?.canUseAs(command.name, jid, context.actorJid, { owner: context.isOwner }) && !(sessionActive && canControlSession)) continue;
+        if (!context.isOwner && !claimPublicCommand(message)) continue;
         if (canControlSession && !sessionActorMatches) {
           await handleCommand(message, command, { ...context, actorJid: sessionControlActor(jid, context.actorJid, context.isOwner) });
         } else {
@@ -4286,7 +4294,7 @@ async function onWorkerMessageUpsert(runtime, event) {
       rememberMessageDirectory(message);
       state.viewOnceCache.remember(message);
       if (message.key.fromMe) await handleWorkerOperatorMessage(runtime, worker, message, text);
-      else await maybeReplyWorkerService(runtime, worker, message, text);
+      else if (!await maybeHandleWorkerPublicMessage(runtime, worker, message, text)) await maybeReplyWorkerService(runtime, worker, message, text);
     } catch (error) {
       await handleFailure(error, { jid, text, messageId: message.key?.id });
     }
@@ -4316,7 +4324,86 @@ function isWorkerBotOutput(message) {
   return false;
 }
 
-async function handleWorkerOperatorMessage(runtime, worker, message, text, viaAdmin = false) {
+const publicCommandClaims = new Map();
+const PUBLIC_CLAIM_TTL_MS = 10 * 60 * 1000;
+
+// The admin and every worker run in this process and see the same message id,
+// so only the first bot that claims a public command answers it.
+function claimPublicCommand(message) {
+  const id = message?.key?.id;
+  if (!id) return true;
+  const now = Date.now();
+  for (const [claimed, at] of publicCommandClaims) {
+    if (now - at < PUBLIC_CLAIM_TTL_MS) break;
+    publicCommandClaims.delete(claimed);
+  }
+  if (publicCommandClaims.has(id)) return false;
+  publicCommandClaims.set(id, now);
+  return true;
+}
+
+// A command typed from a bot number is handled by that bot itself, so the other bots ignore it.
+function isBotActor(actorJid, { skipOwner = false, skipWorkerId = null } = {}) {
+  if (!actorJid) return false;
+  if (!skipOwner && isOwnerAccountJid(actorJid)) return true;
+  return (ownerState.workerStore?.activeWorkers() || []).some((worker) => worker.id !== skipWorkerId
+    && [worker.phoneJid, worker.lidJid].some((jid) => sameActor(jid, actorJid)));
+}
+
+// An online worker that opened a group keeps it, unless the admin bot opened that group with allow here.
+// allow all on the admin bot is only a fallback for groups no worker holds.
+function groupHeldByWorker(jid) {
+  if (!jid?.endsWith('@g.us') || ownerState.commandAccess?.isHere(jid)) return null;
+  const holder = ownerState.workerStore?.publicChatHolder(jid);
+  return holder && workerRuntimes.get(holder.id)?.connection?.connected ? holder : null;
+}
+
+function workerYieldsToAdmin(jid, actorJid) {
+  if (!ownerState.connected || !jid?.endsWith('@g.us')) return false;
+  if (ownerState.commandAccess?.isHere(jid)) return true;
+  return Boolean(ownerState.commandAccess?.isAdmin(actorJid) && ownerState.commandAccess.isOpen(jid));
+}
+
+// Other people may use public commands in a chat the worker operator opened with ,allow here on.
+async function maybeHandleWorkerPublicMessage(runtime, worker, message, text) {
+  const jid = message.key.remoteJid;
+  if (!(worker.publicChats || []).includes(jid)) return false;
+  const command = parseCommand(text);
+  const actorJid = messageActorJid(message);
+  const ownSession = Boolean(activeSessionType(jid)) && activeSessionActorMatches(jid, actorJid);
+  const control = ['end', 'cancel'].includes(command?.name);
+  if (command && !workerPublicCommandAllowed(worker, command.name) && !(control && ownSession)) return false;
+  if (!command && !ownSession) return false;
+  if (ownerState.ignoredOwnMessageIds.has(message.key.id) || isWorkerBotOutput(message)) return true;
+  if (isBotActor(actorJid, { skipWorkerId: worker.id })) return Boolean(command);
+  if (workerYieldsToAdmin(jid, actorJid)) return false;
+  if (command && !claimPublicCommand(message)) return true;
+  if (command && !control && !runtime.limiter.allow(WORKER_REPLY_KEY, WORKER_REPLY_LIMIT, CINTA_REPLY_WINDOW_MS)) return true;
+  await handleWorkerOperatorMessage(runtime, worker, message, text, false, { publicUser: true });
+  return true;
+}
+
+async function handleWorkerAllow(worker, jid, command) {
+  const { scope, enabled } = parseAllowArgs(command.args);
+  if (scope === 'all') throw new UserInputError('Worker hanya bisa ,allow here on|off di chat yang ingin dibuka.');
+  if (enabled && jid.endsWith('@g.us')) {
+    const holder = state.workerStore.publicChatHolder(jid, worker.id);
+    if (holder) throw new UserInputError(`Grup ini sudah dibuka worker #${holder.id}. Minta operatornya ketik ,allow here off dulu.`);
+    if (ownerState.commandAccess?.isHere(jid)) throw new UserInputError('Grup ini sudah dibuka bot admin, jadi command publik dijawab bot admin.');
+  }
+  const updated = await state.workerStore.setPublicChat(worker.id, jid, enabled);
+  const commands = [...WORKER_PUBLIC_COMMANDS]
+    .filter((name) => workerPublicCommandAllowed(updated, name))
+    .map((name) => `${COMMAND_PREFIX}${name}`)
+    .join(', ');
+  await sendText(jid, [
+    `Akses publik worker di chat ini: ${enabled ? 'aktif' : 'nonaktif'}.`,
+    enabled ? `Command publik: ${commands || '-'}.` : null,
+    enabled ? 'Batas anti-ban worker tetap berlaku.' : null
+  ].filter(Boolean).join('\n'));
+}
+
+async function handleWorkerOperatorMessage(runtime, worker, message, text, viaAdmin = false, { publicUser = false } = {}) {
   const jid = message.key.remoteJid;
   const command = parseCommand(text);
   const actorJid = messageActorJid(message);
@@ -4345,10 +4432,10 @@ async function handleWorkerOperatorMessage(runtime, worker, message, text, viaAd
     if (sessionActorMatches) await maybeCollectPdfItem(message, text);
     return;
   }
-  await runWorkerCommand(runtime, worker, message, command, { actorJid, viaAdmin });
+  await runWorkerCommand(runtime, worker, message, command, { actorJid, viaAdmin, publicUser });
 }
 
-async function runWorkerCommand(runtime, worker, message, command, { actorJid, viaAdmin }) {
+async function runWorkerCommand(runtime, worker, message, command, { actorJid, viaAdmin, publicUser = false }) {
   const jid = message.key.remoteJid;
   if (!workerCommandAllowed(worker, command.name)) {
     const exitHint = viaAdmin ? ' Keluar dari sesi worker dengan ,worker exit.' : '';
@@ -4360,14 +4447,17 @@ async function runWorkerCommand(runtime, worker, message, command, { actorJid, v
     if (!runtime.limiter.allow(limitKey, WORKER_COMMAND_LIMIT, WORKER_COMMAND_WINDOW_MS)) return;
     await showWorkerTyping(jid, WORKER_COMMAND_DELAY_MS);
   }
-  if (command.name === 'cinta') {
+  if (command.name === 'allow') {
+    if (viaAdmin) throw new UserInputError('Atur akses worker dari nomor worker itu sendiri: ketik ,allow here on|off di chat yang ingin dibuka.');
+    await handleWorkerAllow(worker, jid, command);
+  } else if (command.name === 'cinta') {
     await handleCintaCommand(worker, jid, command, actorJid);
   } else if (command.name === 'test' && worker.service === 'audit') {
     await handleAuditCommand(worker, message);
   } else if (command.name === 'status') {
     await handleWorkerStatus(jid, worker);
   } else {
-    await handleCommand(message, command, { actorJid, isOwner: false, isAdmin: false, publicOpen: false });
+    await handleCommand(message, command, { actorJid, isOwner: false, isAdmin: false, publicOpen: publicUser, workerPublic: publicUser });
   }
 }
 

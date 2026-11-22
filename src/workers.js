@@ -82,6 +82,7 @@ export class WorkerStore {
       status: 'offline',
       service: null,
       allowDefaultCommands: false,
+      publicChats: [],
       serviceConfig: {},
       stats: { cintaReplies: 0 },
       hasProfilePicture: false,
@@ -123,6 +124,21 @@ export class WorkerStore {
     return path.join(this.dirFor(worker), 'profile.jpg');
   }
 
+  // A group can be opened by one worker only, so a public command is answered once.
+  publicChatHolder(jid, exceptId = null) {
+    if (!jid) return null;
+    return this.activeWorkers().find((worker) => worker.id !== exceptId && (worker.publicChats || []).includes(jid)) || null;
+  }
+
+  async setPublicChat(id, jid, enabled) {
+    const worker = this.get(id);
+    if (!worker) throw new UserInputError(`Worker #${id} tidak ditemukan.`);
+    const chats = new Set(worker.publicChats || []);
+    if (enabled) chats.add(jid);
+    else chats.delete(jid);
+    return this.update(id, { publicChats: [...chats] });
+  }
+
   async archive(id) {
     const worker = this.get(id);
     if (!worker || worker.status === 'logged_out') return worker;
@@ -135,7 +151,7 @@ export class WorkerStore {
     await fs.rename(activeDir, archivedDir).catch((error) => {
       if (error.code !== 'ENOENT') throw error;
     });
-    return this.update(id, { status: 'logged_out', loggedOutAt: new Date().toISOString() });
+    return this.update(id, { status: 'logged_out', loggedOutAt: new Date().toISOString(), publicChats: [] });
   }
 
   async restore(id) {
@@ -191,6 +207,7 @@ export function formatWorkerInfo(worker, { folder, notesCount = 0, linksCount = 
     `Status: ${workerStatusLabel(worker)}`,
     `Service: ${worker.service || 'default'}`,
     `Command default: ${defaultCommands}`,
+    `Akses publik: ${(worker.publicChats || []).length} chat`,
     `Sesi admin: ${adminSession ? 'aktif' : 'tidak aktif'}`,
     '',
     `Pertama login: ${formatTime(worker.createdAt)}`,

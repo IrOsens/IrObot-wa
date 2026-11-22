@@ -71,6 +71,10 @@ export class CommandAccessStore {
     return Boolean(jid && this.data.chats?.[jid]);
   }
 
+  isHere(jid) {
+    return Boolean(jid && this.data.chats?.[jid]);
+  }
+
   isAdmin(actorJid) {
     return Boolean(findAdmin(this.data.admins, actorJid));
   }

@@ -18,6 +18,7 @@ import {
   workerCommandAllowed
 } from '../src/workerServices.js';
 import { UserInputError } from '../src/errors.js';
+import { CommandAccessStore } from '../src/commandAccess.js';
 import { state, workerRuntimes, workerScope, createWorkerScope, onWorkerMessageUpsert, onWorkerReactions, onMessageUpsert } from '../src/index.js';
 
 const tmp = () => fs.mkdtemp(path.join(os.tmpdir(), 'iro-workers-'));
@@ -551,6 +552,112 @@ test('audit service is passive for the worker and only answers admin commands fr
     Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
     state.sock = previous.sock;
     state.workerStore = previous.workerStore;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('worker allow here opens a group to one bot only, with the admin bot allow here taking priority', async () => {
+  const dir = await tmp();
+  const ownerJid = '628999999999@s.whatsapp.net';
+  const group = 'team@g.us';
+  const secondPhone = '628555555555@s.whatsapp.net';
+  const previous = {
+    sock: state.sock, connected: state.connected, workerStore: state.workerStore, commandAccess: state.commandAccess,
+    saveRecorder: state.saveRecorder, taskRecorder: state.taskRecorder, anticall: state.anticall, qrSessions: state.qrSessions,
+    toVideoSessions: state.toVideoSessions, stimpaSessions: state.stimpaSessions, pdfSessions: state.pdfSessions, restoreSessions: state.restoreSessions
+  };
+  const idle = { has: () => false, finish: async () => null, end: () => null, get: () => null, cancel: async () => false, sessions: new Map(), count: () => 0 };
+  Object.assign(WORKER_COMMAND_DELAY_MS, { min: 0, max: 0 });
+  try {
+    const ownerSent = [];
+    Object.assign(state, {
+      sock: {
+        user: { id: ownerJid },
+        sendMessage: async (jid, content) => { ownerSent.push({ jid, content }); return { key: { remoteJid: jid, id: `owner-${ownerSent.length}`, fromMe: true } }; }
+      },
+      connected: true,
+      saveRecorder: idle, taskRecorder: idle, anticall: idle, qrSessions: idle, toVideoSessions: idle,
+      stimpaSessions: idle, pdfSessions: idle, restoreSessions: idle,
+      commandAccess: new CommandAccessStore(path.join(dir, 'access.json'))
+    });
+    await state.commandAccess.load();
+    await state.commandAccess.setAll(true);
+    state.workerStore = await new WorkerStore({
+      file: path.join(dir, 'workers.json'),
+      rootDir: path.join(dir, 'workers'),
+      archiveDir: path.join(dir, 'workers', 'archive')
+    }).load();
+
+    const makeRuntime = async (phoneJid, name) => {
+      const worker = await state.workerStore.create({ phoneJid, name });
+      const sent = [];
+      const sock = {
+        user: { id: phoneJid },
+        sendMessage: async (jid, content) => { sent.push({ jid, content }); return { key: { remoteJid: jid, id: `${name}-${sent.length}`, fromMe: true } }; },
+        sendPresenceUpdate: async () => {},
+        readMessages: async () => {}
+      };
+      const connection = { sock, connected: true };
+      const runtime = { workerId: worker.id, connection, scope: createWorkerScope(worker, connection), limiter: new ReplyLimiter() };
+      workerRuntimes.set(worker.id, runtime);
+      return { worker, runtime, sent };
+    };
+    const first = await makeRuntime(workerPhone, 'first');
+    const second = await makeRuntime(secondPhone, 'second');
+
+    let id = 0;
+    const groupMessage = (text, { fromMe = false, participant = customer, msgId = `in-${++id}` } = {}) => ({
+      key: { remoteJid: group, id: msgId, fromMe, participant: fromMe ? undefined : participant },
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      message: { conversation: text }
+    });
+    const toWorker = ({ runtime }, message) => workerScope.run(runtime.scope, () => onWorkerMessageUpsert(runtime, { type: 'notify', messages: [message] }));
+    const toAdmin = (message) => onMessageUpsert({ messages: [message] });
+    const everyone = async (message) => {
+      await toWorker(first, message);
+      await toWorker(second, message);
+      await toAdmin(message);
+    };
+
+    await toWorker(first, groupMessage(',allow here on', { fromMe: true }));
+    assert.match(first.sent.at(-1).content.text, /Akses publik worker di chat ini: aktif/);
+    assert.deepEqual(state.workerStore.get(first.worker.id).publicChats, [group]);
+
+    await toWorker(second, groupMessage(',allow here on', { fromMe: true }));
+    assert.match(second.sent.at(-1).content.text, /sudah dibuka worker #1/);
+    assert.deepEqual(state.workerStore.get(second.worker.id).publicChats, []);
+
+    const counts = () => [first.sent.length, second.sent.length, ownerSent.length];
+    let before = counts();
+    await everyone(groupMessage(',help'));
+    assert.deepEqual(counts(), [before[0] + 1, before[1], before[2]], 'only the holding worker answers, admin allow all yields');
+
+    before = counts();
+    const repeated = groupMessage(',help');
+    await toWorker(first, repeated);
+    await toWorker(first, repeated);
+    assert.equal(first.sent.length, before[0] + 1, 'the same message id is answered once');
+
+    before = counts();
+    await everyone(groupMessage(',help', { participant: secondPhone }));
+    assert.equal(first.sent.length, before[0], 'a command typed from another bot number is ignored');
+    assert.equal(ownerSent.length, before[2]);
+
+    before = counts();
+    await everyone(groupMessage(',backup'));
+    assert.deepEqual(counts(), before, 'non public commands are not answered for other people');
+
+    await state.commandAccess.setHere(group, true);
+    before = counts();
+    await everyone(groupMessage(',help'));
+    assert.deepEqual(counts(), [before[0], before[1], before[2] + 1], 'admin allow here wins over the worker');
+
+    await toWorker(first, groupMessage(',allow here off', { fromMe: true }));
+    assert.deepEqual(state.workerStore.get(first.worker.id).publicChats, []);
+  } finally {
+    Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
+    workerRuntimes.clear();
+    Object.assign(state, previous);
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
