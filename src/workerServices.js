@@ -8,6 +8,8 @@ export const WORKER_DEFAULT_COMMANDS = new Set([
 // Commands other people may use in a chat the worker operator opened with ,allow here on.
 export const WORKER_PUBLIC_COMMANDS = new Set(['help', 's', 'stext', 'smeme', 'rs', 'resend', 'qr', 'tovideo', 'stimpa']);
 
+export const WORKER_PUBLIC_CHAT_LIMIT = 2;
+
 export const WORKER_SERVICES = [
   {
     name: 'cinta',

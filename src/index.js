@@ -142,7 +142,8 @@ import {
   randomDelayMs,
   workerCommandAllowed,
   workerPublicCommandAllowed,
-  WORKER_PUBLIC_COMMANDS
+  WORKER_PUBLIC_COMMANDS,
+  WORKER_PUBLIC_CHAT_LIMIT
 } from './workerServices.js';
 
 class ChatDirectory {
@@ -572,7 +573,7 @@ const HELP_DETAILS = {
   backup: ['Format: ,backup', 'Backup data/ ke satu tujuan aktif. Pilih grup/server dengan ,setup backup.'],
   restore: ['Format: ,restore atau ,restore save', ',restore memulihkan seluruh data/. ,restore save hanya memulihkan koleksi save.', 'Kirim ZIP/semua part, lalu ,end. Pada restore save pilih semua atau beberapa save dengan angka; 0 kembali. Pilih timpa/gabung lalu ,confirm.'],
   anticall: ['Listening: ,anticall new, kirim teks/media/VN/lokasi, lalu ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.', 'Format: ,anticall', 'Format: ,anticall new|on|off', 'Format: ,anticall except list|add|del <nomor|id>'],
-  allow: ['Format: ,allow here on|off', 'Format: ,allow all on|off', 'Legacy true|false tetap didukung.', 'Di worker hanya ,allow here on|off. Satu grup hanya bisa dibuka satu worker; allow here bot admin selalu didahulukan.'],
+  allow: ['Format: ,allow here on|off', 'Format: ,allow all on|off', 'Legacy true|false tetap didukung.', 'Di worker hanya ,allow here on|off, maksimal 2 chat. Satu grup hanya bisa dibuka satu worker; allow here bot admin selalu didahulukan.'],
   admin: ['Format: ,admin list', 'Format: ,admin add <nomor>', 'Format: ,admin del <nomor|id>'],
   pause: ['Format: ,pause', 'Mem-pause command, session, scheduler, backup otomatis, changedmsg, statussave, dan anticall akun utama. Worker tetap berjalan.'],
   resume: ['Format: ,resume', 'Mengaktifkan lagi bot setelah ,pause.'],
@@ -4383,6 +4384,12 @@ async function maybeHandleWorkerPublicMessage(runtime, worker, message, text) {
   return true;
 }
 
+function publicChatLabel(jid) {
+  const name = state.chatDirectory.nameFor(jid);
+  if (jid.endsWith('@g.us')) return name ? `Grup ${name}` : `Grup ${jid}`;
+  return `${name ? `${name} ` : ''}(+${displayPhoneFromJid(jid)})`;
+}
+
 async function handleWorkerAllow(worker, jid, command) {
   const { scope, enabled } = parseAllowArgs(command.args);
   if (scope === 'all') throw new UserInputError('Worker hanya bisa ,allow here on|off di chat yang ingin dibuka.');
@@ -4390,6 +4397,15 @@ async function handleWorkerAllow(worker, jid, command) {
     const holder = state.workerStore.publicChatHolder(jid, worker.id);
     if (holder) throw new UserInputError(`Grup ini sudah dibuka worker #${holder.id}. Minta operatornya ketik ,allow here off dulu.`);
     if (ownerState.commandAccess?.isHere(jid)) throw new UserInputError('Grup ini sudah dibuka bot admin, jadi command publik dijawab bot admin.');
+  }
+  const opened = worker.publicChats || [];
+  if (enabled && !opened.includes(jid) && opened.length >= WORKER_PUBLIC_CHAT_LIMIT) {
+    throw new UserInputError([
+      `Worker hanya bisa membuka maksimal ${WORKER_PUBLIC_CHAT_LIMIT} chat. Yang sedang aktif:`,
+      ...opened.map((chat, index) => `${index + 1}. ${publicChatLabel(chat)}`),
+      '',
+      'Ketik ,allow here off di salah satu chat itu dulu, lalu coba lagi di sini.'
+    ].join('\n'));
   }
   const updated = await state.workerStore.setPublicChat(worker.id, jid, enabled);
   const commands = [...WORKER_PUBLIC_COMMANDS]
@@ -4399,6 +4415,7 @@ async function handleWorkerAllow(worker, jid, command) {
   await sendText(jid, [
     `Akses publik worker di chat ini: ${enabled ? 'aktif' : 'nonaktif'}.`,
     enabled ? `Command publik: ${commands || '-'}.` : null,
+    `Chat terbuka: ${updated.publicChats.length}/${WORKER_PUBLIC_CHAT_LIMIT}.`,
     enabled ? 'Batas anti-ban worker tetap berlaku.' : null
   ].filter(Boolean).join('\n'));
 }

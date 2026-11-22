@@ -652,8 +652,23 @@ test('worker allow here opens a group to one bot only, with the admin bot allow 
     await everyone(groupMessage(',help'));
     assert.deepEqual(counts(), [before[0], before[1], before[2] + 1], 'admin allow here wins over the worker');
 
+    const inChat = (chat, text) => ({ key: { remoteJid: chat, id: `in-${++id}`, fromMe: true }, messageTimestamp: Math.floor(Date.now() / 1000), message: { conversation: text } });
+    const resetLimiter = () => { first.runtime.limiter = new ReplyLimiter(); };
+    resetLimiter();
+    await toWorker(first, inChat('other@g.us', ',allow here on'));
+    assert.match(first.sent.at(-1).content.text, /Chat terbuka: 2\/2/);
+    await toWorker(first, inChat('third@g.us', ',allow here on'));
+    assert.match(first.sent.at(-1).content.text, /maksimal 2 chat/);
+    assert.match(first.sent.at(-1).content.text, /,allow here off/);
+    assert.equal(state.workerStore.get(first.worker.id).publicChats.length, 2);
+    resetLimiter();
+    await toWorker(first, inChat('other@g.us', ',allow here on'));
+    assert.match(first.sent.at(-1).content.text, /: aktif/, 'turning on an already opened chat is not blocked by the limit');
+
+    resetLimiter();
     await toWorker(first, groupMessage(',allow here off', { fromMe: true }));
-    assert.deepEqual(state.workerStore.get(first.worker.id).publicChats, []);
+    await toWorker(first, inChat('third@g.us', ',allow here on'));
+    assert.deepEqual(state.workerStore.get(first.worker.id).publicChats, ['other@g.us', 'third@g.us']);
   } finally {
     Object.assign(WORKER_COMMAND_DELAY_MS, { min: 1000, max: 2500 });
     workerRuntimes.clear();
