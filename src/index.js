@@ -53,7 +53,7 @@ import {
 } from './config.js';
 import { cleanupOldLogs, logger, setErrorSink } from './logger.js';
 import { detectTools, fileExists, formatBytes, formatDuration, getDiskInfo, getLoadAverageText, runTool, runToolWithInput } from './tools.js';
-import { getMessageText, parseCommand, extractQuotedMessage, unwrapMessage } from './text.js';
+import { firstUrl, getMessageText, parseCommand, extractQuotedMessage, unwrapMessage } from './text.js';
 import {
   cleanupFiles,
   downloadMessageMedia,
@@ -591,7 +591,7 @@ const HELP_DETAILS = {
   serverinfo: ['Format: ,serverinfo', 'Menampilkan spesifikasi server lengkap: OS, CPU, RAM, disk, network, Node.js, dan proses bot.'],
   topdf: ['Format: ,topdf [--name "nama"] [--split] [--max-size 1MB | --target-size 2MB]', '--max-size: batas maksimum; --target-size: ukuran tepat, maksimal 100MB.', 'Target tepat dapat menambahkan padding tanpa meningkatkan kualitas. Kompresi PDF dapat mengubah teks menjadi gambar.', 'Nama berspasi wajib dikutip dalam mode flag. Jangan campur flag dengan format lama.', 'Legacy: ,topdf nama max 1MB, ,topdf split nama, dan ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
   tovideo: ['Kirim/reply gambar, video, atau stiker: ,tovideo [duration=3s] [speed=0.25-4|slow=1-4] [format=mp4|gif] [q=1-100].', 'speed=2 mempercepat 2×; slow=2 memperlambat 2× (video dan audio sumber). Tanpa duration, panjang hasil video menyesuaikan kecepatan; duration=... tetap menentukan panjang hasil.', 'Jika mulai dari stiker, kirim gambar/video template yang sudah menampilkan stiker itu di dalam sesi.', 'Tanpa duration, gambar dibuat 5 detik dan video mengikuti durasi aslinya. Durasi dapat diubah selama sesi.', 'Audio stiker beraudio otomatis jadi musik jika belum ada audio lain.', 'Sesi menerima stiker WhatsApp, audio, atau teks: duration=2m, speed=2, slow=2, sync, mute, unmute, vvol=50%, mvol=50%, q=80, format=gif.', 'Selesai: ,end atau ✅/👍/❤️ pada pesan sesi. Batal: ,cancel atau ❌/👎/❎.', 'Stiker harus terlihat pada sumber agar posisi, ukuran, dan rotasinya bisa dicocokkan. GIF WhatsApp tidak bersuara.'],
-  stimpa: ['Reply stiker (bergerak atau diam) dengan ,stimpa.', 'Bot mengirim frame pertama sebagai gambar kanvas. Edit gambar itu di WhatsApp, lalu kirim satu atau beberapa gambar edit tanpa crop.', 'Setiap gambar yang cocok ditumpuk pada stiker yang sama; gambar yang tidak cocok dilewati. Cukup kirim audio tanpa edit untuk sekadar menambah/mengganti audio. ,end membuat stiker; ,cancel membatalkan.', 'Audio stiker sumber ikut ke hasil. Kirim audio/VN/video di sesi untuk mengganti audionya.'],
+  stimpa: ['Reply stiker (bergerak atau diam) dengan ,stimpa.', 'Bot mengirim frame pertama sebagai gambar kanvas. Edit gambar itu di WhatsApp, lalu kirim satu atau beberapa gambar edit tanpa crop.', 'Setiap gambar yang cocok ditumpuk pada stiker yang sama; gambar yang tidak cocok dilewati. Cukup kirim audio tanpa edit untuk sekadar menambah/mengganti audio. ,end membuat stiker; ,cancel membatalkan.', 'Audio stiker sumber ikut ke hasil. Kirim audio/VN/video atau link langsung mp3/video di sesi untuk mengganti audionya.', 'Bisa juga langsung: ,stimpa <link mp3/video> sambil reply stiker, lalu ,end.'],
   toimg: ['Format: ,toimg', 'Reply/kirim dokumen PDF, lalu bot mengirim tiap halaman sebagai gambar.'],
   note: ['Format: ,note list', 'Format: ,note add <judul> <teks>', 'Format: ,note get <id|judul>', 'Format: ,note del <id|judul>', 'Format: ,note rename <id|judul> <judul-baru>', 'Legacy: ,note <judul> <teks> dan ,note change tetap didukung.'],
   link: ['Format: ,link list', 'Format: ,link add <nama> <https://link>', 'Format: ,link get <id|nama>', 'Format: ,link del <id|nama>', 'Format: ,link rename <id|nama> <nama-baru>', 'Legacy: ,link <nama> <url> dan ,link change tetap didukung.'],
@@ -1264,6 +1264,20 @@ async function downloadSessionAudio(message, prefix) {
   } catch (error) {
     if (error instanceof UserInputError) return { ignored: true, reason: error.message };
     throw error;
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
+}
+
+// Direct link to an mp3/audio or video file -> sticker audio. Errors become a skip reason.
+async function downloadUrlAudio(url, prefix) {
+  let media = null;
+  try {
+    media = await downloadUrlMedia(url, prefix);
+    if (!media || !isAudioSourceMedia(media)) throw new UserInputError('Link harus mengarah langsung ke file audio (mp3, dll.) atau video.');
+    return { audio: await audioFromMedia(state.sock, state.tools, media) };
+  } catch (error) {
+    return { ignored: true, reason: error.message };
   } finally {
     await cleanupFiles([media?.path]);
   }
@@ -2115,15 +2129,19 @@ async function handleTopdf(message, command, actorJid) {
   registerSessionPrompt(sent.key, jid, actorJid);
 }
 
-async function handleStimpa(message, actorJid) {
+async function handleStimpa(message, command, actorJid) {
   const jid = message.key.remoteJid;
   assertNoActiveSession(jid);
+  const audioUrl = firstUrl(command?.rawArgs);
   const media = await downloadQuotedOrOwnMedia(state.sock, message, 'stimpa-source');
   if (!media) throw new UserInputError('Reply stiker dengan ,stimpa.');
   try {
     const { session, preview } = await state.stimpaSessions.start(jid, actorJid, media);
-    const audio = await sourceStickerAudio(media);
-    if (audio) await state.stimpaSessions.setAudio(jid, audio, { replaced: false });
+    const urlAudio = audioUrl ? await downloadUrlAudio(audioUrl, 'stimpa-url-audio') : null;
+    if (urlAudio?.ignored) throw new UserInputError(`Audio dari link gagal: ${urlAudio.reason}`);
+    const audio = urlAudio ? null : await sourceStickerAudio(media);
+    if (urlAudio) await state.stimpaSessions.setAudio(jid, urlAudio.audio);
+    else if (audio) await state.stimpaSessions.setAudio(jid, audio, { replaced: false });
     session.sourceAudio = Boolean(audio);
     await sendBotMessage(jid, { image: preview, mimetype: 'image/png', caption: 'Kanvas ,stimpa: edit gambar ini di WhatsApp, lalu kirim hasilnya tanpa crop.' });
     const sent = await sendText(jid, formatStimpaSession(session));
@@ -2148,6 +2166,16 @@ async function collectStimpaItem(message) {
     if (prompt?.key) await editText(jid, prompt.key, formatStimpaSession(updated));
     return;
   }
+  const url = found ? null : firstUrl(getMessageText(message));
+  if (url) {
+    const result = await downloadUrlAudio(url, 'stimpa-url-audio');
+    if (result.ignored) { await sendText(jid, `Audio dari link dilewati: ${result.reason}`); return; }
+    const updated = await state.stimpaSessions.setAudio(jid, result.audio);
+    if (!updated) return;
+    const prompt = state.sessionPrompts.get(jid);
+    if (prompt?.key) await editText(jid, prompt.key, formatStimpaSession(updated));
+    return;
+  }
   const session = await state.stimpaSessions.add(state.sock, message);
   if (!session) return;
   if (session.ignored) {
@@ -2165,7 +2193,7 @@ function formatStimpaSession(session) {
   return [
     session.edits.length ? `*Sesi stimpa* • ${session.edits.length} gambar edit diterima` : '*Sesi stimpa*',
     session.edits.length ? 'Gambar lain yang cocok akan digabung.' : 'Kirim satu atau beberapa gambar hasil edit kanvas (tanpa crop). Semua edit yang cocok akan digabung.',
-    `Audio: ${audio}. Kirim audio/VN/video untuk mengganti audio stiker.`,
+    `Audio: ${audio}. Kirim audio/VN/video atau link langsung mp3/video untuk mengganti audio stiker.`,
     `Buat ${session.animated ? 'stiker bergerak' : 'stiker'}: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.`
   ].join('\n');
 }
@@ -3518,7 +3546,7 @@ async function handleCommand(message, command, context = commandContext(message)
       await handleToVideo(message, command, context.actorJid);
       break;
     case 'stimpa':
-      await handleStimpa(message, context.actorJid);
+      await handleStimpa(message, command, context.actorJid);
       break;
     case 'toimg':
       await handleToImg(message);
