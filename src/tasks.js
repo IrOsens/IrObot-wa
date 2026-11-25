@@ -345,7 +345,7 @@ export class TaskRecorder {
     if (!session) return null;
     const recorded = await recordMessageEntry(sock, message, 'task-record-item');
     if (!recorded) return null;
-    if (recorded.tempFile) session.tempFiles.push(recorded.tempFile);
+    session.tempFiles.push(...(recorded.tempFiles || [recorded.tempFile]).filter(Boolean));
     session.entries.push(recorded.entry);
     return { type: recorded.type, count: visibleRecordedEntries(session.entries).length };
   }

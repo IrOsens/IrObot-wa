@@ -198,19 +198,71 @@ test('stimpa requires meaningful edits and keeps the session after failure', asy
   }
 });
 
-test('stimpa accepts only animated stickers and is a public command', async () => {
+test('stimpa edits a static sticker into a static sticker and is a public command', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'stimpa-static-'));
+  const sessions = new StimpaSessions();
   try {
     const source = path.join(dir, 'static.webp');
-    await sharp({ create: { width: 64, height: 64, channels: 4, background: '#ff0000' } }).webp().toFile(source);
-    const sessions = new StimpaSessions();
-    await assert.rejects(() => sessions.start('chat', 'actor', { path: source, type: 'stickerMessage', mimetype: 'image/webp' }), /bergerak/);
+    const edit = path.join(dir, 'edit.png');
+    await sharp({ create: { width: 64, height: 64, channels: 4, background: '#00000000' } })
+      .composite([{ input: Buffer.from('<svg width="32" height="32"><rect width="32" height="32" fill="#e63946"/></svg>'), left: 16, top: 16 }])
+      .webp({ lossless: true }).toFile(source);
+    const { session, preview } = await sessions.start('chat', 'actor', { path: source, type: 'stickerMessage', mimetype: 'image/webp' });
+    assert.equal(session.animated, false);
+    await sharp(preview).composite([{
+      input: Buffer.from('<svg width="48" height="48"><circle cx="24" cy="24" r="18" fill="#00ff00"/></svg>'),
+      left: 232, top: 232
+    }]).png().toFile(edit);
+    session.edit = { path: edit, type: 'imageMessage' };
+    session.files.push(edit);
+    let sent = null;
+    await sessions.finish('chat', 'actor', async () => {}, async (buffer, audio, options) => { sent = { buffer, audio, options }; });
+    assert.equal(sent.options.isAnimated, false);
+    const decoded = await decodeStickerFrames(await writeTemp(dir, sent.buffer));
+    assert.equal(decoded.frames.length, 1);
+    const drawn = rgba(decoded.frames[0], decoded.width, 256, 256);
+    assert.ok(drawn[1] > 180 && drawn[3] > 220, `overlay pixel: ${drawn}`);
+    assert.ok(rgba(decoded.frames[0], decoded.width, 160, 160)[0] > 180);
     assert.equal(sessions.has('chat'), false);
     assert.equal(PUBLIC_COMMANDS.has('stimpa'), true);
   } finally {
+    await sessions.cancel('chat', 'actor');
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+test('stimpa with only new audio sends the source sticker unchanged', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'stimpa-audio-'));
+  const sessions = new StimpaSessions();
+  try {
+    const source = path.join(dir, 'static.webp');
+    await sharp({ create: { width: 64, height: 64, channels: 4, background: '#ff0000' } }).webp().toFile(source);
+    const audioPath = path.join(dir, 'source-audio.ogg');
+    const newAudioPath = path.join(dir, 'new-audio.ogg');
+    await fs.writeFile(audioPath, 'a');
+    await fs.writeFile(newAudioPath, 'b');
+    await sessions.start('chat', 'actor', { path: source, type: 'stickerMessage', mimetype: 'image/webp' });
+    await sessions.setAudio('chat', { path: audioPath, seconds: 2 }, { replaced: false });
+    await assert.rejects(() => sessions.finish('chat', 'actor', async () => {}, async () => {}), /audio baru/);
+    const original = await fs.readFile(source);
+    await sessions.setAudio('chat', { path: newAudioPath, seconds: 3 });
+    let sent = null;
+    await sessions.finish('chat', 'actor', async () => {}, async (buffer, audio, options) => { sent = { buffer, audio, options }; });
+    assert.deepEqual(sent.buffer, original);
+    assert.equal(sent.audio.path, newAudioPath);
+    assert.equal(sent.options.isAnimated, false);
+    assert.equal(sessions.has('chat'), false);
+  } finally {
+    await sessions.cancel('chat', 'actor');
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+async function writeTemp(dir, buffer) {
+  const file = path.join(dir, `out-${Math.random().toString(36).slice(2)}.webp`);
+  await fs.writeFile(file, buffer);
+  return file;
+}
 
 test('stimpa ignores small image differences from compression', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'stimpa-noise-'));

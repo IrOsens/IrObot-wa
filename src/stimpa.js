@@ -28,16 +28,14 @@ export class StimpaSessions {
   isActor(jid, actorJid) { return !this.has(jid) || this.get(jid).actorJid === actorJid; }
 
   async start(jid, actorJid, media) {
-    if (media?.type !== 'stickerMessage' || !(await isAnimatedMedia(media))) {
-      throw new UserInputError('Reply stiker WhatsApp bergerak untuk memakai ,stimpa.');
-    }
+    if (media?.type !== 'stickerMessage') throw new UserInputError('Reply stiker WhatsApp untuk memakai ,stimpa.');
     const decoded = await decodeStickerFrames(media.path);
+    const animated = decoded.frames.length > 1 && await isAnimatedMedia(media);
     const duration = decoded.frames.reduce((sum, frame) => sum + frame.delay, 0);
-    if (decoded.frames.length < 2) throw new UserInputError('Stiker sumber tidak memiliki animasi.');
-    if (duration > MAX_DURATION_MS) throw new UserInputError('Durasi stiker melebihi 10 detik.');
+    if (animated && duration > MAX_DURATION_MS) throw new UserInputError('Durasi stiker melebihi 10 detik.');
     const reference = await previewFrame(decoded.frames[0].data, decoded.width, decoded.height);
     const preview = await sharp(reference, { raw: { width: CANVAS, height: CANVAS, channels: 4 } }).png().toBuffer();
-    const session = { jid, actorJid, media, reference, edit: null, edits: [], files: [media.path], busy: false };
+    const session = { jid, actorJid, media, animated, reference, edit: null, edits: [], audio: null, audioReplaced: false, files: [media.path], busy: false };
     this.sessions.set(jid, session);
     this.touch(session);
     return { session, preview };
@@ -81,6 +79,18 @@ export class StimpaSessions {
     }
   }
 
+  // replaced=false marks the source sticker's own audio, which alone is not a change.
+  async setAudio(jid, audio, { replaced = true } = {}) {
+    const session = this.get(jid);
+    if (!session || session.busy) { await cleanupFiles([audio?.path]); return null; }
+    if (session.audio) await cleanupFiles([session.audio.path]);
+    session.audio = audio;
+    if (replaced) session.audioReplaced = true;
+    session.files.push(audio.path);
+    this.touch(session);
+    return session;
+  }
+
   async cancel(jid, actorJid = null) {
     const session = this.get(jid);
     if (!session || (actorJid && session.actorJid !== actorJid) || session.busy) return false;
@@ -94,11 +104,22 @@ export class StimpaSessions {
     const session = this.get(jid);
     if (!session || session.actorJid !== actorJid) return false;
     if (session.busy) return true;
-    if (!session.edit) throw new UserInputError('Kirim gambar kanvas yang sudah diedit sebelum ,end.');
+    if (!session.edit && !session.audioReplaced) {
+      throw new UserInputError('Kirim gambar kanvas yang sudah diedit atau audio baru sebelum ,end.');
+    }
     session.busy = true;
     clearTimeout(session.timer);
     try {
-      await onProgress(5, 'Membaca gambar edit');
+      await onProgress(5, session.edit ? 'Membaca gambar edit' : 'Menyiapkan stiker');
+      if (!session.edit) {
+        // Audio only: keep the source sticker exactly as it is.
+        await onProgress(92, 'Mengirim stiker');
+        await send(await fs.readFile(session.media.path), session.audio, { isAnimated: session.animated });
+        await onProgress(100, 'Selesai');
+        this.sessions.delete(jid);
+        await cleanupFiles(session.files);
+        return true;
+      }
       const raw = { raw: { width: CANVAS, height: CANVAS, channels: 4 } };
       const layers = session.edits?.length
         ? session.edits.map((item) => item.overlay)
@@ -108,17 +129,19 @@ export class StimpaSessions {
         const png = await sharp(layer, raw).png().toBuffer();
         overlay = await sharp(overlay, raw).composite([{ input: png, left: 0, top: 0 }]).raw().toBuffer();
       }
-      await onProgress(20, 'Menyiapkan frame animasi');
+      await onProgress(20, session.animated ? 'Menyiapkan frame animasi' : 'Menyiapkan gambar');
       const decoded = await decodeStickerFrames(session.media.path);
       let result;
       for (const [index, preset] of PRESETS.entries()) {
         await onProgress(20 + Math.round(index * 13), `Membuat stiker (${preset.canvas}px)`);
-        result = await renderSticker(decoded, overlay, preset);
+        result = session.animated
+          ? await renderSticker(decoded, overlay, preset)
+          : await renderStaticSticker(decoded, overlay, preset);
         if (result.length <= MAX_BYTES) break;
       }
       if (result.length > MAX_BYTES) throw new UserInputError('Stiker hasil masih terlalu besar untuk WhatsApp. Sederhanakan gambar edit lalu coba lagi.');
       await onProgress(92, 'Mengirim stiker');
-      await send(result);
+      await send(result, session.audio, { isAnimated: session.animated });
       await onProgress(100, 'Selesai');
       this.sessions.delete(jid);
       await cleanupFiles(session.files);
@@ -128,6 +151,20 @@ export class StimpaSessions {
       if (this.has(jid)) this.touch(session);
     }
   }
+}
+
+async function renderStaticSticker(decoded, overlay, preset) {
+  const [frame] = decoded.frames;
+  const overlayPng = await sharp(overlay, { raw: { width: CANVAS, height: CANVAS, channels: 4 } })
+    .resize(preset.canvas, preset.canvas).png().toBuffer();
+  const buffer = await sharp(frame.data, { raw: { width: decoded.width, height: decoded.height, channels: 4 } })
+    .resize(preset.canvas, preset.canvas, { fit: 'contain', background: '#00000000' })
+    .composite([{ input: overlayPng, left: 0, top: 0 }])
+    .webp({ quality: preset.quality, alphaQuality: 100, effort: 5 }).toBuffer();
+  const image = new webp.Image();
+  await image.load(buffer);
+  image.exif = buildStickerExif(DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE);
+  return image.save(null);
 }
 
 async function previewFrame(data, width, height) {

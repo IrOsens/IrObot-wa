@@ -95,6 +95,7 @@ export class ToVideoSessions {
       } else if (kind === 'audio') {
         const old = session.music;
         session.music = media;
+        session.musicFromSticker = false;
         session.files.push(media.path);
         if (old) await cleanupFiles([old.path]);
       } else if (kind === 'image' || kind === 'video') {

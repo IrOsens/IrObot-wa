@@ -350,6 +350,37 @@ export async function reverseSticker(media, tools) {
   }
 }
 
+// Sound sticker -> regular MP4 with its audio. The visual loops until the audio ends.
+export async function stickerToAudioVideo(media, audioPath, tools) {
+  if (!tools?.ffmpeg) throw new Error('FFmpeg belum tersedia untuk mengubah stiker beraudio menjadi video.');
+  const animated = await isAnimatedMedia(media);
+  const visual = makeTempPath('sound-sticker-visual', animated ? '.mp4' : '.png');
+  const outPath = makeTempPath('sound-sticker', '.mp4');
+  try {
+    if (animated) await animatedWebpToGifPlaybackVideo(media.path, visual, tools);
+    else await sharp(media.path, { animated: false }).flatten({ background: '#ffffff' }).png().toFile(visual);
+    // -shortest alone overshoots with looped inputs, so cut at the probed audio length.
+    const seconds = tools.ffprobe
+      ? Number(String((await runTool(tools.ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', audioPath])).stdout).trim())
+      : NaN;
+    await runTool(tools.ffmpeg, [
+      '-y',
+      ...(animated ? ['-stream_loop', '-1', '-i', visual] : ['-loop', '1', '-framerate', '25', '-i', visual]),
+      '-i', audioPath,
+      '-map', '0:v:0', '-map', '1:a:0',
+      ...(Number.isFinite(seconds) && seconds > 0 ? ['-t', seconds.toFixed(3)] : []),
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-tune', animated ? 'animation' : 'stillimage',
+      '-c:a', 'aac', '-b:a', '128k',
+      '-shortest', '-movflags', '+faststart',
+      outPath
+    ]);
+    return { buffer: await fs.readFile(outPath), mimetype: 'video/mp4', fileName: 'sticker.mp4' };
+  } finally {
+    await cleanupFiles([visual, outPath]);
+  }
+}
+
 export async function isAnimatedMedia(media) {
   if (media?.node?.isAnimated) return true;
   if (isLikelyAnimated({ mimetype: media?.mimetype, fileName: media?.fileName || media?.path })) return true;

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { getContentType } from 'baileys';
 import { cleanupFiles, downloadMessageMedia } from './media.js';
+import { STICKER_AUDIO_MIMETYPE, downloadStickerAudio, stickerAudioOf } from './soundSticker.js';
 import { getMessageText, unwrapMessage } from './text.js';
 
 export function isRecorderNotice(entry) {
@@ -141,7 +142,14 @@ export async function recordMessageEntry(sock, message, prefix = 'recorded-item'
       seconds: numberLike(media.node?.seconds),
       gifPlayback: Boolean(media.node?.gifPlayback)
     };
-    return { entry, tempFile: media.path, type: 'media' };
+    if (media.type === 'stickerMessage' && stickerAudioOf(media)) {
+      const audio = await downloadStickerAudio(sock, media, `${prefix}-audio`).catch(() => null);
+      if (audio) {
+        entry.audioTempPath = audio.path;
+        entry.audioSeconds = numberLike(media.node.soundAudio.seconds);
+      }
+    }
+    return { entry, tempFile: media.path, tempFiles: [media.path, entry.audioTempPath].filter(Boolean), type: 'media' };
   }
 
   const entry = serializeNonMedia(message, text);
@@ -160,6 +168,11 @@ export async function persistRecordedEntries(entries, dir) {
     const ext = path.extname(entry.tempPath || '') || path.extname(entry.fileName || '') || '.bin';
     const dest = path.join(dir, `${String(index + 1).padStart(3, '0')}${ext}`);
     await fs.copyFile(entry.tempPath, dest);
+    let audioPath;
+    if (entry.audioTempPath) {
+      audioPath = `${dest}.audio.ogg`;
+      await fs.copyFile(entry.audioTempPath, audioPath);
+    }
     persisted.push({
       kind: 'media',
       path: dest,
@@ -170,14 +183,15 @@ export async function persistRecordedEntries(entries, dir) {
       isAnimated: entry.isAnimated,
       ptt: entry.ptt,
       seconds: entry.seconds,
-      gifPlayback: entry.gifPlayback
+      gifPlayback: entry.gifPlayback,
+      ...(audioPath ? { audioPath, audioSeconds: entry.audioSeconds } : {})
     });
   }
   return persisted;
 }
 
 export async function cleanupRecordedTempEntries(entries = []) {
-  await cleanupFiles(entries.filter((entry) => entry.kind === 'media').map((entry) => entry.tempPath));
+  await cleanupFiles(entries.filter((entry) => entry.kind === 'media').flatMap((entry) => [entry.tempPath, entry.audioTempPath]));
 }
 
 async function sendUnsupported(sock, jid, entry) {
@@ -208,7 +222,13 @@ async function sendMediaEntry(sock, jid, entry) {
   } else if (entry.messageType === 'audioMessage') {
     await sock.sendMessage(jid, { audio: buffer, mimetype: entry.mimetype, ptt: Boolean(entry.ptt), seconds: entry.seconds || undefined });
   } else if (entry.messageType === 'stickerMessage') {
-    await sock.sendMessage(jid, { sticker: buffer, isAnimated: entry.isAnimated || undefined });
+    const audioPath = entry.audioPath || entry.audioTempPath;
+    const hasAudio = audioPath && typeof sock.sendSoundSticker === 'function' && await fs.access(audioPath).then(() => true, () => false);
+    if (hasAudio) {
+      await sock.sendSoundSticker(jid, buffer, { path: audioPath, seconds: entry.audioSeconds || undefined, mimetype: STICKER_AUDIO_MIMETYPE }, { isAnimated: entry.isAnimated });
+    } else {
+      await sock.sendMessage(jid, { sticker: buffer, isAnimated: entry.isAnimated || undefined });
+    }
   } else {
     await sock.sendMessage(jid, {
       document: buffer,

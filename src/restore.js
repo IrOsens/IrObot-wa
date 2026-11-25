@@ -206,7 +206,16 @@ export class RestoreSessions {
           await fs.mkdir(itemDir, { recursive: true });
           if (!copiedDirs.includes(itemDir)) copiedDirs.push(itemDir);
           await fs.copyFile(source, target);
-          entries.push({ ...entry, path: target });
+          const restoredEntry = { ...entry, path: target };
+          delete restoredEntry.audioPath;
+          if (entry.audioPath) {
+            const audioSource = path.resolve(path.dirname(source), path.basename(entry.audioPath));
+            if (await fs.stat(audioSource).then((stat) => stat.isFile(), () => false)) {
+              restoredEntry.audioPath = `${target}.audio.ogg`;
+              await fs.copyFile(audioSource, restoredEntry.audioPath);
+            }
+          }
+          entries.push(restoredEntry);
         }
         restored.push({ ...item, id, title, entries });
       }
