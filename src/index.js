@@ -1354,15 +1354,59 @@ export async function maybeForwardReactedViewOnce(update, { downloadMedia = down
   }
 }
 
+function viewOnceFieldSummary(message) {
+  const found = mediaNode(message);
+  const node = found?.node || {};
+  return {
+    envelope: Object.keys(message?.message || {}),
+    type: found?.type || null,
+    viewOnce: Boolean(node.viewOnce),
+    url: Boolean(node.url),
+    directPath: Boolean(node.directPath),
+    mediaKey: Boolean(node.mediaKey?.length),
+    mimetype: node.mimetype || null,
+    fileLength: Number(node.fileLength || 0),
+    jpegThumbnail: Boolean(node.jpegThumbnail?.length)
+  };
+}
+
+function hasDownloadableMedia(message) {
+  const node = mediaNode(message)?.node;
+  return Boolean(node?.mediaKey?.length && (node.directPath || node.url));
+}
+
 async function maybeForwardRepliedViewOnce(message, text) {
   const quoted = extractQuotedViewOnceMessage(message);
   if (!quoted) return false;
   const destinationJid = state.chatDirectory.findByName(PRIMARY_TARGET_NAME);
   if (!destinationJid) throw new Error(`Grup target "${PRIMARY_TARGET_NAME}" tidak ditemukan di cache chat bot.`);
 
+  // The quoted copy inside contextInfo often carries a stale/invalid media path (HTTP 400),
+  // so prefer the original view-once message the bot cached when it arrived.
+  const original = state.viewOnceCache.findByKey(quoted.key);
+  const sources = [original, quoted].filter(Boolean);
+
   let media = null;
   try {
-    media = await downloadMessageMedia(state.sock, quoted, 'view-once-reply');
+    let lastError = null;
+    for (const source of sources) {
+      try {
+        media = await downloadMessageMedia(state.sock, source, 'view-once-reply');
+        if (media) break;
+      } catch (error) {
+        lastError = error;
+        await logger.warn('View-once reply download failed', {
+          source: source === original ? 'cache' : 'quoted',
+          cachedOriginal: Boolean(original),
+          cause: error?.cause?.message || error?.message,
+          fields: viewOnceFieldSummary(source)
+        });
+      }
+    }
+    if (!media && sources.every((source) => !hasDownloadableMedia(source))) {
+      throw new Error('WhatsApp tidak mengirim media view-once ini ke perangkat tertaut (bot), jadi tidak bisa diteruskan. Buka di HP lalu teruskan manual.');
+    }
+    if (!media && lastError) throw lastError;
     if (!media) throw new Error('Reply mengarah ke view-once, tapi medianya tidak bisa dibaca.');
     const replyCaption = String(text || '').trim();
     await sendDownloadedMedia(destinationJid, media, {

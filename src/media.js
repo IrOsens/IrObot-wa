@@ -210,7 +210,7 @@ function canRequestMediaReupload(sock, message) {
 }
 
 function shouldRequestMediaReupload(error) {
-  return [404, 410].includes(mediaErrorStatus(error)) || isRetryableMediaDownloadError(error);
+  return [400, 403, 404, 410].includes(mediaErrorStatus(error)) || isRetryableMediaDownloadError(error);
 }
 
 function isRetryableMediaDownloadError(error) {
