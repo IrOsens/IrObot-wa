@@ -17,7 +17,6 @@ export const STICKER_AUDIO_MIMETYPE = 'audio/ogg; codecs=opus';
 const AUDIO_MAX_BYTES = 950 * 1024;
 const AUDIO_MAX_MS = 10_000;
 const AUDIO_BITRATES = ['64k', '48k', '32k', '24k', '16k'];
-const SESSION_MS = 30 * 60 * 1000;
 const PATCHED = Symbol.for('iro.soundStickerPatched');
 
 function readVarint(buf, pos) {
@@ -239,66 +238,6 @@ export function parseStickerAudioFlag(rawArgs) {
   const pattern = /(?:^|\s)(?:-a|--audio)(?=\s|$)/gi;
   const audio = pattern.test(raw);
   return { audio, rest: raw.replace(pattern, ' ').replace(/\s+/g, ' ').trim() };
-}
-
-export class StickerAudioSessions {
-  constructor() { this.sessions = new Map(); }
-  has(jid) { return this.sessions.has(jid); }
-  get(jid) { return this.sessions.get(jid) || null; }
-  count() { return this.sessions.size; }
-  isActor(jid, actorJid) { return !this.has(jid) || this.get(jid).actorJid === actorJid; }
-
-  start(jid, actorJid, media, options = {}) {
-    const session = { jid, actorJid, media, options, audio: null, files: [media.path], busy: false };
-    this.sessions.set(jid, session);
-    this.touch(session);
-    return session;
-  }
-
-  touch(session) {
-    clearTimeout(session.timer);
-    session.timer = setTimeout(() => this.cancel(session.jid).catch(() => {}), SESSION_MS);
-    session.timer.unref?.();
-  }
-
-  async setAudio(jid, audio) {
-    const session = this.get(jid);
-    if (!session || session.busy) { await cleanupFiles([audio?.path]); return null; }
-    if (session.audio) await cleanupFiles([session.audio.path]);
-    session.audio = audio;
-    session.files.push(audio.path);
-    this.touch(session);
-    return session;
-  }
-
-  async cancel(jid, actorJid = null) {
-    const session = this.get(jid);
-    if (!session || (actorJid && session.actorJid !== actorJid) || session.busy) return false;
-    clearTimeout(session.timer);
-    this.sessions.delete(jid);
-    await cleanupFiles(session.files);
-    return true;
-  }
-
-  // build(session) -> { sticker, isAnimated, audio }; send(result) delivers it.
-  async finish(jid, actorJid, build, send) {
-    const session = this.get(jid);
-    if (!session || session.actorJid !== actorJid) return false;
-    if (session.busy) return true;
-    session.busy = true;
-    clearTimeout(session.timer);
-    try {
-      const result = await build(session);
-      if (result?.audio && result.audio !== session.audio) session.files.push(result.audio.path);
-      await send(result);
-      this.sessions.delete(jid);
-      await cleanupFiles(session.files);
-      return true;
-    } finally {
-      session.busy = false;
-      if (this.has(jid)) this.touch(session);
-    }
-  }
 }
 
 // A reply's quotedMessage carries the sticker but usually not its sound (field 134 is

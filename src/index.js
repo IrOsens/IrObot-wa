@@ -67,7 +67,7 @@ import {
 } from './media.js';
 import { isAnimatedMedia, makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerArgs, reverseSticker, stickerToAudioVideo } from './sticker.js';
 import {
-  SoundStickerAudioCache, StickerAudioSessions, audioFromMedia, downloadStickerAudio, hasAudioStream, isAudioSourceMedia, parseStickerAudioFlag, sendSoundSticker, stickerAudioOf
+  SoundStickerAudioCache, audioFromMedia, downloadStickerAudio, isAudioSourceMedia, parseStickerAudioFlag, sendSoundSticker, stickerAudioOf
 } from './soundSticker.js';
 import { QrSessions, downloadQrIcon, makeQrCode, parseQrArgs } from './qr.js';
 import { TaskRecorder, TaskScheduler, createTask, formatTaskList, formatWib, listTasks, parseTaskRecordingArgs, updateTaskState } from './tasks.js';
@@ -303,7 +303,6 @@ const ownerState = {
   pdfSessions: null,
   toVideoSessions: null,
   stimpaSessions: null,
-  stickerAudioSessions: null,
   qrSessions: null,
   restoreSessions: null,
   saveRecorder: null,
@@ -494,7 +493,7 @@ const HELP_SECTIONS = [
     title: 'Media',
     items: [
       { name: 'stext', text: ',stext Stiker teks' },
-      { name: 's', text: ',s        Buat stiker (,s -a = stiker beraudio)' },
+      { name: 's', text: ',s        Buat stiker (,s -a = stiker video beraudio)' },
       { name: 'smeme', text: ',smeme    Buat stiker meme dari gambar' },
       { name: 'resend', text: ',resend   Kirim ulang media/view-once' },
       { name: 'qr', text: ',qr       Buat QR dari pesan' },
@@ -584,7 +583,7 @@ const HELP_DETAILS = {
   setup: ['Format: ,setup [statussave|backup|logs|changedmsg|errors]', ',setup root <path-server>', ',setup <fitur> group <nama-grup|jid>', ',setup <fitur> local [path]', 'Satu tujuan aktif per fitur. Error teknis selalu memakai grup.'],
   stext: ['Format: ,stext [align=justify|left|right|center] <teks>', 'Default rata kiri dengan jarak huruf normal; alias: kiri, kanan, tengah, kiri-kanan.', 'Stiker 512×512, Arial hitam, panel putih membulat, low quality sedikit buram. Ukuran font otomatis menyesuaikan isi.', 'Contoh: ,stext align=center Halo dunia'],
   help: ['Format: ,help <command>', 'Contoh: ,help s, ,help task.'],
-  s: ['Format: ,s [q=1-100]', 'Format: ,s <title>,<author> [q=1-100]', 'Format: ,s -a [title,author] [q=1-100] untuk stiker beraudio.', 'Default q=100. Kualitas/resolusi hanya diturunkan jika perlu agar ukuran sticker bisa dikirim.', 'Kirim/reply media atau sertakan URL media. Stiker beraudio yang di-,s ulang tetap membawa audionya.', 'Sesi -a: kirim audio, voice note, video, atau stiker beraudio (maks 10 detik, terakhir yang dipakai). Tanpa kiriman, audio video sumber dipakai.', 'Buat: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.'],
+  s: ['Format: ,s [q=1-100]', 'Format: ,s <title>,<author> [q=1-100]', 'Format: ,s -a [title,author] [q=1-100]: reply video (mp4), stiker langsung jadi dengan audio videonya.', 'Default q=100. Kualitas/resolusi hanya diturunkan jika perlu agar ukuran sticker bisa dikirim.', 'Kirim/reply media atau sertakan URL media. Stiker beraudio yang di-,s ulang tetap membawa audionya.', 'Untuk memasukkan audio lain ke stiker, pakai ,stimpa.'],
   smeme: ['Format: ,smeme up <teks>', 'Format: ,smeme down <teks>', 'Advanced: tambah kualitas 1-99 di akhir.', 'Audio stiker beraudio tetap ikut.'],
   resend: ['Format: ,resend', 'Legacy: ,rs', 'Reply media/view-once. Sticker statis dikirim sebagai PNG, sticker bergerak sebagai GIF.', 'Sticker beraudio dikirim sebagai video MP4 dengan audionya.'],
   qr: ['Format langsung: ,qr [style=square|dot|rounded] [bg=warna|#RRGGBB] <pesan>', 'Format sesi: ,qr [style=square|dot|rounded] [bg=warna|#RRGGBB], lalu kirim pesan terpisah dan akhiri dengan ,end.', 'Background: white, black, red, blue, green, yellow, purple, orange. Default style=square dan bg=white.', 'Lampirkan gambar/GIF pada pesan untuk menjadikannya ikon tengah QR. Caption tetap menjadi isi QR.'],
@@ -917,7 +916,6 @@ function activeSessionType(jid) {
   if (state.pdfSessions?.has(jid)) return 'PDF';
   if (state.toVideoSessions?.has(jid)) return 'video';
   if (state.stimpaSessions?.has(jid)) return 'stimpa';
-  if (state.stickerAudioSessions?.has(jid)) return 'stiker audio';
   if (state.qrSessions?.has(jid)) return 'QR';
   if (state.restoreSessions?.has(jid)) return 'restore';
   return null;
@@ -931,7 +929,6 @@ function activeSessionActorMatches(jid, actorJid) {
   if (state.pdfSessions?.has(jid)) return state.pdfSessions.isActor(jid, actorJid);
   if (state.toVideoSessions?.has(jid)) return state.toVideoSessions.isActor(jid, actorJid);
   if (state.stimpaSessions?.has(jid)) return state.stimpaSessions.isActor(jid, actorJid);
-  if (state.stickerAudioSessions?.has(jid)) return state.stickerAudioSessions.isActor(jid, actorJid);
   if (state.qrSessions?.has(jid)) return state.qrSessions.isActor(jid, actorJid);
   if (state.restoreSessions?.has(jid)) return state.restoreSessions.isActor(jid, actorJid);
   return true;
@@ -942,7 +939,7 @@ function activeSessionOwnerJid(jid) {
   if (promptActor) return promptActor;
   for (const session of [state.saveRecorder?.sessions?.get(jid), state.taskRecorder?.sessions?.get(jid),
     state.anticall?.sessions?.get(jid), state.cintaRecorder?.sessions?.get(jid), state.pdfSessions?.get(jid), state.toVideoSessions?.get(jid),
-    state.stimpaSessions?.get(jid), state.stickerAudioSessions?.get(jid), state.qrSessions?.get(jid), state.restoreSessions?.sessions?.get(jid)]) {
+    state.stimpaSessions?.get(jid), state.qrSessions?.get(jid), state.restoreSessions?.sessions?.get(jid)]) {
     if (session?.actorJid) return session.actorJid;
   }
   return null;
@@ -970,7 +967,6 @@ function hasAnyTempSession() {
     || state.pdfSessions?.count()
     || state.toVideoSessions?.count()
     || state.stimpaSessions?.count()
-    || state.stickerAudioSessions?.count()
     || state.qrSessions?.count()
     || state.restoreSessions?.count()
   );
@@ -1210,7 +1206,7 @@ async function handleHealth(jid) {
     `Disk: ${diskText}`,
     `Tools: ffmpeg=${Boolean(state.tools.ffmpeg)}, ffprobe=${Boolean(state.tools.ffprobe)}, office=${Boolean(state.tools.office)}, pdftoppm=${Boolean(state.tools.pdftoppm)}, magick=${Boolean(state.tools.magick)}`,
     `Data counts: save=${saved.length}, note=${notes.length}, link=${links.length}, task=${tasks.length}, remind=${reminders.length}, wol=${wolItems.length}`,
-    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, video=${state.toVideoSessions?.count() || 0}, stimpa=${state.stimpaSessions?.count() || 0}, stickerAudio=${state.stickerAudioSessions?.count() || 0}, qr=${state.qrSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, confirm=${state.confirmStore.count()}`,
+    `Sessions: save=${state.saveRecorder?.sessions?.size || 0}, anticall=${state.anticall?.sessions?.size || 0}, pdf=${state.pdfSessions?.count() || 0}, video=${state.toVideoSessions?.count() || 0}, stimpa=${state.stimpaSessions?.count() || 0}, qr=${state.qrSessions?.count() || 0}, restore=${state.restoreSessions?.count() || 0}, confirm=${state.confirmStore.count()}`,
     `Anticall: ${anticall.enabled ? 'aktif' : 'nonaktif'}, pesan=${anticall.hasMessage ? `${anticall.entryCount} item` : 'belum ada'}, exception=${anticall.exceptionCount || 0}`,
     `Public command access: all=${Boolean(access.all)}, chats=${access.chatCount || 0}, admins=${access.adminCount || 0}`,
     `Schedulers: task=${state.scheduler?.isRunning?.() ? 'running' : 'stopped'}, remind=${state.reminderScheduler?.isRunning?.() ? 'running' : 'stopped'}, backup=${state.backupScheduler?.isRunning?.() ? 'running' : 'stopped'}`,
@@ -1228,17 +1224,14 @@ async function handleSticker(message, command, actorJid) {
     defaultAuthor: DEFAULT_STICKER_AUTHOR,
     defaultTitle: DEFAULT_STICKER_TITLE
   });
-  if (flag.audio) assertNoActiveSession(jid);
   let media = null;
   let audio = null;
   try {
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'sticker-source');
     if (!media) media = await downloadUrlMedia(flag.rest, 'sticker-url');
     if (!media) throw new UserInputError('Kirim/reply media atau sertakan URL media yang valid.');
-    if (flag.audio) {
-      await startStickerAudioSession(jid, actorJid, media, options);
-      media = null;
-      return;
+    if (flag.audio && !isVideoSourceMedia(media)) {
+      throw new UserInputError(',s -a hanya untuk video (mp4) yang punya audio. Untuk menambah audio ke stiker, pakai ,stimpa.');
     }
     const animated = await isAnimatedMedia(media);
     const sticker = await makeSticker(media, {
@@ -1247,52 +1240,17 @@ async function handleSticker(message, command, actorJid) {
       quality: options.quality,
       tools: state.tools
     });
-    audio = await sourceStickerAudio(media);
-    await sendStickerResult(jid, sticker, { isAnimated: animated, audio });
+    // -a: the video's own audio, from the start like the sticker clip.
+    audio = flag.audio ? await audioFromMedia(state.sock, state.tools, media) : await sourceStickerAudio(media);
+    await sendStickerResult(jid, sticker, { isAnimated: animated, audio, strict: flag.audio });
   } finally {
     await cleanupFiles([media?.path, audio?.path]);
   }
 }
 
-function isStickerVisualMedia(media) {
-  if (['imageMessage', 'videoMessage', 'stickerMessage'].includes(media?.type)) return true;
-  return /^(image|video)\//i.test(media?.mimetype || '');
-}
-
-async function startStickerAudioSession(jid, actorJid, media, options) {
-  if (!isStickerVisualMedia(media)) {
-    await cleanupFiles([media.path]);
-    throw new UserInputError('Reply/kirim gambar, video, GIF, atau stiker dengan ,s -a lalu kirim audionya.');
-  }
-  if (!state.tools?.ffmpeg) {
-    await cleanupFiles([media.path]);
-    throw new UserInputError('FFmpeg diperlukan untuk stiker beraudio.');
-  }
-  withCachedStickerAudio(media);
-  const session = state.stickerAudioSessions.start(jid, actorJid, media, options);
-  try {
-    session.sourceHasAudio = media.type === 'stickerMessage'
-      ? Boolean(stickerAudioOf(media))
-      : videoMediaKind(media) === 'video' && await hasAudioStream(state.tools, media.path);
-    const sent = await sendText(jid, formatStickerAudioSession(session));
-    registerSessionPrompt(sent.key, jid, actorJid);
-  } catch (error) {
-    await state.stickerAudioSessions.cancel(jid, actorJid);
-    throw error;
-  }
-}
-
-function formatStickerAudioSession(session) {
-  const kind = { sticker: 'stiker', video: 'video', image: 'gambar' }[videoMediaKind(session.media)] || 'media';
-  const audio = session.audio
-    ? `ada (${session.audio.seconds || '?'} detik)`
-    : session.sourceHasAudio ? 'belum dikirim — audio dari sumber akan dipakai' : 'belum ada';
-  return [
-    '*Sesi stiker audio*',
-    `Sumber: ${kind}. Audio: ${audio}.`,
-    'Kirim audio, voice note, video, atau stiker beraudio (maks 10 detik). Audio terakhir yang dipakai.',
-    'Buat stiker: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.'
-  ].join('\n');
+function isVideoSourceMedia(media) {
+  if (media?.type === 'videoMessage') return !media.node?.gifPlayback;
+  return media?.type !== 'stickerMessage' && /^video\//i.test(media?.mimetype || '');
 }
 
 async function downloadSessionAudio(message, prefix) {
@@ -1309,50 +1267,6 @@ async function downloadSessionAudio(message, prefix) {
   } finally {
     await cleanupFiles([media?.path]);
   }
-}
-
-async function collectStickerAudioItem(message) {
-  const jid = message.key.remoteJid;
-  if (!state.stickerAudioSessions.get(jid) || !mediaNode(message)) return;
-  const result = await downloadSessionAudio(message, 'sticker-audio-item');
-  if (!result) return;
-  if (result.ignored) {
-    await sendText(jid, `Audio dilewati: ${result.reason}`);
-    return;
-  }
-  const session = await state.stickerAudioSessions.setAudio(jid, result.audio);
-  const prompt = state.sessionPrompts.get(jid);
-  if (session && prompt?.key) await editText(jid, prompt.key, formatStickerAudioSession(session));
-}
-
-async function finishStickerAudioByJid(jid, actorJid) {
-  const session = state.stickerAudioSessions?.get(jid);
-  if (!session || !state.stickerAudioSessions.isActor(jid, actorJid)) return false;
-  if (session.busy) return true;
-  if (!session.audio && !session.sourceHasAudio) {
-    await sendText(jid, 'Kirim audio, voice note, atau video sebelum ,end. Sesi masih aktif.');
-    return true;
-  }
-  const progress = await sendText(jid, '*Membuat stiker audio…*');
-  try {
-    await state.stickerAudioSessions.finish(jid, actorJid, async (current) => {
-      const isAnimated = await isAnimatedMedia(current.media);
-      const sticker = await makeSticker(current.media, {
-        author: current.options.author,
-        title: current.options.title,
-        quality: current.options.quality,
-        tools: state.tools
-      });
-      const audio = current.audio || await audioFromMedia(state.sock, state.tools, current.media);
-      return { sticker, isAnimated, audio };
-    }, async (result) => sendStickerResult(jid, result.sticker, { isAnimated: result.isAnimated, audio: result.audio, strict: true }));
-    await editText(jid, progress.key, '*Stiker audio terkirim*').catch(() => {});
-  } catch (error) {
-    await editText(jid, progress.key, `*Pembuatan stiker audio gagal*\n${error.message}\nSesi masih aktif; kirim audio lain atau ketik ,end.`);
-    if (error instanceof UserInputError) return true;
-    throw error;
-  }
-  return true;
 }
 
 async function handleQr(message, command, actorJid) {
@@ -2720,10 +2634,6 @@ async function cancelActiveSessionByJid(jid, actorJid) {
     await sendText(jid, 'Sesi stimpa dibatalkan.');
     return true;
   }
-  if (await state.stickerAudioSessions?.cancel(jid, actorJid)) {
-    await sendText(jid, 'Sesi stiker audio dibatalkan.');
-    return true;
-  }
 
   if (await state.qrSessions.cancel(jid, actorJid)) {
     await sendText(jid, 'Sesi QR dibatalkan.');
@@ -2770,7 +2680,6 @@ async function finishActiveSession(jid, actorJid) {
   if (await finishQrByJid(jid, actorJid)) return true;
   if (await finishToVideoByJid(jid, actorJid)) return true;
   if (await finishStimpaByJid(jid, actorJid)) return true;
-  if (await finishStickerAudioByJid(jid, actorJid)) return true;
   if (state.restoreSessions.has(jid)) {
     if (!activeSessionActorMatches(jid, actorJid)) return false;
     const session = state.restoreSessions.sessions.get(jid);
@@ -3779,10 +3688,6 @@ async function onMessageUpsert(event) {
       }
       if (sessionActorMatches && state.stimpaSessions?.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
         await collectStimpaItem(message);
-        continue;
-      }
-      if (sessionActorMatches && state.stickerAudioSessions?.has(jid) && (!command || !['end', 'cancel'].includes(command.name))) {
-        await collectStickerAudioItem(message);
         continue;
       }
       if (!command && context.isOwner && await maybeHandleJadibotTextApproval(message, text)) {
@@ -5198,7 +5103,6 @@ async function main() {
   state.pdfSessions = new PdfSessions(state.tools);
   state.toVideoSessions = new ToVideoSessions(state.tools);
   state.stimpaSessions = new StimpaSessions();
-  state.stickerAudioSessions = new StickerAudioSessions();
   state.qrSessions = new QrSessions();
   state.restoreSessions = new RestoreSessions();
   state.saveRecorder = new SaveRecorder();

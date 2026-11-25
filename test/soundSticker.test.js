@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { proto } from 'baileys';
 import {
-  STICKER_AUDIO_MIMETYPE, SoundStickerAudioCache, StickerAudioSessions, audioFromMedia, encodeSoundStickerWrapper, parseStickerAudioFlag, prepareStickerAudio, stickerAudioOf
+  STICKER_AUDIO_MIMETYPE, SoundStickerAudioCache, audioFromMedia, encodeSoundStickerWrapper, parseStickerAudioFlag, prepareStickerAudio, stickerAudioOf
 } from '../src/soundSticker.js';
 import { detectTools } from '../src/tools.js';
 import { TEMP_DIR } from '../src/config.js';
@@ -96,27 +96,6 @@ test('prepareStickerAudio makes a short audio-only opus file', async (t) => {
     await fs.rm(input, { force: true });
     await fs.rm(audio.path, { force: true });
   }
-});
-
-test('sticker audio session keeps the latest audio and cleans up', async () => {
-  const sessions = new StickerAudioSessions();
-  const source = tmp('src.png');
-  await fs.writeFile(source, 'x');
-  const session = sessions.start('j@g.us', 'a@s', { path: source, type: 'imageMessage' }, { title: 't' });
-  const first = tmp('first.ogg');
-  const audioPath = tmp('a.ogg');
-  await fs.writeFile(first, 'x');
-  await fs.writeFile(audioPath, 'x');
-  await sessions.setAudio('j@g.us', { path: first, seconds: 1 });
-  await sessions.setAudio('j@g.us', { path: audioPath, seconds: 2 });
-  await assert.rejects(fs.stat(first));
-  assert.equal(session.audio.seconds, 2);
-  let sent = null;
-  await sessions.finish('j@g.us', 'a@s', async (current) => ({ sticker: Buffer.from('s'), audio: current.audio }), async (result) => { sent = result; });
-  assert.equal(sent.audio.path, audioPath);
-  assert.equal(sessions.has('j@g.us'), false);
-  await assert.rejects(fs.stat(audioPath));
-  await assert.rejects(fs.stat(source));
 });
 
 test('sound sticker cache restores audio on a quoted sticker without sound', () => {
