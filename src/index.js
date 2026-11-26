@@ -615,7 +615,7 @@ const HELP_DETAILS = {
   topdf: ['Format: ,topdf [--name "nama"] [--split] [--max-size 1MB | --target-size 2MB]', '--max-size: batas maksimum; --target-size: ukuran tepat, maksimal 100MB.', 'Target tepat dapat menambahkan padding tanpa meningkatkan kualitas. Kompresi PDF dapat mengubah teks menjadi gambar.', 'Nama berspasi wajib dikutip dalam mode flag. Jangan campur flag dengan format lama.', 'Legacy: ,topdf nama max 1MB, ,topdf split nama, dan ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
   tovideo: ['Kirim/reply gambar, video, atau stiker: ,tovideo [duration=3s] [speed=0.25-4|slow=1-4] [format=mp4|gif] [q=1-100].', 'speed=2 mempercepat 2×; slow=2 memperlambat 2× (video dan audio sumber). Tanpa duration, panjang hasil video menyesuaikan kecepatan; duration=... tetap menentukan panjang hasil.', 'Jika mulai dari stiker, kirim gambar/video template yang sudah menampilkan stiker itu di dalam sesi.', 'Tanpa duration, gambar dibuat 5 detik dan video mengikuti durasi aslinya. Durasi dapat diubah selama sesi.', 'Audio stiker beraudio otomatis jadi musik jika belum ada audio lain.', 'Sesi menerima stiker WhatsApp, audio, atau teks: duration=2m, speed=2, slow=2, sync, mute, unmute, vvol=50%, mvol=50%, q=80, format=gif.', 'Selesai: ,end atau ✅/👍/❤️ pada pesan sesi. Batal: ,cancel atau ❌/👎/❎.', 'Stiker harus terlihat pada sumber agar posisi, ukuran, dan rotasinya bisa dicocokkan. GIF WhatsApp tidak bersuara.'],
   stimpa: ['Reply stiker (bergerak atau diam) dengan ,stimpa.', 'Bot mengirim frame pertama sebagai gambar kanvas. Edit gambar itu di WhatsApp, lalu kirim satu atau beberapa gambar edit tanpa crop.', 'Setiap gambar yang cocok ditumpuk pada stiker yang sama; gambar yang tidak cocok dilewati. Cukup kirim audio tanpa edit untuk sekadar menambah/mengganti audio. ,end membuat stiker; ,cancel membatalkan.', 'Audio stiker sumber ikut ke hasil. Kirim audio/VN/video atau link langsung mp3/video di sesi untuk mengganti audionya.', 'Bisa juga langsung: ,stimpa <link> sambil reply stiker, lalu ,end. Link bisa mp3/video langsung atau TikTok/IG/YouTube/X/FB.', 'Ambil dari menit tertentu: ,stimpa <link> 1:05 (10 detik mulai 1:05). File unduhan langsung dihapus dari server.'],
-  dl: ['Format: ,dl <link>', 'Format: ,dl <link> mp3 (audio saja)', 'Alias: ,yt, ,ig, ,tt. Bisa juga reply pesan yang berisi link.', 'Video maks 720p dan 64 MB. Carousel IG/TikTok foto dikirim semua (maks 10). File langsung dihapus dari server setelah terkirim.'],
+  dl: ['Format: ,dl <link>', 'Format: ,dl mp3 <link> (audio saja)', 'Alias: ,yt, ,ig, ,tt. Bisa juga reply pesan yang berisi link.', 'Video maks 720p dan 64 MB. Carousel IG/TikTok foto dikirim semua (maks 10). File langsung dihapus dari server setelah terkirim.'],
   toimg: ['Format: ,toimg', 'Reply/kirim dokumen PDF, lalu bot mengirim tiap halaman sebagai gambar.'],
   note: ['Format: ,note list', 'Format: ,note add <judul> <teks>', 'Format: ,note get <id|judul>', 'Format: ,note del <id|judul>', 'Format: ,note rename <id|judul> <judul-baru>', 'Legacy: ,note <judul> <teks> dan ,note change tetap didukung.'],
   link: ['Format: ,link list', 'Format: ,link add <nama> <https://link>', 'Format: ,link get <id|nama>', 'Format: ,link del <id|nama>', 'Format: ,link rename <id|nama> <nama-baru>', 'Legacy: ,link <nama> <url> dan ,link change tetap didukung.'],
@@ -743,7 +743,7 @@ async function loadWorkerHelpGif() {
   return buffer;
 }
 
-async function sendWorkerHelpGif(jid, caption) {
+async function sendHelpGif(jid, caption) {
   try {
     await sendBotMessage(jid, { video: await loadWorkerHelpGif(), gifPlayback: true, mimetype: 'video/mp4', caption });
     return true;
@@ -779,7 +779,7 @@ async function handleHelp(jid, command, context) {
     if (items.length) lines.push('', `${HELP_ICONS[section.title] || '•'} *${section.title}*`, items.map((item) => cmd(`${COMMAND_PREFIX}${item.name}`)).join('  '));
   }
   lines.push('', replyHint(`Contoh: ${helpExamples(jid, context)}`));
-  if (currentWorker() && await sendWorkerHelpGif(jid, lines.join('\n'))) return;
+  if (await sendHelpGif(jid, lines.join('\n'))) return;
   await sendText(jid, lines.join('\n'));
 }
 
@@ -2281,13 +2281,13 @@ async function handleTopdf(message, command, actorJid) {
   registerSessionPrompt(sent.key, jid, actorJid);
 }
 
-// ,dl <link> [mp3]: TikTok / Instagram / YouTube / ... -> video or photos (or audio) in the chat.
+// ,dl [mp3] <link>: TikTok / Instagram / YouTube / ... -> video or photos (or audio) in the chat.
 // The download folder is removed right after sending.
 async function handleSocialDownload(message, command) {
   const jid = message.key.remoteJid;
   const quoted = extractQuotedMessage(message);
   const url = firstUrl(command.rawArgs) || firstUrl(quoted ? getMessageText(quoted) : '');
-  if (!url) throw new UserInputError(`Kirim link-nya: ${cmd(`${COMMAND_PREFIX}${command.name} <link>`)}, atau reply pesan yang berisi link.`);
+  if (!url) throw new UserInputError(`Kirim link-nya: ${cmd(`${COMMAND_PREFIX}${command.name} <link>`)} atau ${cmd(`${COMMAND_PREFIX}${command.name} mp3 <link>`)} untuk audio saja. Bisa juga reply pesan yang berisi link.`);
   const audioOnly = /(^|\s)(mp3|audio|-a)(\s|$)/i.test(String(command.rawArgs).replace(url, ' '));
   const progress = await sendText(jid, `⏳ *Mengunduh${audioOnly ? ' audio' : ''}…*\n${replyHint(new URL(url).hostname.replace(/^www\./, ''))}`);
   await withSocialDownload(state.tools, url, { audioOnly }, async ({ title, uploader, files }) => {

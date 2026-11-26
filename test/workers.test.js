@@ -369,7 +369,9 @@ test('admin session runs worker commands from the owner account in any chat with
     assert.ok(!ownerSent.at(-1).content.text.includes(header));
 
     await send(groupJid, ',help');
-    assert.ok(!ownerSent.at(-1).content.text.includes(header));
+    const help = ownerSent.at(-1).content;
+    assert.equal(help.gifPlayback, true);
+    assert.ok(!help.caption.includes(header));
   } finally {
     state.sock = previous.sock;
     state.workerStore = previous.workerStore;
