@@ -74,20 +74,21 @@ export function startTimeFromArgs(rawArgs, url) {
   return 0;
 }
 
-function describeFailure(error) {
+function describeFailure(error, video = false) {
   const text = `${error?.stderr || ''}\n${error?.message || ''}`;
   if (error?.killed || /timed? ?out/i.test(text)) return 'Link kelamaan diunduh, coba lagi atau pakai link lain.';
   if (/private|login|sign in|cookies|age/i.test(text)) return 'Konten ini privat atau butuh login.';
   if (/max-filesize|larger than/i.test(text)) return 'File di link terlalu besar.';
-  if (/unsupported url|no video|no media|not available|removed|404/i.test(text)) return 'Link ini tidak bisa diambil audionya (privat/dihapus?).';
-  return 'Link ini tidak bisa diambil audionya.';
+  const what = video ? 'videonya' : 'audionya';
+  if (/unsupported url|no video|no media|not available|removed|404/i.test(text)) return `Link ini tidak bisa diambil ${what} (privat/dihapus?).`;
+  return `Link ini tidak bisa diambil ${what}.`;
 }
 
-// Downloads a short audio section from a social media link with yt-dlp, hands it to `use`,
+// Downloads a short section of a social media link with yt-dlp, hands the file to `use`,
 // then removes the whole download folder (also .part files) no matter what happens.
-export async function withSocialAudio(tools, url, { startSec = 0, run = runTool, ytdlp = {} } = {}, use) {
+async function withSocialSection(tools, url, { startSec = 0, video = false, run = runTool, ytdlp = {} } = {}, use) {
   await ensureYtdlp(tools, ytdlp);
-  const dir = makeTempPath('sosmed');
+  const dir = makeTempPath(video ? 'sosmed-clip' : 'sosmed');
   await fs.mkdir(dir, { recursive: true });
   try {
     const start = Math.max(0, Math.floor(Number(startSec) || 0));
@@ -95,26 +96,48 @@ export async function withSocialAudio(tools, url, { startSec = 0, run = runTool,
       '--no-playlist', '--no-progress', '--no-warnings', '--no-mtime',
       '--socket-timeout', '20',
       '--max-filesize', '80M',
-      '-f', 'bestaudio/best',
+      '-f', video ? CLIP_FORMAT : 'bestaudio/best',
+      ...(video ? ['--merge-output-format', 'mp4'] : []),
       '--download-sections', `*${start}-${start + SECTION_SECONDS}`,
-      '-o', path.join(dir, 'audio.%(ext)s')
+      '-o', path.join(dir, `${video ? 'clip' : 'audio'}.%(ext)s`)
     ];
     if (tools.ffmpeg) args.push('--ffmpeg-location', tools.ffmpeg);
     args.push('--', url);
     try {
       await run(tools.ytdlp, args, { timeout: DOWNLOAD_TIMEOUT_MS, cwd: dir });
     } catch (error) {
-      throw new UserInputError(describeFailure(error));
+      throw new UserInputError(describeFailure(error, video));
     }
     const files = (await fs.readdir(dir)).filter((name) => !/\.(part|ytdl|temp)$/i.test(name));
-    if (!files.length) throw new UserInputError('Link ini tidak bisa diambil audionya.');
+    if (!files.length) throw new UserInputError(video ? 'Link ini tidak punya video yang bisa diambil.' : 'Link ini tidak bisa diambil audionya.');
     const file = path.join(dir, files[0]);
-    const mimetype = mime.lookup(file) || 'audio/mpeg';
+    const mimetype = mime.lookup(file) || (video ? 'video/mp4' : 'audio/mpeg');
+    if (video) {
+      if (!/^video\//.test(mimetype)) throw new UserInputError('Link ini bukan video. Untuk foto pakai `,dl <link>` lalu reply `,s`.');
+      return await use({ path: file, mimetype, type: 'videoMessage', ext: path.extname(file), node: {} });
+    }
     const media = { path: file, mimetype: /^video\//.test(mimetype) ? mimetype : (/^audio\//.test(mimetype) ? mimetype : 'audio/mpeg'), type: 'audioMessage', ext: path.extname(file) };
     return await use(media);
   } finally {
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }).catch(() => {});
   }
+}
+
+// ~12 s of audio for a sticker sound.
+export function withSocialAudio(tools, url, options = {}, use) {
+  return withSocialSection(tools, url, { ...options, video: false }, use);
+}
+
+// ~12 s of video (small, with sound) to turn into an animated sticker.
+export function withSocialClip(tools, url, options = {}, use) {
+  return withSocialSection(tools, url, { ...options, video: true }, use);
+}
+
+// Only clock-like times ("1:05", "0:01:05", "1m5s", "30s"), so plain numbers in other args are left alone.
+export function clipStartFromArgs(rawArgs, url) {
+  const rest = String(rawArgs || '').replace(url || '', ' ').trim().split(/\s+/);
+  const word = rest.find((item) => /^(?:\d+:)?\d{1,2}:\d{2}$|^(?:\d+m)(?:\d+s)?$|^\d+s$/i.test(item));
+  return { startSec: word ? parseStartTime(word) : 0, word: word || '' };
 }
 
 export const SOCIAL_DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024;
@@ -123,6 +146,15 @@ const VIDEO_FORMAT = [
   'b[height<=720][vcodec^=avc]',
   'bv*[height<=720]+ba',
   'b[height<=720]',
+  'b'
+].join('/');
+// Stickers are 512 px, so a small (<=480p) clip is plenty and downloads fast.
+const CLIP_FORMAT = [
+  'bv*[height<=480][vcodec^=avc]+ba[ext=m4a]',
+  'b[height<=480][vcodec^=avc]',
+  'bv*[height<=480]+ba',
+  'b[height<=480]',
+  'bv*[height<=720]+ba',
   'b'
 ].join('/');
 const MEDIA_EXT = {

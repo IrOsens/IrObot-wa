@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { isSocialUrl, parseStartTime, startTimeFromArgs, withSocialAudio, withSocialDownload, ensureYtdlp } from '../src/socialAudio.js';
+import { isSocialUrl, parseStartTime, startTimeFromArgs, withSocialAudio, withSocialDownload, withSocialClip, clipStartFromArgs, ensureYtdlp } from '../src/socialAudio.js';
 
 test('isSocialUrl recognises social media hosts only', () => {
   assert.equal(isSocialUrl('https://vt.tiktok.com/ZS123/'), true);
@@ -87,4 +87,33 @@ test('withSocialDownload returns every photo/video with the title and cleans up'
   const empty = async (command, args) => { dir = path.dirname(args[args.indexOf('-o') + 1]); return { stdout: '' }; };
   await assert.rejects(withSocialDownload({ ytdlp: '/bin/yt-dlp' }, 'https://youtu.be/x', { run: empty }, async () => {}), /Tidak ada video/);
   await assert.rejects(fs.access(dir));
+});
+
+test('withSocialClip downloads a small video section and always removes it', async () => {
+  let dir = null;
+  const run = async (command, args) => {
+    const output = args[args.indexOf('-o') + 1];
+    dir = path.dirname(output);
+    await fs.writeFile(output.replace('%(ext)s', 'mp4'), 'video');
+    assert.match(args[args.indexOf('-f') + 1], /height<=480/);
+    assert.equal(args[args.indexOf('--download-sections') + 1], '*65-77');
+    return { stdout: '', stderr: '' };
+  };
+  const result = await withSocialClip({ ytdlp: '/bin/yt-dlp' }, 'https://youtu.be/x', { run, startSec: 65 }, async (media) => {
+    assert.equal(media.type, 'videoMessage');
+    assert.equal(media.mimetype, 'video/mp4');
+    return 'sticker';
+  });
+  assert.equal(result, 'sticker');
+  await assert.rejects(fs.access(dir));
+  const image = async (command, args) => { const output = args[args.indexOf('-o') + 1]; dir = path.dirname(output); await fs.writeFile(output.replace('%(ext)s', 'jpg'), 'x'); return {}; };
+  await assert.rejects(withSocialClip({ ytdlp: '/bin/yt-dlp' }, 'https://youtu.be/x', { run: image }, async () => {}), /bukan video/);
+  await assert.rejects(fs.access(dir));
+});
+
+test('clipStartFromArgs only takes clock-like times', () => {
+  const url = 'https://youtu.be/x';
+  assert.deepEqual(clipStartFromArgs(`${url} 1:05`, url), { startSec: 65, word: '1:05' });
+  assert.deepEqual(clipStartFromArgs(`${url} 30s q=80`, url), { startSec: 30, word: '30s' });
+  assert.deepEqual(clipStartFromArgs(`${url} Paket 2026`, url), { startSec: 0, word: '' });
 });

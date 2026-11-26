@@ -77,7 +77,7 @@ import { TaskRecorder, TaskScheduler, createTask, formatTaskList, formatWib, lis
 import { PdfSessions, parsePdfOrderText, parsePdfStartArgs } from './pdf.js';
 import { ToVideoSessions, parseToVideoOptions, videoMediaKind } from './toVideo.js';
 import { StimpaSessions } from './stimpa.js';
-import { isSocialUrl, startTimeFromArgs, withSocialAudio, withSocialDownload } from './socialAudio.js';
+import { clipStartFromArgs, isSocialUrl, startTimeFromArgs, withSocialAudio, withSocialClip, withSocialDownload } from './socialAudio.js';
 import { ImportantStore, ImportantVault } from './importantStore.js';
 import { ImportantRecorder } from './importantRecorder.js';
 import { ImportantAuth } from './importantAuth.js';
@@ -606,7 +606,7 @@ const HELP_DETAILS = {
   setup: ['Format: ,setup [statussave|backup|logs|changedmsg|errors]', ',setup root <path-server>', ',setup <fitur> group <nama-grup|jid>', ',setup <fitur> local [path]', 'Satu tujuan aktif per fitur. Error teknis selalu memakai grup.'],
   stext: ['Format: ,stext [align=justify|left|right|center] <teks>', 'Default rata kiri dengan jarak huruf normal; alias: kiri, kanan, tengah, kiri-kanan.', 'Stiker 512×512, Arial hitam, panel putih membulat, low quality sedikit buram. Ukuran font otomatis menyesuaikan isi.', 'Contoh: ,stext align=center Halo dunia'],
   help: ['Format: ,help <command>', 'Contoh: ,help s, ,help dl.'],
-  s: ['Format: ,s [q=1-100]', 'Format: ,s <title>,<author> [q=1-100]', 'Format: ,s -a [title,author] [q=1-100]: reply video (mp4), stiker langsung jadi dengan audio videonya.', 'Default q=100. Kualitas/resolusi hanya diturunkan jika perlu agar ukuran sticker bisa dikirim.', 'Kirim/reply media atau sertakan URL media. Stiker beraudio yang di-,s ulang tetap membawa audionya.', 'Untuk memasukkan audio lain ke stiker, pakai ,stimpa.'],
+  s: ['Format: ,s [q=1-100]', 'Format: ,s <title>,<author> [q=1-100]', 'Format: ,s -a [title,author] [q=1-100]: reply video (mp4), stiker langsung jadi dengan audio videonya.', 'Format: ,s -a <link TikTok/IG/YouTube> [1:05]: video dari link langsung jadi stiker beraudio (tanpa -a: tanpa suara). Waktu opsional = mulai detik ke berapa.', 'Default q=100. Kualitas/resolusi hanya diturunkan jika perlu agar ukuran sticker bisa dikirim.', 'Kirim/reply media atau sertakan URL media. Stiker beraudio yang di-,s ulang tetap membawa audionya.', 'Untuk memasukkan audio lain ke stiker, pakai ,stimpa.'],
   smeme: ['Format: ,smeme up <teks>', 'Format: ,smeme down <teks>', 'Advanced: tambah kualitas 1-99 di akhir.', 'Audio stiker beraudio tetap ikut.'],
   resend: ['Format: ,resend', 'Legacy: ,rs', 'Reply media/view-once. Sticker statis dikirim sebagai PNG, sticker bergerak sebagai GIF.', 'Sticker beraudio dikirim sebagai video MP4 dengan audionya.'],
   qr: ['Format langsung: ,qr [style=square|dot|rounded] [bg=warna|#RRGGBB] <pesan>', 'Format sesi: ,qr [style=square|dot|rounded] [bg=warna|#RRGGBB], lalu kirim pesan terpisah dan akhiri dengan ,end.', 'Background: white, black, red, blue, green, yellow, purple, orange. Default style=square dan bg=white.', 'Lampirkan gambar/GIF pada pesan untuk menjadikannya ikon tengah QR. Caption tetap menjadi isi QR.'],
@@ -1343,25 +1343,52 @@ async function handleSticker(message, command, actorJid) {
     defaultTitle: null
   });
   let media = null;
-  let audio = null;
   try {
     media = await downloadQuotedOrOwnMedia(state.sock, message, 'sticker-source');
+    const url = media ? null : firstUrl(flag.rest);
+    // ,s [-a] <link TikTok/IG/YT> [1:05] -> a short clip is downloaded, turned into a sticker, then deleted.
+    if (url && isSocialUrl(url)) {
+      const { startSec, word } = clipStartFromArgs(flag.rest, url);
+      const metaArgs = flag.rest.split(/\s+/).filter((part) => part && part !== url && part !== word).join(' ');
+      const progress = await sendText(jid, `⏳ *Ambil video${flag.audio ? ' + audio' : ''}…*\n${replyHint(new URL(url).hostname.replace(/^www\./, ''))}`);
+      try {
+        await withSocialClip(state.tools, url, { startSec }, (clip) => makeStickerFromSource(jid, clip, parseStickerArgs(metaArgs, {
+          defaultAuthor: DEFAULT_STICKER_AUTHOR,
+          defaultTitle: null
+        }), flag.audio));
+        await editText(jid, progress.key, '✅ *Stiker jadi*').catch(() => {});
+      } catch (error) {
+        await editText(jid, progress.key, userErrorText(error.message)).catch(() => {});
+        if (!(error instanceof UserInputError)) throw error;
+      }
+      return;
+    }
     if (!media) media = await downloadUrlMedia(flag.rest, 'sticker-url');
-    if (!media) throw new UserInputError('Kirim/reply media atau sertakan URL media yang valid.');
+    if (!media) throw new UserInputError('Kirim/reply media, atau sertakan link media / TikTok / IG / YouTube.');
     if (flag.audio && !isVideoSourceMedia(media)) {
       throw new UserInputError(',s -a hanya untuk video (mp4) yang punya audio. Untuk menambah audio ke stiker, pakai ,stimpa.');
     }
+    await makeStickerFromSource(jid, media, options, flag.audio);
+  } finally {
+    await cleanupFiles([media?.path]);
+  }
+}
+
+// Sticker from a downloaded source; with `withAudio` the source's own sound becomes the sticker sound.
+async function makeStickerFromSource(jid, media, options, withAudio) {
+  let audio = null;
+  try {
     const animated = await isAnimatedMedia(media);
     const [stickerResult, audioResult] = await Promise.allSettled([
       makeSticker(media, { ...options, animated, tools: state.tools }),
-      flag.audio ? audioFromMedia(state.sock, state.tools, media) : sourceStickerAudio(media, { strict: true })
+      withAudio ? audioFromMedia(state.sock, state.tools, media) : sourceStickerAudio(media, { strict: true })
     ]);
     if (audioResult.status === 'fulfilled') audio = audioResult.value;
     if (stickerResult.status === 'rejected') throw stickerResult.reason;
     if (audioResult.status === 'rejected') throw audioResult.reason;
     await sendStickerResult(jid, stickerResult.value, { isAnimated: animated, audio, strict: true });
   } finally {
-    await cleanupFiles([media?.path, audio?.path]);
+    await cleanupFiles([audio?.path]);
   }
 }
 
