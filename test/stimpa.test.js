@@ -231,7 +231,7 @@ test('stimpa edits a static sticker into a static sticker and is a public comman
   }
 });
 
-test('stimpa with only new audio sends the source sticker unchanged', async () => {
+test('stimpa with only new audio applies configured sticker metadata', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'stimpa-audio-'));
   const sessions = new StimpaSessions();
   try {
@@ -244,11 +244,17 @@ test('stimpa with only new audio sends the source sticker unchanged', async () =
     await sessions.start('chat', 'actor', { path: source, type: 'stickerMessage', mimetype: 'image/webp' });
     await sessions.setAudio('chat', { path: audioPath, seconds: 2 }, { replaced: false });
     await assert.rejects(() => sessions.finish('chat', 'actor', async () => {}, async () => {}), /audio baru/);
-    const original = await fs.readFile(source);
+    const originalPixels = await sharp(source).ensureAlpha().raw().toBuffer();
     await sessions.setAudio('chat', { path: newAudioPath, seconds: 3 });
     let sent = null;
     await sessions.finish('chat', 'actor', async () => {}, async (buffer, audio, options) => { sent = { buffer, audio, options }; });
-    assert.deepEqual(sent.buffer, original);
+    assert.deepEqual(await sharp(sent.buffer).ensureAlpha().raw().toBuffer(), originalPixels);
+    const image = new (await import('node-webpmux')).default.Image();
+    await image.load(sent.buffer);
+    const metadata = JSON.parse(image.exif.subarray(22).toString());
+    const { DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE } = await import('../src/config.js');
+    assert.equal(metadata['sticker-pack-publisher'], DEFAULT_STICKER_AUTHOR);
+    assert.equal(metadata['sticker-pack-name'], DEFAULT_STICKER_TITLE);
     assert.equal(sent.audio.path, newAudioPath);
     assert.equal(sent.options.isAnimated, false);
     assert.equal(sessions.has('chat'), false);

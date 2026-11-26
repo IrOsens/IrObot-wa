@@ -112,9 +112,12 @@ export class StimpaSessions {
     try {
       await onProgress(5, session.edit ? 'Membaca gambar edit' : 'Menyiapkan stiker');
       if (!session.edit) {
-        // Audio only: keep the source sticker exactly as it is.
+        // Preserve the image while applying the configured sticker metadata.
+        const image = new webp.Image();
+        await image.load(session.media.path);
+        image.exif = buildStickerExif(DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE);
         await onProgress(92, 'Mengirim stiker');
-        await send(await fs.readFile(session.media.path), session.audio, { isAnimated: session.animated });
+        await send(await image.save(null), session.audio, { isAnimated: session.animated });
         await onProgress(100, 'Selesai');
         this.sessions.delete(jid);
         await cleanupFiles(session.files);
