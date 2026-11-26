@@ -361,6 +361,8 @@ Service `important`:
 - Web UI mirip WhatsApp Web di port `important.port` (default `8790`), hanya listen di IP Tailscale (`tailscale ip -4`), misalnya `http://minipc.nyala-duck.ts.net:8790`. Server web hanya jalan jika ada worker dengan service ini.
 - Login memakai key dari `,worker key` (hanya hash scrypt yang disimpan). Maksimal 5 percobaan salah per 15 menit per IP. Login bertahan 7 hari atau sampai `,worker key reset`.
 - Tiap worker `important` punya tab sendiri. Di ⚙️ Pengaturan: **Hapus semua data** (pesan, media, foto profil worker itu dihapus dari server) dan **Auto-hapus 7 hari** (dicek tiap jam; pesan dan media lebih dari 7 hari dihapus).
+- Di header chat: tombol ⬇️ **Download chat** (file `.txt` berisi `[waktu] nama : pesan`, media ditulis `[stiker]`, `[video]`, dll.) dan toggle **Log** per kontak/grup. Kalau off (abu-abu), pesan baru dari chat itu tidak dicatat sama sekali (termasuk media) sampai dinyalakan lagi.
+- Stiker beraudio: klik untuk putar audio, animasinya ikut mulai dari awal supaya sinkron.
 - Pesan yang diedit, dihapus, atau sekali lihat tampil abu-abu transparan (termasuk medianya) dengan label `edited`, `deleted`, atau `view once`; teks sebelum diedit ikut ditampilkan. Reaksi tampil di bawah bubble beserta nama yang bereaksi. Stiker beraudio diputar sekali saat diklik (tanpa pemutar terpisah, ikon 🔊 di pojok). Menu ⋮ di pojok stiker untuk download: stiker beraudio jadi MP4 dengan audionya, stiker bergerak jadi GIF, stiker diam jadi PNG.
 - Media di atas 50 MB hanya dicatat keterangannya. Pasang dengan `,worker service <id|nomor> important`.
 

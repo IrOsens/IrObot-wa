@@ -258,6 +258,31 @@ export class ImportantWeb {
       json(res, 200, { messages: list, chat, hasMore: list.length >= limit });
       return;
     }
+    // Plain-text export of one chat, downloaded as a .txt file.
+    const exported = rest.match(/^chats\/([^/]+)\/export$/);
+    if (exported && req.method === 'GET') {
+      const jid = decodeURIComponent(exported[1]);
+      const worker = (await this.workers.list()).find((item) => item.id === workerId);
+      const { title, text } = await this.store.exportText(workerId, jid, { meName: worker?.name || '' });
+      const safe = String(title || 'chat').replace(/[^\p{L}\p{N} _.-]+/gu, '').trim().replace(/\s+/g, '_').slice(0, 60) || 'chat';
+      const body = Buffer.from(text, 'utf8');
+      res.writeHead(200, {
+        ...SECURITY_HEADERS,
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Length': body.length,
+        'Content-Disposition': `attachment; filename="chat-${safe}.txt"; filename*=UTF-8''${encodeURIComponent(`chat-${safe}.txt`)}`
+      });
+      res.end(body);
+      return;
+    }
+    // Turn recording of one chat on or off.
+    const logging = rest.match(/^chats\/([^/]+)\/logging$/);
+    if (logging && req.method === 'PUT') {
+      const body = await readJson(req);
+      const chat = await this.store.setLogging(workerId, decodeURIComponent(logging[1]), Boolean(body.enabled));
+      json(res, 200, { ok: true, logging: !chat.paused });
+      return;
+    }
     const media = rest.match(/^media\/([A-Za-z0-9_-]+)$/);
     if (media && req.method === 'GET') {
       const buffer = await this.store.readMedia(workerId, media[1]);

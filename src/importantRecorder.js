@@ -187,6 +187,8 @@ export class ImportantRecorder {
       for (const { message, normalized } of messages) {
         const key = `${normalized.t}:${normalized.chat}:${normalized.id}:${normalized.ts}:${normalized.emoji || ''}`;
         if (this.seen(workerId, key)) continue;
+        // Logging switched off for this chat in the Web UI: store nothing (no media either).
+        if (await this.store.isPaused?.(workerId, normalized.chat)) continue;
         await this.saveOne(workerId, sock, message, normalized);
       }
     });

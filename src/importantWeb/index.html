@@ -62,9 +62,19 @@
             <strong id="chat-name"></strong>
             <span id="chat-sub"></span>
           </div>
+          <div class="chat-actions">
+            <a id="export-chat" class="icon-btn" title="Download chat (.txt)" aria-label="Download chat sebagai txt">
+              <svg viewBox="0 0 24 24"><path d="M11 3h2v9.2l3.3-3.3 1.4 1.4L12 16 6.3 10.3l1.4-1.4 3.3 3.3V3ZM5 18h14v2H5v-2Z"/></svg>
+            </a>
+            <label class="switch" title="Catat log chat ini">
+              <input id="chat-logging" type="checkbox" checked>
+              <span class="slider" aria-hidden="true"></span>
+              <span class="switch-label" id="chat-logging-label">Log</span>
+            </label>
+          </div>
         </header>
         <div id="messages" class="messages"></div>
-        <footer class="readonly">Hanya baca · log dari worker</footer>
+        <footer class="readonly" id="chat-footer">Hanya baca · log dari worker</footer>
       </div>
     </main>
   </div>

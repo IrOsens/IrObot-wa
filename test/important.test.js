@@ -236,6 +236,15 @@ test('web UI requires the key and only serves important workers', async () => {
     assert.deepEqual(exported, [['webp', 'ogg'], ['webp', null]]);
     assert.equal((await fetch(`${base}/api/w/7/sticker/${stickerId}`)).status, 401);
 
+    await store.append(7, { t: 'msg', id: 'T', chat, ts: Date.now() + 1, sender: chat, pushName: 'Budi', kind: 'text', text: 'halo' });
+    const txt = await fetch(`${base}/api/w/7/chats/${encodeURIComponent(chat)}/export`, { headers: auth1 });
+    assert.equal(txt.headers.get('content-type'), 'text/plain; charset=utf-8');
+    assert.match(txt.headers.get('content-disposition'), /attachment; filename="chat-.+\.txt"/);
+    assert.match(await txt.text(), /\] Budi : halo/);
+    const off = await fetch(`${base}/api/w/7/chats/${encodeURIComponent(chat)}/logging`, { method: 'PUT', headers: { ...headers, ...auth1 }, body: JSON.stringify({ enabled: false }) });
+    assert.deepEqual(await off.json(), { ok: true, logging: false });
+    assert.equal(await store.isPaused(7, chat), true);
+
     const put = await fetch(`${base}/api/w/7/retention`, { method: 'PUT', headers: { ...headers, ...auth1 }, body: JSON.stringify({ enabled: true }) });
     assert.equal(put.status, 200);
     assert.equal(retention, true);
@@ -264,4 +273,43 @@ test('sound sticker keeps its audio as a second encrypted media file', async () 
   assert.equal(saved.media.soundSeconds, 4);
   assert.equal((await store.readMedia(6, saved.media.audioId)).toString(), 'ogg');
   assert.match((await store.chats(6))[0].lastPreview, /🔊/);
+});
+
+test('exportText writes [time] name : message with media as labels', async () => {
+  const { store } = await makeStore();
+  const group = '120@g.us';
+  const ts = Date.UTC(2026, 10, 26, 7, 5); // 14:05 WIB
+  await store.setContact(3, '628111@s.whatsapp.net', 'Ani');
+  await store.updateChat(3, group, { name: 'Keluarga' });
+  await store.append(3, { t: 'msg', id: 'A', chat: group, ts, sender: '628111@s.whatsapp.net', kind: 'text', text: 'halo\nsemua' });
+  await store.append(3, { t: 'msg', id: 'B', chat: group, ts: ts + 1000, sender: '99@lid', pushName: 'Budi', kind: 'sticker', text: '', media: {} });
+  await store.append(3, { t: 'msg', id: 'C', chat: group, ts: ts + 2000, sender: 'me', fromMe: true, kind: 'video', text: 'lihat', media: {} });
+  await store.append(3, { t: 'msg', id: 'D', chat: group, ts: ts + 3000, sender: '6281234567@s.whatsapp.net', kind: 'document', text: '', media: { fileName: 'a.pdf' } });
+  await store.append(3, { t: 'del', id: 'D', chat: group, ts: ts + 4000, sender: '6281234567@s.whatsapp.net' });
+  const { title, text } = await store.exportText(3, group, { meName: 'Worker X' });
+  assert.equal(title, 'Keluarga');
+  const rows = text.split('\n').filter((row) => row.startsWith('['));
+  assert.deepEqual(rows, [
+    '[26/11/2026 14:05] Ani : halo',
+    '[26/11/2026 14:05] Budi : [stiker]',
+    '[26/11/2026 14:05] Worker X : [video] lihat',
+    '[26/11/2026 14:05] +6281234567 : [dokumen: a.pdf] (dihapus)'
+  ]);
+  assert.match(text, /\n  semua\n/);
+});
+
+test('recorder skips chats whose logging is switched off', async () => {
+  const { store } = await makeStore();
+  let downloads = 0;
+  const recorder = new ImportantRecorder({ store, fetchImpl: async () => ({ ok: false }), downloadMedia: async () => { downloads += 1; return { buffer: Buffer.from('x') }; } });
+  const sock = { profilePictureUrl: async () => null, groupMetadata: async () => ({}) };
+  const chat = '628@s.whatsapp.net';
+  const message = (id) => ({ key: { remoteJid: chat, id, fromMe: false }, messageTimestamp: 1_700_000_000, message: { imageMessage: { mimetype: 'image/jpeg' } } });
+  await store.setLogging(9, chat, false);
+  await recorder.record(9, sock, { type: 'notify', messages: [message('P1')] });
+  assert.equal((await store.messages(9, chat)).length, 0);
+  assert.equal(downloads, 0);
+  await store.setLogging(9, chat, true);
+  await recorder.record(9, sock, { type: 'notify', messages: [message('P2')] });
+  assert.deepEqual((await store.messages(9, chat)).map((item) => item.id), ['P2']);
 });

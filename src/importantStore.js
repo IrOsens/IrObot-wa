@@ -226,6 +226,7 @@ export class ImportantStore extends EventEmitter {
     const days = (await this.listDays(workerId)).reverse();
     const mods = new Map();
     const found = [];
+    const ids = new Set();
     for (const day of days) {
       const events = await this.readDay(workerId, day);
       for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -238,13 +239,41 @@ export class ImportantStore extends EventEmitter {
           continue;
         }
         if (event.ts >= before) continue;
-        if (found.some((item) => item.id === event.id)) continue;
+        if (ids.has(event.id)) continue;
+        ids.add(event.id);
         found.push(applyMods(event, mods.get(event.id)));
       }
       if (found.length >= limit) break;
     }
     found.sort((a, b) => a.ts - b.ts);
     return found.slice(-limit);
+  }
+
+  // Per chat on/off switch for recording. Off = nothing new is stored for that chat.
+  async setLogging(workerId, jid, enabled) {
+    return this.updateChat(workerId, jid, { paused: enabled ? undefined : true });
+  }
+
+  async isPaused(workerId, jid) {
+    return Boolean((await this.state(workerId)).chats[jid]?.paused);
+  }
+
+  // Whole chat as plain text: "[26/11/2026 14:05] Nama : pesan", media as [stiker], [video], ...
+  async exportText(workerId, jid, { meName = '' } = {}) {
+    const value = await this.state(workerId);
+    const chat = value.chats[jid] || { jid };
+    const list = await this.messages(workerId, jid, { limit: Infinity });
+    const nameOf = (message) => {
+      if (message.fromMe) return meName || 'Saya';
+      const named = value.contacts[message.sender] || message.pushName || value.contacts[message.senderAlt];
+      if (named) return named;
+      if (!chat.isGroup) return chat.name || value.contacts[jid] || chat.pushName || phoneOf(chat.phone || jid);
+      return phoneOf(message.senderAlt || message.sender);
+    };
+    const title = chat.name || value.contacts[jid] || chat.pushName || phoneOf(chat.phone || jid);
+    const rows = [`Chat: ${title}`, `Diekspor: ${exportTime(Date.now())} WIB · ${list.length} pesan`, ''];
+    for (const message of list) rows.push(`[${exportTime(message.ts)}] ${nameOf(message)} : ${exportBody(message)}`);
+    return { title, text: `${rows.join('\n')}\n` };
   }
 
   async saveMedia(workerId, ts, buffer) {
@@ -360,6 +389,34 @@ export function previewOf(event) {
   if (event.kind === 'text') return text.slice(0, 120);
   const label = `${KIND_PREVIEW[event.kind] || KIND_PREVIEW.other}${event.media?.sound ? ' 🔊' : ''}`;
   return text ? `${label} · ${text}`.slice(0, 120) : label;
+}
+
+const EXPORT_LABEL = {
+  image: 'gambar', video: 'video', gif: 'gif', audio: 'audio', voice: 'voice note', sticker: 'stiker',
+  document: 'dokumen', location: 'lokasi', contact: 'kontak', poll: 'polling', other: 'pesan lain'
+};
+const exportFormat = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Jakarta', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false
+});
+const exportTime = (ts) => exportFormat.format(new Date(ts)).replace(',', '');
+const phoneOf = (jid) => {
+  const digits = String(jid || '').split('@')[0].split(':')[0];
+  return /^\d{8,15}$/.test(digits) && !String(jid).endsWith('@lid') ? `+${digits}` : digits;
+};
+
+function exportBody(message) {
+  const text = String(message.text || '').replace(/\r?\n/g, '\n  ').trim();
+  let body = text;
+  if (message.kind !== 'text') {
+    const label = message.kind === 'document' && message.media?.fileName ? `dokumen: ${message.media.fileName}` : EXPORT_LABEL[message.kind] || 'pesan lain';
+    const own = ['contact', 'poll', 'other'].includes(message.kind) ? '' : text;
+    body = `[${label}]${own ? ` ${own}` : ''}`;
+    if (message.kind === 'poll' && text) body = `[polling] ${text}`;
+    if (message.kind === 'contact' && text) body = `[kontak] ${text}`;
+  }
+  if (message.deleted) body += ' (dihapus)';
+  else if (message.edited) body += ' (diedit)';
+  return body;
 }
 
 async function folderSize(dir) {

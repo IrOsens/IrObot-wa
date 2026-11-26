@@ -240,6 +240,7 @@ function renderChats() {
     top.append(el('span', 'name', `${chat.isGroup ? '👥 ' : ''}${chatTitle(chat)}`), el('span', 'time', listTime(chat.lastTs)));
     const bottom = el('div', 'row');
     bottom.append(el('span', 'preview', previewText(chat)));
+    if (chat.paused) bottom.append(el('span', 'paused-tag', '⏸ log off'));
     if (unread) bottom.append(el('span', 'badge', '●'));
     body.append(top, bottom);
     item.append(body);
@@ -294,7 +295,32 @@ function renderChatHeader() {
   }
   if (chat.count) parts.push(`${chat.count} pesan tercatat`);
   $('chat-sub').textContent = parts.join(' · ');
+  $('export-chat').href = `/api/w/${state.workerId}/chats/${encodeURIComponent(chat.jid)}/export`;
+  renderLogging(!chat.paused);
 }
+
+function renderLogging(on) {
+  $('chat-logging').checked = on;
+  $('chat-logging-label').textContent = on ? 'Log on' : 'Log off';
+  const footer = $('chat-footer');
+  footer.textContent = on ? 'Hanya baca · log dari worker' : '⏸ Log chat ini dimatikan · pesan baru tidak dicatat';
+  footer.classList.toggle('paused', !on);
+}
+
+$('chat-logging').addEventListener('change', async (event) => {
+  const enabled = event.target.checked;
+  const jid = state.chatJid;
+  renderLogging(enabled);
+  try {
+    await api(`/api/w/${state.workerId}/chats/${encodeURIComponent(jid)}/logging`, { method: 'PUT', body: JSON.stringify({ enabled }) });
+    const chat = state.chats.find((item) => item.jid === jid);
+    if (chat) chat.paused = enabled ? undefined : true;
+    renderChats();
+  } catch (error) {
+    renderLogging(!enabled);
+    alert(error.message);
+  }
+});
 
 async function loadMessages({ scroll = 'keep', before = null } = {}) {
   const jid = state.chatJid;
@@ -373,16 +399,33 @@ function renderMedia(message, bubble) {
       wrap.append(icon);
       if (media.audioId) {
         let audio = null;
+        let image = null;
+        let frameUrl = '';
         wrap.classList.add('playable');
-        wrap.addEventListener('click', () => {
+        // A fresh blob URL makes the browser decode the sticker again from frame one,
+        // so the animation starts together with the sound.
+        const restartAnimation = async () => {
+          image ||= await fetch(url, { credentials: 'same-origin' }).then((response) => (response.ok ? response.blob() : null)).catch(() => null);
+          if (!image) return;
+          if (frameUrl) URL.revokeObjectURL(frameUrl);
+          frameUrl = URL.createObjectURL(image);
+          await new Promise((resolve) => {
+            img.onload = resolve;
+            img.onerror = resolve;
+            img.src = frameUrl;
+          });
+        };
+        wrap.addEventListener('click', async () => {
           if (!audio) {
             audio = new Audio(mediaUrl({ id: media.audioId }));
+            audio.preload = 'auto';
             audio.loop = false;
             audio.addEventListener('ended', () => wrap.classList.remove('playing'));
             audio.addEventListener('pause', () => wrap.classList.remove('playing'));
           }
           if (!audio.paused) { audio.pause(); return; }
           audio.currentTime = 0;
+          await restartAnimation();
           audio.play().then(() => wrap.classList.add('playing')).catch(() => {});
         });
       }
