@@ -489,6 +489,30 @@ test('makeSticker enlarges small images to 512px and preserves transparent pixel
   }
 });
 
+test('makeSticker reads an automatic title and preserves an explicit title', { skip: process.platform === 'win32' }, async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'sticker-title-test-'));
+  try {
+    const source = path.join(work, 'source.png');
+    const tesseract = path.join(work, 'tesseract');
+    await sharp({ create: { width: 32, height: 32, channels: 3, background: 'white' } }).png().toFile(source);
+    await fs.writeFile(tesseract, `#!/bin/sh\nprintf 'Halo IrO\\n'\n`, { mode: 0o755 });
+    const media = { path: source, mimetype: 'image/png' };
+    for (const [args, expected] of [['q=80', 'Halo IrO'], ['Judul manual,Author', 'Judul manual']]) {
+      const options = parseStickerArgs(args, { defaultAuthor: 'IrO', defaultTitle: null });
+      const sticker = await makeSticker(media, { ...options, tools: { tesseract } });
+      const image = new webp.Image();
+      await image.load(sticker);
+      const metadata = JSON.parse(image.exif.subarray(22).toString());
+      assert.equal(metadata['sticker-pack-name'], expected);
+      assert.equal(metadata['sticker-pack-publisher'], options.author);
+    }
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
+});
+
 test('makeSticker ffmpeg path keeps transparent animated-media pixels', async () => {
   const tools = await detectTools();
   if (!tools.ffmpeg) return;

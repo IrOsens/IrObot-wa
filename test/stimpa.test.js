@@ -8,6 +8,7 @@ import webp from 'node-webpmux';
 import { StimpaSessions, extractOverlay } from '../src/stimpa.js';
 import { decodeStickerFrames } from '../src/sticker.js';
 import { PUBLIC_COMMANDS } from '../src/commandAccess.js';
+import { DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE } from '../src/config.js';
 
 async function animatedSticker(file) {
   const frames = [];
@@ -249,15 +250,47 @@ test('stimpa with only new audio applies configured sticker metadata', async () 
     let sent = null;
     await sessions.finish('chat', 'actor', async () => {}, async (buffer, audio, options) => { sent = { buffer, audio, options }; });
     assert.deepEqual(await sharp(sent.buffer).ensureAlpha().raw().toBuffer(), originalPixels);
-    const image = new (await import('node-webpmux')).default.Image();
+    const image = new webp.Image();
     await image.load(sent.buffer);
     const metadata = JSON.parse(image.exif.subarray(22).toString());
-    const { DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE } = await import('../src/config.js');
     assert.equal(metadata['sticker-pack-publisher'], DEFAULT_STICKER_AUTHOR);
     assert.equal(metadata['sticker-pack-name'], DEFAULT_STICKER_TITLE);
     assert.equal(sent.audio.path, newAudioPath);
     assert.equal(sent.options.isAnimated, false);
     assert.equal(sessions.has('chat'), false);
+  } finally {
+    await sessions.cancel('chat', 'actor');
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('stimpa uses OCR on only the first frame of an animated sticker', { skip: process.platform === 'win32' }, async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'stimpa-ocr-test-'));
+  const tesseract = path.join(dir, 'tesseract');
+  const sessions = new StimpaSessions(tesseract);
+  try {
+    const source = path.join(dir, 'source.webp');
+    await animatedSticker(source);
+    const { width, height, frames } = await decodeStickerFrames(source);
+    await sharp(frames[0].data, { raw: { width, height, channels: 4 } })
+      .resize(1024, 1024).flatten({ background: '#b0b0b0' })
+      .extend({ top: 16, bottom: 16, left: 16, right: 16, background: '#b0b0b0' })
+      .png().toFile(path.join(dir, 'expected.png'));
+    await fs.writeFile(tesseract, `#!/bin/sh
+cmp "$1" "\${0%/*}/expected.png" && printf 'Halo\\nIrO\\n'
+`, { mode: 0o755 });
+    await sessions.start('chat', 'actor', { path: source, type: 'stickerMessage', mimetype: 'image/webp' });
+    const audioPath = path.join(dir, 'audio.ogg');
+    await fs.writeFile(audioPath, 'audio');
+    await sessions.setAudio('chat', { path: audioPath, seconds: 3 });
+    await sessions.finish('chat', 'actor', async () => {}, async (buffer) => {
+      const image = new webp.Image();
+      await image.load(buffer);
+      const metadata = JSON.parse(image.exif.subarray(22).toString());
+      assert.equal(metadata['sticker-pack-name'], 'Halo IrO');
+      assert.equal(metadata['sticker-pack-publisher'], DEFAULT_STICKER_AUTHOR);
+      assert.equal(image.frames.length, 2);
+    });
   } finally {
     await sessions.cancel('chat', 'actor');
     await fs.rm(dir, { recursive: true, force: true });

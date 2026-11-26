@@ -46,6 +46,12 @@ export class WorkerConnection {
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('messages.upsert', (event) => enqueue(this.handlers.onMessages, event));
     sock.ev.on('messages.reaction', (updates) => enqueue(this.handlers.onReactions, updates));
+    if (this.handlers.onContacts) {
+      const onContacts = (contacts) => { try { this.handlers.onContacts(contacts); } catch { /* names are best-effort */ } };
+      sock.ev.on('contacts.upsert', onContacts);
+      sock.ev.on('contacts.update', onContacts);
+      sock.ev.on('messaging-history.set', ({ contacts }) => { if (contacts?.length) onContacts(contacts); });
+    }
     sock.ev.on('connection.update', (update) => this.onConnectionUpdate(sock, update));
   }
 

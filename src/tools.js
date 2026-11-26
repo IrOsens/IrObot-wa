@@ -36,12 +36,18 @@ export async function detectTools() {
       ]
     : ['soffice', 'libreoffice'];
 
-  const [ffmpeg, ffprobe, pdftoppm, magick] = await Promise.all([
+  const [ffmpeg, ffprobe, pdftoppm, magick, tesseractOnPath, ytdlpOnPath] = await Promise.all([
     which('ffmpeg'),
     which('ffprobe'),
     process.platform === 'win32' ? which('pdftoppm.exe') : which('pdftoppm'),
-    process.platform === 'win32' ? which('magick.exe') : which('magick')
+    process.platform === 'win32' ? which('magick.exe') : which('magick'),
+    which('tesseract'),
+    process.platform === 'win32' ? which('yt-dlp.exe') : which('yt-dlp')
   ]);
+  const localTesseract = path.join(os.homedir(), '.local', 'bin', 'tesseract');
+  const tesseract = tesseractOnPath || (process.platform === 'linux' && await fileExists(localTesseract) ? localTesseract : null);
+  const localYtdlp = path.join(os.homedir(), '.local', 'bin', 'yt-dlp');
+  const ytdlp = ytdlpOnPath || (process.platform !== 'win32' && await fileExists(localYtdlp) ? localYtdlp : null);
   let office = null;
   for (const candidate of officeCandidates) {
     if (path.isAbsolute(candidate)) {
@@ -55,7 +61,7 @@ export async function detectTools() {
     }
   }
 
-  return { ffmpeg, ffprobe, office, pdftoppm, magick };
+  return { ffmpeg, ffprobe, office, pdftoppm, magick, tesseract, ytdlp };
 }
 
 export async function runTool(command, args, options = {}) {

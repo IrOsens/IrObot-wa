@@ -2,10 +2,11 @@ import { UserInputError } from './errors.js';
 import fs from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import os from 'node:os';
 import { parse as parseEmoji } from '@twemoji/parser';
 import sharp from 'sharp';
 import webp from 'node-webpmux';
-import { TEMP_DIR, makeTempPath } from './config.js';
+import { DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE, TEMP_DIR, makeTempPath } from './config.js';
 import { cleanupFiles, isLikelyAnimated } from './media.js';
 import { runTool } from './tools.js';
 
@@ -72,17 +73,54 @@ export function buildStickerExif(author, title) {
   return Buffer.concat([header, json]);
 }
 
-async function attachExif(inputPath, author, title) {
-  const outPath = makeTempPath('sticker-exif', '.webp');
-  const img = new webp.Image();
-  await img.load(inputPath);
-  img.exif = buildStickerExif(author, title);
-  await img.save(outPath);
-  return outPath;
+async function readStickerTitle(input, tesseract) {
+  let dir;
+  try {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sticker-ocr-'));
+    const framePath = path.join(dir, 'frame.png');
+    await sharp(input, { page: 0, pages: 1 })
+      .resize({ width: 1024, height: 1024, fit: 'inside' })
+      .flatten({ background: '#b0b0b0' })
+      .extend({ top: 16, bottom: 16, left: 16, right: 16, background: '#b0b0b0' })
+      .png().toFile(framePath);
+    for (const mode of ['11', '6']) {
+      const { stdout } = await runTool(tesseract, [framePath, 'stdout', '-l', 'eng', '--psm', mode], {
+        timeout: 3000, maxBuffer: 32 * 1024, env: { ...process.env, OMP_THREAD_LIMIT: '1' }
+      });
+      const title = stdout.replace(/\s+/g, ' ').trim();
+      if (/[\p{L}\p{N}]/u.test(title)) return title;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
-export async function makeSticker(media, { author, title, tools, quality = 100 }) {
-  const animated = await isAnimatedMedia(media);
+export async function applyStickerMetadata(input, {
+  author = DEFAULT_STICKER_AUTHOR, title, tesseract, fallbackTitle = DEFAULT_STICKER_TITLE
+} = {}) {
+  const detectedTitle = !title && tesseract ? await readStickerTitle(input, tesseract) : null;
+  const image = new webp.Image();
+  await image.load(input);
+  image.exif = buildStickerExif(author, title || detectedTitle || fallbackTitle);
+  return image.save(null);
+}
+
+export async function makeSticker(media, { author, title, tools, quality = 100, animated }) {
+  animated ??= await isAnimatedMedia(media);
+  const metadata = { author, title, tesseract: tools?.tesseract };
+  if (media.type === 'stickerMessage' && isWebpMedia(media) && quality === 100) {
+    const image = new webp.Image();
+    await image.load(media.path);
+    const duration = image.frames?.reduce((ms, frame) => ms + normalizeFrameDelay(frame.delay), 0) || 0;
+    if (image.width === 512 && image.height === 512 && duration <= 10_000
+        && (await fs.stat(media.path)).size <= STICKER_MAX_BYTES) {
+      const sticker = await applyStickerMetadata(media.path, metadata);
+      if (sticker.length <= STICKER_MAX_BYTES) return sticker;
+    }
+  }
   const presets = stickerPresets(animated, quality);
   let smallestOversize = Infinity;
   let lastError = null;
@@ -95,9 +133,14 @@ export async function makeSticker(media, { author, title, tools, quality = 100 }
       if (animated) await renderAnimatedStickerWebp(media, rawSticker, tools, preset);
       else await renderStaticStickerWebp(media, rawSticker, preset);
 
-      const withExif = await attachExif(rawSticker, author, title);
-      temp.push(withExif);
-      const sticker = await fs.readFile(withExif);
+      if (!title && metadata.tesseract) {
+        const { size } = await fs.stat(rawSticker);
+        if (size > STICKER_MAX_BYTES) {
+          smallestOversize = Math.min(smallestOversize, size);
+          continue;
+        }
+      }
+      const sticker = await applyStickerMetadata(rawSticker, metadata);
       if (sticker.length <= STICKER_MAX_BYTES) return sticker;
       smallestOversize = Math.min(smallestOversize, sticker.length);
     } catch (error) {
@@ -222,13 +265,14 @@ export function parseSmemeArgs(args) {
 
 export async function makeSmemeSticker(media, { author, title, tools, smeme }) {
   if (!smeme) throw new Error('Argumen smeme tidak valid.');
+  const metadata = { author, title, tesseract: tools?.tesseract, fallbackTitle: smeme.text };
   const animated = await isAnimatedMedia(media);
   return animated
-    ? makeAnimatedSmemeSticker(media, { author, title, tools, smeme })
-    : makeStaticSmemeSticker(media, { author, title, smeme });
+    ? makeAnimatedSmemeSticker(media, { metadata, tools, smeme })
+    : makeStaticSmemeSticker(media, { metadata, smeme });
 }
 
-async function makeStaticSmemeSticker(media, { author, title, smeme }) {
+async function makeStaticSmemeSticker(media, { metadata, smeme }) {
   const temp = [];
   try {
     const rawSticker = makeTempPath('smeme', '.webp');
@@ -242,15 +286,13 @@ async function makeStaticSmemeSticker(media, { author, title, smeme }) {
       .webp({ quality: SMEME_STYLE.webpQuality })
       .toFile(rawSticker);
 
-    const withExif = await attachExif(rawSticker, author, title);
-    temp.push(withExif);
-    return await fs.readFile(withExif);
+    return await applyStickerMetadata(rawSticker, metadata);
   } finally {
     await cleanupFiles(temp);
   }
 }
 
-async function makeAnimatedSmemeSticker(media, { author, title, tools, smeme }) {
+async function makeAnimatedSmemeSticker(media, { metadata, tools, smeme }) {
   const tempDir = await fs.mkdtemp(path.join(TEMP_DIR, 'smeme-frames-'));
   const framePaths = [];
   const overlayPaths = [];
@@ -267,9 +309,7 @@ async function makeAnimatedSmemeSticker(media, { author, title, tools, smeme }) 
         quality: SMEME_STYLE.webpQuality
       });
 
-      const withExif = await attachExif(rawSticker, author, title);
-      temp.push(withExif);
-      return await fs.readFile(withExif);
+      return await applyStickerMetadata(rawSticker, metadata);
     }
 
     if (!tools.ffmpeg) throw new Error('FFmpeg belum tersedia. Smeme bergerak butuh FFmpeg.');
@@ -309,9 +349,7 @@ async function makeAnimatedSmemeSticker(media, { author, title, tools, smeme }) 
       rawSticker
     ]);
 
-    const withExif = await attachExif(rawSticker, author, title);
-    temp.push(withExif);
-    return await fs.readFile(withExif);
+    return await applyStickerMetadata(rawSticker, metadata);
   } finally {
     await cleanupFiles([...framePaths, ...overlayPaths, ...temp]);
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
@@ -351,6 +389,21 @@ export async function reverseSticker(media, tools) {
 }
 
 // Sound sticker -> regular MP4 with its audio. The visual loops until the audio ends.
+// Download format for a sticker: animated -> GIF, static -> PNG.
+export async function stickerToDownload(media, tools) {
+  const animated = await isAnimatedMedia(media);
+  const outPath = makeTempPath('sticker-download', animated ? '.gif' : '.png');
+  try {
+    if (animated) await animatedWebpToGif(media.path, outPath, tools);
+    else await sharp(media.path, { animated: false }).png().toFile(outPath);
+    return animated
+      ? { buffer: await fs.readFile(outPath), mimetype: 'image/gif', ext: 'gif' }
+      : { buffer: await fs.readFile(outPath), mimetype: 'image/png', ext: 'png' };
+  } finally {
+    await fs.rm(outPath, { force: true }).catch(() => {});
+  }
+}
+
 export async function stickerToAudioVideo(media, audioPath, tools) {
   if (!tools?.ffmpeg) throw new Error('FFmpeg belum tersedia untuk mengubah stiker beraudio menjadi video.');
   const animated = await isAnimatedMedia(media);
@@ -909,7 +962,7 @@ async function animatedWebpToGif(inputPath, outPath, tools) {
 
 export function parseStickerMeta(input, options = {}) {
   const defaultAuthor = options.defaultAuthor || 'IrO';
-  const defaultTitle = options.defaultTitle || ':3';
+  const { defaultTitle = ':3' } = options;
   const text = (Array.isArray(input) ? input.join(' ') : String(input || ''))
     .replace(/https?:\/\/[^\s"'<>]+/gi, '')
     .trim();

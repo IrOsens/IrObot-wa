@@ -74,6 +74,11 @@ export const DEFAULT_APP_CONFIG = {
     enabled: true,
     maxMediaMb: 25
   },
+  important: {
+    root: '',
+    host: '',
+    port: 8790
+  },
   update: {
     restartMode: 'systemctl',
     systemdService: 'irobot-wa.service',
@@ -96,6 +101,9 @@ export const TARGET_CHAT_NAMES = uniqueStrings([
 export const PRIMARY_TARGET_NAME = APP_CONFIG.targets?.primaryGroup || 'IrOBot';
 export const REMINDER_TARGET_NAMES = uniqueStrings([APP_CONFIG.targets?.reminderChat || PRIMARY_TARGET_NAME]);
 export const TASK_TARGET_NAMES = asStringArray(APP_CONFIG.targets?.taskChats, ['dev', PRIMARY_TARGET_NAME]);
+export const IMPORTANT_ROOT = APP_CONFIG.important?.root || path.join(DATA_DIR, 'important');
+export const IMPORTANT_HOST = APP_CONFIG.important?.host || '';
+export const IMPORTANT_PORT = Number(APP_CONFIG.important?.port) || 8790;
 export const DEFAULT_STICKER_AUTHOR = APP_CONFIG.sticker?.defaultAuthor || 'IrO';
 export const DEFAULT_STICKER_TITLE = APP_CONFIG.sticker?.defaultTitle || ':3';
 export const PDF_DEFAULT_FILE_NAME = APP_CONFIG.pdf?.defaultFileName || BOT_NAME;

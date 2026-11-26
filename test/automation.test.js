@@ -198,7 +198,7 @@ test('bot integration: local status, owner listening, prompt priority, error rou
     setErrorSink(async (title, meta) => errors.push(meta));
     await handleFailure(new Error('download failed'), { jid: '9@g.us' });
     assert.equal(sent.length, before); assert.equal(errors.length, 1);
-    await handleFailure(new UserInputError('Format salah'), { jid: '9@g.us' }); assert.equal(sent.at(-1).content.text, 'Format salah');
+    await handleFailure(new UserInputError('Format salah'), { jid: '9@g.us' }); assert.equal(sent.at(-1).content.text, '⚠️ Format salah');
     await handleSetup({ key: { remoteJid: phone } }, { args: ['statussave', 'group', '123@g.us'] }, { isOwner: true, actorJid: phone });
     assert.equal(state.runtimeConfig.storageTarget('statussave').mode, 'group');
     state.groups.set('dev@g.us', { id: 'dev@g.us', subject: 'dev' });

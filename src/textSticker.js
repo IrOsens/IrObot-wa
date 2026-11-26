@@ -1,9 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
-import webp from 'node-webpmux';
-import { DATA_DIR, DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE } from './config.js';
-import { buildStickerExif } from './sticker.js';
+import { DATA_DIR } from './config.js';
+import { applyStickerMetadata } from './sticker.js';
 import { UserInputError } from './errors.js';
 
 const CANVAS = 512;
@@ -65,8 +64,6 @@ export async function makeTextSticker({ text, align = 'left', fontfile = path.jo
   const card = Buffer.from('<svg width="512" height="512"><rect x="16" y="16" width="480" height="480" rx="18" fill="white"/></svg>');
   const buffer = await sharp(card).composite([{ input: softText }])
     .webp({ quality: 19, alphaQuality: 100, effort: 4 }).toBuffer();
-  const sticker = new webp.Image();
-  await sticker.load(buffer);
-  sticker.exif = buildStickerExif(DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE);
-  return { buffer: await sticker.save(null), fontSize: chosen.size, textHeight: chosen.info.height };
+  const sticker = await applyStickerMetadata(buffer, { title: text.replace(/\s+/g, ' ').trim() });
+  return { buffer: sticker, fontSize: chosen.size, textHeight: chosen.info.height };
 }

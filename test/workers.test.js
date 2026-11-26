@@ -21,6 +21,9 @@ import { UserInputError } from '../src/errors.js';
 import { CommandAccessStore } from '../src/commandAccess.js';
 import { state, workerRuntimes, workerScope, createWorkerScope, onWorkerMessageUpsert, onWorkerReactions, onMessageUpsert } from '../src/index.js';
 
+// Keeps worker ,help offline in tests: the help GIF is already "cached".
+state.workerHelpGif = Buffer.from('gif');
+
 const tmp = () => fs.mkdtemp(path.join(os.tmpdir(), 'iro-workers-'));
 const workerPhone = '628111111111@s.whatsapp.net';
 const customer = '628222222222@s.whatsapp.net';
@@ -52,7 +55,8 @@ test('reply limiter allows two replies per window and then blocks', () => {
 test('worker command access follows service and default command setting', () => {
   const plain = { service: null };
   assert.equal(workerCommandAllowed(plain, 's'), true);
-  assert.equal(workerCommandAllowed(plain, 'note'), true);
+  assert.equal(workerCommandAllowed(plain, 'note'), false);
+  assert.equal(workerCommandAllowed(plain, 'dl'), true);
   assert.equal(workerCommandAllowed(plain, 'cinta'), false);
   assert.equal(workerCommandAllowed(plain, 'backup'), false);
   assert.equal(workerCommandAllowed(plain, 'worker'), false);
@@ -167,7 +171,8 @@ test('worker messages are answered through the worker socket only', async () => 
     assert.equal(workerSent.length, 3);
 
     await deliver(incoming(',status', { remoteJid: workerPhone, fromMe: true }));
-    assert.match(workerSent.at(-1).content.text, /Status worker #1/);
+    assert.match(workerSent.at(-1).content.text, /\*Worker #1\*/);
+    assert.ok(!/Service/i.test(workerSent.at(-1).content.text));
     await deliver(incoming(',backup', { remoteJid: workerPhone, fromMe: true }));
     assert.match(workerSent.at(-1).content.text, /tidak tersedia untuk worker/);
     assert.equal(ownerSent.length, 0);
@@ -236,7 +241,7 @@ test('jadibot request notifies the owner and can be rejected by replying to the 
     assert.match(sent.at(-1).content.text, /baru saja ditolak/);
 
     await send({ remoteJid: ownerJid, fromMe: true }, { conversation: ',jadibot kode' });
-    assert.match(sent.at(-1).content.text, /Format: ,jadibot kode <nomor calon worker>/);
+    assert.match(sent.at(-1).content.text, /Format: `,jadibot kode <nomor calon worker>`/);
 
     await state.workerStore.create({ phoneJid: workerPhone, name: 'Tako' });
     await send({ remoteJid: ownerJid, fromMe: true }, { conversation: ',jadibot kode 08111111111' });
@@ -342,8 +347,9 @@ test('admin session runs worker commands from the owner account in any chat with
 
     await send(groupJid, ',help');
     assert.equal(ownerSent.at(-1).jid, groupJid);
-    assert.ok(ownerSent.at(-1).content.text.startsWith(`${header}\n`));
-    assert.match(ownerSent.at(-1).content.text, /,cinta/);
+    assert.equal(ownerSent.at(-1).content.gifPlayback, true);
+    assert.ok(ownerSent.at(-1).content.caption.startsWith(`${header}\n`));
+    assert.match(ownerSent.at(-1).content.caption, /,cinta/);
 
     await send(groupJid, ',backup');
     assert.match(ownerSent.at(-1).content.text, /tidak tersedia untuk worker ini/);
@@ -541,8 +547,8 @@ test('audit service is passive for the worker and only answers admin commands fr
     assert.match(ownerSent.at(-1).content.text, /tidak berada di grup ini/);
 
     await admin(groupJid, ',help');
-    assert.match(ownerSent.at(-1).content.text, /,test/);
-    assert.ok(!/,cinta/.test(ownerSent.at(-1).content.text));
+    assert.match(ownerSent.at(-1).content.caption, /,test/);
+    assert.ok(!/,cinta/.test(ownerSent.at(-1).content.caption));
     assert.equal(workerSent.length, sentBefore);
 
     await admin(groupJid, ',cinta');

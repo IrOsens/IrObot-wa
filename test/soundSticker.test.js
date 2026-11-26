@@ -122,3 +122,22 @@ test('sound sticker cache drops the oldest entries past its limit', () => {
   assert.equal(cache.find({ remoteJid: 'j', id: 'A' }), null);
   assert.ok(cache.find({ remoteJid: 'j', id: 'C' }));
 });
+
+test('sound sticker cache can restore quoted audio after a restart', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sound-cache-'));
+  const file = path.join(dir, 'cache.json');
+  try {
+    const message = { key: { remoteJid: 'g@g.us', id: 'ABC' } };
+    const cache = new SoundStickerAudioCache({ file });
+    cache.remember(message, soundSticker());
+    await cache.save();
+    const restarted = new SoundStickerAudioCache({ file });
+    await restarted.load();
+    const quoted = { type: 'stickerMessage', node: {}, sourceMessage: message };
+    assert.equal(restarted.attach(quoted), true);
+    assert.equal(stickerAudioOf(quoted).directPath, '/v/a');
+    assert.deepEqual(Buffer.from(stickerAudioOf(quoted).mediaKey), Buffer.alloc(32, 1));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});

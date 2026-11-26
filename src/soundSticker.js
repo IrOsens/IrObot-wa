@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { generateWAMessage, prepareWAMessageMedia, proto } from 'baileys';
 import { makeTempPath } from './config.js';
 import { UserInputError } from './errors.js';
@@ -226,6 +227,18 @@ export async function audioFromMedia(sock, tools, media) {
     if (media.type === 'stickerMessage') {
       source = await downloadStickerAudio(sock, media);
       if (!source) throw new UserInputError('Audio stiker tidak bisa diunduh.');
+      const seconds = Number(stickerAudioOf(media).seconds);
+      const { size } = await fs.stat(source.path);
+      if (seconds > 0 && seconds <= AUDIO_MAX_MS / 1000 && size <= AUDIO_MAX_BYTES) {
+        const file = await fs.open(source.path, 'r');
+        const header = Buffer.alloc(64);
+        try { await file.read(header); } finally { await file.close(); }
+        if (header.toString('ascii', 0, 4) === 'OggS' && header.includes('OpusHead')) {
+          const audio = { path: source.path, seconds };
+          source = media;
+          return audio;
+        }
+      }
     }
     return await prepareStickerAudio(tools, source.path);
   } finally {
@@ -244,10 +257,43 @@ export function parseStickerAudioFlag(rawArgs) {
 // dropped from the quote), so keep the audio of every sound sticker the bot sees and
 // look it up by the quoted stanza id.
 export class SoundStickerAudioCache {
-  constructor({ max = 500, ttlMs = 24 * 60 * 60 * 1000 } = {}) {
+  constructor({ max = 500, ttlMs = 24 * 60 * 60 * 1000, file = null, onError } = {}) {
     this.max = max;
     this.ttlMs = ttlMs;
     this.entries = new Map();
+    this.file = file;
+    this.onError = onError;
+    this.pending = Promise.resolve();
+  }
+
+  async load() {
+    if (!this.file) return;
+    try {
+      const entries = JSON.parse(await fs.readFile(this.file, 'utf8'));
+      for (const { id, audio, emoji, seenAt } of entries.slice(-this.max)) {
+        if (!id || !Number.isFinite(seenAt) || Date.now() - seenAt > this.ttlMs) continue;
+        this.entries.set(id, { audio: proto.Message.AudioMessage.decode(Buffer.from(audio, 'base64')), emoji, seenAt });
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') await this.onError?.(error);
+    }
+  }
+
+  save() {
+    clearTimeout(this.timer);
+    if (!this.file) return this.pending;
+    this.pending = this.pending.catch(() => {}).then(async () => {
+      const entries = [];
+      for (const [id, { audio, emoji, seenAt }] of this.entries) {
+        if (Date.now() - seenAt > this.ttlMs) continue;
+        entries.push({ id, emoji, seenAt, audio: Buffer.from(proto.Message.AudioMessage.encode(audio).finish()).toString('base64') });
+      }
+      await fs.mkdir(path.dirname(this.file), { recursive: true });
+      const temp = `${this.file}.${process.pid}.tmp`;
+      await fs.writeFile(temp, JSON.stringify(entries), { mode: 0o600 });
+      await fs.rename(temp, this.file);
+    });
+    return this.pending;
   }
 
   static keyOf(key) {
@@ -261,6 +307,11 @@ export class SoundStickerAudioCache {
     this.entries.delete(id);
     this.entries.set(id, { audio, emoji: stickerNode.soundEmoji || null, seenAt: Date.now() });
     while (this.entries.size > this.max) this.entries.delete(this.entries.keys().next().value);
+    if (this.file) {
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => this.save().catch((error) => this.onError?.(error)), 500);
+      this.timer.unref?.();
+    }
     return true;
   }
 

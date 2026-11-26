@@ -17,6 +17,8 @@ async function main() {
   line('Node', process.version);
   line('ffmpeg', tools.ffmpeg || 'missing');
   line('ffprobe', tools.ffprobe || 'missing');
+  line('Tesseract (judul stiker otomatis)', tools.tesseract || 'missing');
+  line('yt-dlp (link sosmed ,stimpa)', tools.ytdlp || 'missing');
   line('LibreOffice/soffice', tools.office || 'missing');
   line('Target primary group', APP_CONFIG.targets?.primaryGroup || 'missing');
   line('Backup destination default', APP_CONFIG.destinations?.backup || 'backup');
@@ -32,7 +34,7 @@ async function main() {
     return;
   }
 
-  console.log('Semua tool opsional terdeteksi. Fitur penuh siap dipakai.');
+  console.log('Tool media dan Office terdeteksi.');
 }
 
 main().catch((error) => {

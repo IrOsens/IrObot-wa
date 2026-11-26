@@ -22,6 +22,7 @@ Opsional untuk fitur penuh:
 - `ffprobe`
 - `libreoffice` atau `soffice`
 - `pdftoppm` dari Poppler atau ImageMagick `magick` untuk fallback `,toimg`
+- `tesseract` dengan data bahasa `eng` untuk membaca teks dari gambar stiker. Pasang untuk akun yang menjalankan bot. Di Debian/Ubuntu, `npm run setup:full` memasangnya bersama alat sistem lain, atau jalankan `sudo apt install tesseract-ocr tesseract-ocr-eng` dan restart bot.
 
 ## Setup Cepat
 
@@ -133,12 +134,12 @@ systemctl --user disable --now irobot-wa
 
 ## Command
 
-- Media: `,s`, `,stext`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,toimg`, `,tovideo`, `,stimpa`
+- Media: `,s`, `,stext`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,toimg`, `,tovideo`, `,stimpa`, `,dl` (alias `,yt`, `,ig`, `,tt`)
 - Reminder/task: `,task list|add|loop|repeat|record|pause|stop|resume|del`, `,remindme <teks> <durasi>`
 - Save: `,save`, `,save update`, `,load`, `,load <id|judul>`, `,load del <id|judul>`, `,load rename <id|judul> <judul-baru>`
 - Note/link: `,note list|add|get|del|rename`, `,link list|add|get|del|rename`
 - Utility: `,info`, `,typing`, `,status`, `,status bot`, `,health`, `,wol`, `,backup`, `,restore`, `,clear`, `,update`, `,pull`, `,restartbot`, `,allow`, `,admin`, `,pause`, `,resume`, `,anticall`, `,changedmsg`, `,statussave`, `,config`, `,log`, `,net`, `,button`
-- Worker: `,jadibot`, `,jadibot kode`, `,worker list|info|session|exit|service|default`, `,cinta`
+- Worker: `,jadibot`, `,jadibot kode`, `,worker list|info|session|exit|service|default|key`, `,cinta`
 - Session: `,end`, `,cancel`, `,confirm`
 
 ## Catatan Fitur
@@ -156,7 +157,9 @@ Sticker:
 
 - `,s` memakai kualitas maksimum secara default dan membuat canvas 512x512 dengan padding transparan.
 - Gunakan `q=1-100` untuk memilih kualitas, contoh `,s q=80` atau `,s Judul,Author q=80`.
+- Judul otomatis memakai teks dari gambar hasil `,s`, `,stimpa`, atau `,smeme`. Untuk stiker bergerak, hanya frame pertama yang diperiksa. `,stext` memakai teks yang diketik, dan `,smeme` memakai teks meme jika OCR tidak membacanya. Jika teks tidak ditemukan, judul memakai `sticker.defaultTitle`. Judul yang ditulis manual lewat `,s` tetap dipakai.
 - Bot hanya menurunkan kualitas/resolusi lebih lanjut jika diperlukan agar ukuran sticker dapat dikirim WhatsApp.
+- Jika stiker sumber punya audio, `,s` membawa audio itu. Untuk reply ke stiker lama yang audionya belum pernah diterima bot, kirim ulang stiker ke chat sebelum memakai `,s`.
 
 QR code:
 
@@ -229,6 +232,9 @@ Stiker bergerak dengan gambar edit:
 - Edit kanvas itu di WhatsApp dengan teks, coretan, atau gambar; kirim satu atau beberapa gambar hasil edit tanpa memotong gambar. Bot hanya menerima gambar yang cocok dengan kanvas sesi dan menumpuk edit dari semuanya. Gambar yang tidak cocok dilewati.
 - Ketik `,end` atau beri reaksi ✅/👍/❤️ pada prompt sesi. Bot menaruh gabungan perubahan pada setiap frame asli, lalu mengirim stiker WebP bergerak. `,cancel` atau ❌/👎/❎ membatalkan. Pemilik sesi dan nomor admin/host dapat mengakhiri/membatalkan sesi; pengguna lain tidak bisa.
 - Lapisan edit tetap pada posisi yang sama sementara animasi asli berjalan. Menghapus bagian asli atau menggerakkan lapisan edit secara terpisah belum didukung.
+- Audio stiker bisa diambil dari link: `,stimpa <link>` sambil reply stiker, atau kirim link di dalam sesi. Link bisa file mp3/video langsung, atau link sosmed (TikTok, Instagram, YouTube, X, Facebook, Threads, SoundCloud, dll.) yang diunduh dengan `yt-dlp`. Tambahkan waktu mulai untuk mengambil 10 detik dari bagian tertentu, contoh `,stimpa https://youtu.be/xxxx 1:05`.
+- `,dl <link>` mengunduh video (maks 720p, 64 MB) atau semua foto carousel (maks 10) dari TikTok, Instagram, YouTube, dll. lalu mengirimnya ke chat. `,dl <link> mp3` hanya audio. Bisa juga reply pesan berisi link. Folder unduhan langsung dihapus setelah terkirim.
+- Hanya potongan pendek yang diunduh, ke folder sementara sendiri di `temp/`. Folder itu langsung dihapus setelah audio jadi (berhasil atau gagal). `yt-dlp` dipasang oleh `npm run setup:full` ke `~/.local/bin/yt-dlp`; cek dengan `npm run doctor`. Kalau belum ada, bot mencarinya lagi saat `,dl`/`,stimpa` dipakai (tanpa restart) dan memasangnya sendiri ke `~/.local/bin` bila perlu. Perintah `npm run ...` harus dijalankan di folder bot (`cd ~/projects/IrObot-wa`).
 
 Anticall:
 
@@ -321,10 +327,12 @@ Command owner:
 - `,worker service list`: daftar service yang tersedia.
 - `,worker service <id|nomor> <nama|off>`: pasang atau lepas service.
 - `,worker default <id|nomor> on|off`: izinkan command default untuk worker yang memakai service.
+- `,worker key`: buat key login Web UI service `important` (ditampilkan sekali). `,worker key reset` membuat key baru dan mengeluarkan semua login lama.
 
 Command worker (diketik dari akun worker sendiri, misalnya di chat "Pesan ke diri sendiri"):
 
-- Tanpa service: `,help`, `,status`, `,s`, `,stext`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,tovideo`, `,stimpa`, `,toimg`, `,note`, `,link`, `,end`, `,cancel`, `,confirm`.
+- Tanpa service: `,help`, `,status`, `,s`, `,stext`, `,smeme`, `,resend`, `,qr`, `,topdf`, `,tovideo`, `,stimpa`, `,toimg`, `,dl`/`,yt`/`,ig`/`,tt`, `,end`, `,cancel`, `,confirm`. Note/link tidak tersedia untuk worker.
+- `,help` di worker dikirim sebagai GIF dengan daftar command sebagai caption (GIF di-cache di `data/worker-help.mp4`). `,status` worker hanya menampilkan koneksi dan nomor, tanpa info service.
 - Dengan service: hanya `,help`, `,status`, command service, dan kontrol sesi, kecuali owner mengaktifkan `,worker default`.
 - Pesan dari orang lain ke nomor worker tidak menjalankan command; hanya service (misalnya `cinta`) yang membalas.
 
@@ -345,6 +353,16 @@ Service `audit`:
 - Hanya admin yang menjalankan command lewat `,worker session <id>`. Contoh `,test`: jika admin mengetik `,test` di grup yang sama dengan worker, atau di DM dengan nomor worker, worker membalas `test` dari nomornya sendiri. Di DM, balasan dikirim ke admin.
 - Jika chat itu bukan DM dengan worker atau grup yang diikuti worker, admin diberi tahu bahwa worker bukan peserta chat tersebut dan tidak ada yang dikirim. `,help` di sesi audit menampilkan `,test`.
 - Pasang dengan `,worker service <id|nomor> audit`.
+
+Service `important`:
+
+- Pasif: semua pesan masuk dan keluar worker (teks, foto, video, stiker, audio/VN, dokumen, lokasi, kontak, polling, view-once), termasuk pesan yang dikirim dari HP worker sendiri, dicatat beserta waktu, balasan (quote), edit, hapus, reaksi, nama kontak, foto profil, dan nama grup.
+- Data disimpan terenkripsi AES-256-GCM di `important.root` (`data/config.json`, contoh `/home/iro/hdd25/services/IrObot-wa/important/<id worker>/`). Kunci enkripsi ada di `data/important-secret.json` (di luar disk data, mode 600), jadi file di HDD tidak bisa dibaca sendiri. Jangan hapus file kunci itu: tanpa kunci, data lama tidak bisa dibuka.
+- Web UI mirip WhatsApp Web di port `important.port` (default `8790`), hanya listen di IP Tailscale (`tailscale ip -4`), misalnya `http://minipc.nyala-duck.ts.net:8790`. Server web hanya jalan jika ada worker dengan service ini.
+- Login memakai key dari `,worker key` (hanya hash scrypt yang disimpan). Maksimal 5 percobaan salah per 15 menit per IP. Login bertahan 7 hari atau sampai `,worker key reset`.
+- Tiap worker `important` punya tab sendiri. Di ⚙️ Pengaturan: **Hapus semua data** (pesan, media, foto profil worker itu dihapus dari server) dan **Auto-hapus 7 hari** (dicek tiap jam; pesan dan media lebih dari 7 hari dihapus).
+- Pesan yang diedit, dihapus, atau sekali lihat tampil abu-abu transparan (termasuk medianya) dengan label `edited`, `deleted`, atau `view once`; teks sebelum diedit ikut ditampilkan. Reaksi tampil di bawah bubble beserta nama yang bereaksi. Stiker beraudio diputar sekali saat diklik (tanpa pemutar terpisah, ikon 🔊 di pojok). Menu ⋮ di pojok stiker untuk download: stiker beraudio jadi MP4 dengan audionya, stiker bergerak jadi GIF, stiker diam jadi PNG.
+- Media di atas 50 MB hanya dicatat keterangannya. Pasang dengan `,worker service <id|nomor> important`.
 
 Pengaman anti-banned (khusus worker):
 

@@ -2,11 +2,11 @@ import { UserInputError } from './errors.js';
 
 export const WORKER_BASE_COMMANDS = new Set(['help', 'status', 'end', 'cancel', 'confirm', 'allow']);
 export const WORKER_DEFAULT_COMMANDS = new Set([
-  's', 'stext', 'smeme', 'rs', 'resend', 'qr', 'topdf', 'tovideo', 'stimpa', 'toimg', 'note', 'link'
+  's', 'stext', 'smeme', 'rs', 'resend', 'qr', 'topdf', 'tovideo', 'stimpa', 'toimg', 'dl', 'yt', 'ig', 'tt'
 ]);
 
 // Commands other people may use in a chat the worker operator opened with ,allow here on.
-export const WORKER_PUBLIC_COMMANDS = new Set(['help', 's', 'stext', 'smeme', 'rs', 'resend', 'qr', 'tovideo', 'stimpa']);
+export const WORKER_PUBLIC_COMMANDS = new Set(['help', 's', 'stext', 'smeme', 'rs', 'resend', 'qr', 'tovideo', 'stimpa', 'dl', 'yt', 'ig', 'tt']);
 
 export const WORKER_PUBLIC_CHAT_LIMIT = 2;
 
@@ -15,6 +15,11 @@ export const WORKER_SERVICES = [
     name: 'cinta',
     description: 'Balas otomatis gambar menu + caption saat pesan berisi trigger pemesanan.',
     commands: ['cinta']
+  },
+  {
+    name: 'important',
+    description: 'Pasif: semua chat masuk & keluar dicatat terenkripsi dan bisa dibuka di Web UI (key: ,worker key).',
+    commands: []
   },
   {
     name: 'audit',
@@ -77,11 +82,12 @@ export function findWorkerService(name) {
 
 export function formatWorkerServiceList() {
   return [
-    '*Service worker*',
-    ...WORKER_SERVICES.map((service) => `- ${service.name}: ${service.description}`),
+    '🧩 *Service worker*',
     '',
-    'Pasang: ,worker service <id|nomor> <nama>',
-    'Lepas: ,worker service <id|nomor> off'
+    ...WORKER_SERVICES.map((service) => `• *${service.name}*: ${service.description}`),
+    '',
+    '▸ Pasang: `,worker service <id|nomor> <nama>`',
+    '▸ Lepas: `,worker service <id|nomor> off`'
   ].join('\n');
 }
 

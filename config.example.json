@@ -46,6 +46,11 @@
     "enabled": true,
     "maxMediaMb": 25
   },
+  "important": {
+    "root": "/home/iro/hdd25/services/IrObot-wa/important",
+    "host": "",
+    "port": 8790
+  },
   "update": {
     "restartMode": "systemctl",
     "systemdService": "irobot-wa.service",

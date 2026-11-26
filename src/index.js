@@ -32,7 +32,9 @@ import {
   BOT_NAME,
   COMMAND_PREFIX,
   DEFAULT_STICKER_AUTHOR,
-  DEFAULT_STICKER_TITLE,
+  IMPORTANT_HOST,
+  IMPORTANT_PORT,
+  IMPORTANT_ROOT,
   LINKS_FILE,
   LOG_DIR,
   NOTES_FILE,
@@ -49,6 +51,7 @@ import {
   WOL_FILE,
   WORKERS_PENDING_DIR,
   cleanupStartupTemp,
+  makeTempPath,
   ensureRuntimeDirs
 } from './config.js';
 import { cleanupOldLogs, logger, setErrorSink } from './logger.js';
@@ -65,7 +68,7 @@ import {
   mediaNode,
   quotedMediaNode
 } from './media.js';
-import { isAnimatedMedia, makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerArgs, reverseSticker, stickerToAudioVideo } from './sticker.js';
+import { isAnimatedMedia, makeSmemeSticker, makeSticker, parseSmemeArgs, parseStickerArgs, reverseSticker, stickerToAudioVideo, stickerToDownload } from './sticker.js';
 import {
   SoundStickerAudioCache, audioFromMedia, downloadStickerAudio, isAudioSourceMedia, parseStickerAudioFlag, sendSoundSticker, stickerAudioOf
 } from './soundSticker.js';
@@ -74,6 +77,13 @@ import { TaskRecorder, TaskScheduler, createTask, formatTaskList, formatWib, lis
 import { PdfSessions, parsePdfOrderText, parsePdfStartArgs } from './pdf.js';
 import { ToVideoSessions, parseToVideoOptions, videoMediaKind } from './toVideo.js';
 import { StimpaSessions } from './stimpa.js';
+import { isSocialUrl, startTimeFromArgs, withSocialAudio, withSocialDownload } from './socialAudio.js';
+import { ImportantStore, ImportantVault } from './importantStore.js';
+import { ImportantRecorder } from './importantRecorder.js';
+import { ImportantAuth } from './importantAuth.js';
+import { ImportantWeb } from './importantWeb.js';
+import { TAILSCALE_HOSTNAME } from './services.js';
+import { ICON, botText, card, cmd, hint as replyHint, monoCommands, progress as progressText, userErrorText } from './reply.js';
 import { pdfToImages } from './pdfImages.js';
 import {
   SaveRecorder,
@@ -296,7 +306,7 @@ const ownerState = {
   tools: null,
   chatDirectory: new ChatDirectory(),
   viewOnceCache: new ViewOnceCache(),
-  soundStickerCache: new SoundStickerAudioCache(),
+  soundStickerCache: createSoundStickerCache(path.join(ROOT_DIR, 'data')),
   forwardedViewOnceReactions: new Set(),
   scheduler: null,
   reminderScheduler: null,
@@ -323,7 +333,9 @@ const ownerState = {
   notesFile: NOTES_FILE,
   linksFile: LINKS_FILE,
   promptKeysFile: path.join(ROOT_DIR, 'data', 'prompt-keys.json'),
-  workerStore: null
+  workerStore: null,
+  important: null,
+  workerHelpGif: null
 };
 
 // While a worker message is handled, state.<key> reads the worker's own value
@@ -434,7 +446,9 @@ async function sendStickerResult(jid, sticker, { isAnimated = false, audio = nul
   const messageId = generateMessageIDV2(ownUserJid());
   rememberOwnOutput({ key: { id: messageId } });
   try {
-    return await sendSoundSticker(state.sock, jid, sticker, audio, { isAnimated, messageId });
+    const sent = await sendSoundSticker(state.sock, jid, sticker, audio, { isAnimated, messageId });
+    rememberSoundSticker(sent);
+    return sent;
   } catch (error) {
     if (strict) throw error;
     await logger.warn('Sound sticker send failed; sending without audio', { jid, error: error?.message });
@@ -442,7 +456,13 @@ async function sendStickerResult(jid, sticker, { isAnimated = false, audio = nul
   }
 }
 
-// Downloads and normalizes the audio of a sound sticker; null when it has none or it fails.
+function createSoundStickerCache(dataDir) {
+  return new SoundStickerAudioCache({
+    file: path.join(dataDir, 'sound-sticker-cache.json'),
+    onError: (error) => logger.warn('Sound sticker cache unavailable', { error: error.message })
+  });
+}
+
 function rememberSoundSticker(message) {
   const found = mediaNode(message);
   if (found?.type === 'stickerMessage') state.soundStickerCache?.remember(message, found.node);
@@ -451,19 +471,18 @@ function rememberSoundSticker(message) {
 // A replied sticker's quote usually lacks the sound; restore it from the cached original.
 function withCachedStickerAudio(media) {
   if (media?.type !== 'stickerMessage' || stickerAudioOf(media)) return media;
-  if (!state.soundStickerCache?.attach(media)) {
-    void logger.warn('Sticker has no sound in message or cache', { id: media.sourceMessage?.key?.id || null }).catch?.(() => {});
-  }
+  state.soundStickerCache?.attach(media);
   return media;
 }
 
-async function sourceStickerAudio(media) {
+async function sourceStickerAudio(media, { strict = false } = {}) {
   withCachedStickerAudio(media);
   if (!stickerAudioOf(media)) return null;
   try {
     return await audioFromMedia(state.sock, state.tools, media);
   } catch (error) {
     await logger.warn('Sticker audio unavailable', { error: error?.message });
+    if (strict) throw new UserInputError('Audio stiker sumber gagal diproses. Coba kirim ulang stiker sumber.');
     return null;
   }
 }
@@ -500,6 +519,7 @@ const HELP_SECTIONS = [
       { name: 'topdf', text: ',topdf    Gabung gambar/dokumen jadi PDF' },
       { name: 'tovideo', text: ',tovideo  Ubah gambar/video jadi MP4 atau GIF' },
       { name: 'stimpa', text: ',stimpa   Timpa stiker dengan gambar edit atau audio baru' },
+      { name: 'dl', text: ',dl       Download video/foto TikTok, IG, YouTube' },
       { name: 'toimg', text: ',toimg    Ubah PDF jadi gambar' }
     ]
   },
@@ -575,6 +595,9 @@ const HELP_SECTIONS = [
 
 const HELP_ALIASES = {
   rs: 'resend',
+  yt: 'dl',
+  ig: 'dl',
+  tt: 'dl',
   won: 'wol',
   ltask: 'task'
 };
@@ -582,7 +605,7 @@ const HELP_ALIASES = {
 const HELP_DETAILS = {
   setup: ['Format: ,setup [statussave|backup|logs|changedmsg|errors]', ',setup root <path-server>', ',setup <fitur> group <nama-grup|jid>', ',setup <fitur> local [path]', 'Satu tujuan aktif per fitur. Error teknis selalu memakai grup.'],
   stext: ['Format: ,stext [align=justify|left|right|center] <teks>', 'Default rata kiri dengan jarak huruf normal; alias: kiri, kanan, tengah, kiri-kanan.', 'Stiker 512×512, Arial hitam, panel putih membulat, low quality sedikit buram. Ukuran font otomatis menyesuaikan isi.', 'Contoh: ,stext align=center Halo dunia'],
-  help: ['Format: ,help <command>', 'Contoh: ,help s, ,help task.'],
+  help: ['Format: ,help <command>', 'Contoh: ,help s, ,help dl.'],
   s: ['Format: ,s [q=1-100]', 'Format: ,s <title>,<author> [q=1-100]', 'Format: ,s -a [title,author] [q=1-100]: reply video (mp4), stiker langsung jadi dengan audio videonya.', 'Default q=100. Kualitas/resolusi hanya diturunkan jika perlu agar ukuran sticker bisa dikirim.', 'Kirim/reply media atau sertakan URL media. Stiker beraudio yang di-,s ulang tetap membawa audionya.', 'Untuk memasukkan audio lain ke stiker, pakai ,stimpa.'],
   smeme: ['Format: ,smeme up <teks>', 'Format: ,smeme down <teks>', 'Advanced: tambah kualitas 1-99 di akhir.', 'Audio stiker beraudio tetap ikut.'],
   resend: ['Format: ,resend', 'Legacy: ,rs', 'Reply media/view-once. Sticker statis dikirim sebagai PNG, sticker bergerak sebagai GIF.', 'Sticker beraudio dikirim sebagai video MP4 dengan audionya.'],
@@ -591,7 +614,8 @@ const HELP_DETAILS = {
   serverinfo: ['Format: ,serverinfo', 'Menampilkan spesifikasi server lengkap: OS, CPU, RAM, disk, network, Node.js, dan proses bot.'],
   topdf: ['Format: ,topdf [--name "nama"] [--split] [--max-size 1MB | --target-size 2MB]', '--max-size: batas maksimum; --target-size: ukuran tepat, maksimal 100MB.', 'Target tepat dapat menambahkan padding tanpa meningkatkan kualitas. Kompresi PDF dapat mengubah teks menjadi gambar.', 'Nama berspasi wajib dikutip dalam mode flag. Jangan campur flag dengan format lama.', 'Legacy: ,topdf nama max 1MB, ,topdf split nama, dan ,topdf nama,1MB tetap didukung.', 'Kirim/reply media setelah sesi dimulai. Selesai pakai ,end. Batal pakai ,cancel.'],
   tovideo: ['Kirim/reply gambar, video, atau stiker: ,tovideo [duration=3s] [speed=0.25-4|slow=1-4] [format=mp4|gif] [q=1-100].', 'speed=2 mempercepat 2×; slow=2 memperlambat 2× (video dan audio sumber). Tanpa duration, panjang hasil video menyesuaikan kecepatan; duration=... tetap menentukan panjang hasil.', 'Jika mulai dari stiker, kirim gambar/video template yang sudah menampilkan stiker itu di dalam sesi.', 'Tanpa duration, gambar dibuat 5 detik dan video mengikuti durasi aslinya. Durasi dapat diubah selama sesi.', 'Audio stiker beraudio otomatis jadi musik jika belum ada audio lain.', 'Sesi menerima stiker WhatsApp, audio, atau teks: duration=2m, speed=2, slow=2, sync, mute, unmute, vvol=50%, mvol=50%, q=80, format=gif.', 'Selesai: ,end atau ✅/👍/❤️ pada pesan sesi. Batal: ,cancel atau ❌/👎/❎.', 'Stiker harus terlihat pada sumber agar posisi, ukuran, dan rotasinya bisa dicocokkan. GIF WhatsApp tidak bersuara.'],
-  stimpa: ['Reply stiker (bergerak atau diam) dengan ,stimpa.', 'Bot mengirim frame pertama sebagai gambar kanvas. Edit gambar itu di WhatsApp, lalu kirim satu atau beberapa gambar edit tanpa crop.', 'Setiap gambar yang cocok ditumpuk pada stiker yang sama; gambar yang tidak cocok dilewati. Cukup kirim audio tanpa edit untuk sekadar menambah/mengganti audio. ,end membuat stiker; ,cancel membatalkan.', 'Audio stiker sumber ikut ke hasil. Kirim audio/VN/video atau link langsung mp3/video di sesi untuk mengganti audionya.', 'Bisa juga langsung: ,stimpa <link mp3/video> sambil reply stiker, lalu ,end.'],
+  stimpa: ['Reply stiker (bergerak atau diam) dengan ,stimpa.', 'Bot mengirim frame pertama sebagai gambar kanvas. Edit gambar itu di WhatsApp, lalu kirim satu atau beberapa gambar edit tanpa crop.', 'Setiap gambar yang cocok ditumpuk pada stiker yang sama; gambar yang tidak cocok dilewati. Cukup kirim audio tanpa edit untuk sekadar menambah/mengganti audio. ,end membuat stiker; ,cancel membatalkan.', 'Audio stiker sumber ikut ke hasil. Kirim audio/VN/video atau link langsung mp3/video di sesi untuk mengganti audionya.', 'Bisa juga langsung: ,stimpa <link> sambil reply stiker, lalu ,end. Link bisa mp3/video langsung atau TikTok/IG/YouTube/X/FB.', 'Ambil dari menit tertentu: ,stimpa <link> 1:05 (10 detik mulai 1:05). File unduhan langsung dihapus dari server.'],
+  dl: ['Format: ,dl <link>', 'Format: ,dl <link> mp3 (audio saja)', 'Alias: ,yt, ,ig, ,tt. Bisa juga reply pesan yang berisi link.', 'Video maks 720p dan 64 MB. Carousel IG/TikTok foto dikirim semua (maks 10). File langsung dihapus dari server setelah terkirim.'],
   toimg: ['Format: ,toimg', 'Reply/kirim dokumen PDF, lalu bot mengirim tiap halaman sebagai gambar.'],
   note: ['Format: ,note list', 'Format: ,note add <judul> <teks>', 'Format: ,note get <id|judul>', 'Format: ,note del <id|judul>', 'Format: ,note rename <id|judul> <judul-baru>', 'Legacy: ,note <judul> <teks> dan ,note change tetap didukung.'],
   link: ['Format: ,link list', 'Format: ,link add <nama> <https://link>', 'Format: ,link get <id|nama>', 'Format: ,link del <id|nama>', 'Format: ,link rename <id|nama> <nama-baru>', 'Legacy: ,link <nama> <url> dan ,link change tetap didukung.'],
@@ -628,7 +652,9 @@ const HELP_DETAILS = {
     'Format: ,worker session <id|nomor>, lalu ketik command di chat dengan nomor worker. Keluar: ,end atau ,worker exit',
     'Format: ,worker service list',
     'Format: ,worker service <id|nomor> <nama|off>',
-    'Format: ,worker default <id|nomor> on|off (izinkan command default untuk worker yang memakai service)'
+    'Format: ,worker default <id|nomor> on|off (izinkan command default untuk worker yang memakai service)',
+    'Format: ,worker key: key login Web UI service important (ditampilkan sekali)',
+    'Format: ,worker key reset: buat key baru dan keluarkan semua login lama'
   ],
   jadibot: [
     'Format: ,jadibot atau ,jadibot kode',
@@ -659,6 +685,86 @@ const HELP_DETAILS = {
   confirm: ['Format: ,confirm', 'Jalankan aksi yang sedang menunggu konfirmasi.']
 };
 
+const HELP_ICONS = {
+  Media: '🎨',
+  Catatan: '📝',
+  Reminder: '⏰',
+  Server: '🖥️',
+  Pengelolaan: '⚙️',
+  Multiakun: '👥',
+  Session: '🔄'
+};
+
+// ",note     Kelola note" -> "• `,note` — Kelola note"
+function helpItemLine(text) {
+  const [, name = '', rest = ''] = String(text).match(/^(\S+)\s+(.*)$/) || [];
+  return name ? `• ${cmd(name)} — ${rest.trim()}` : `• ${text}`;
+}
+
+// Detail lines: "Format: ,x <y>" -> "▸ `,x <y>`"; anything else becomes a short bullet.
+function helpDetailLine(text) {
+  const format = String(text).match(/^Format(?: langsung| sesi)?:\s*(.+)$/i);
+  if (format) return `▸ ${monoCommands(format[1])}`;
+  const legacy = String(text).match(/^Legacy:\s*(.+)$/i);
+  if (legacy) return replyHint(`Lama: ${legacy[1]}`.replace(/_/g, ''));
+  return `• ${monoCommands(text)}`;
+}
+
+const WORKER_HELP_GIF_URL = 'https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExOGp6amMwbWIxbzN5cmFndGxmZnRlcWUxbzh4ZWk4dG15b3RlMTVzNSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/VW6Yu55U4tZtmwV0Nl/giphy.gif';
+const WORKER_HELP_GIF_FILE = path.join(ROOT_DIR, 'data', 'worker-help.mp4');
+
+// WhatsApp plays a "GIF" as a looping mp4, so the giphy clip is fetched as mp4
+// (or converted from the gif with ffmpeg) once and cached on disk.
+async function loadWorkerHelpGif() {
+  if (state.workerHelpGif) return state.workerHelpGif;
+  try {
+    state.workerHelpGif = await fs.readFile(WORKER_HELP_GIF_FILE);
+    return state.workerHelpGif;
+  } catch { /* not cached yet */ }
+  let buffer = null;
+  const mp4 = await fetch(WORKER_HELP_GIF_URL.replace(/giphy\.gif$/, 'giphy.mp4'), { signal: AbortSignal.timeout(15000) }).catch(() => null);
+  if (mp4?.ok && /video\/mp4/.test(mp4.headers.get('content-type') || '')) buffer = Buffer.from(await mp4.arrayBuffer());
+  if (!buffer && state.tools?.ffmpeg) {
+    const gif = await fetch(WORKER_HELP_GIF_URL, { signal: AbortSignal.timeout(15000) });
+    if (!gif.ok) throw new Error(`HTTP ${gif.status}`);
+    const input = makeTempPath('help-gif', '.gif');
+    const output = makeTempPath('help-gif', '.mp4');
+    try {
+      await fs.writeFile(input, Buffer.from(await gif.arrayBuffer()));
+      await runTool(state.tools.ffmpeg, ['-y', '-i', input, '-movflags', 'faststart', '-pix_fmt', 'yuv420p', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-an', output]);
+      buffer = await fs.readFile(output);
+    } finally {
+      await cleanupFiles([input, output]);
+    }
+  }
+  if (!buffer) throw new Error('Help GIF unavailable');
+  await fs.writeFile(WORKER_HELP_GIF_FILE, buffer).catch(() => {});
+  state.workerHelpGif = buffer;
+  return buffer;
+}
+
+async function sendWorkerHelpGif(jid, caption) {
+  try {
+    await sendBotMessage(jid, { video: await loadWorkerHelpGif(), gifPlayback: true, mimetype: 'video/mp4', caption });
+    return true;
+  } catch (error) {
+    await logger.warn('Worker help GIF failed', { error: error.message });
+    return false;
+  }
+}
+
+// Examples only use commands this chat can actually run (a worker has no ,task, for instance).
+function helpExamples(jid, context) {
+  const visible = HELP_SECTIONS
+    .map((section) => ({ title: section.title, items: section.items.filter((item) => canShowHelpItem(item.name, jid, context)) }))
+    .filter((section) => section.items.length);
+  const names = visible.flatMap((section) => section.items.map((item) => item.name));
+  const preferred = ['task', 'dl', 'stimpa', 's', 'tovideo'].find((name) => names.includes(name)) || names[0];
+  const examples = preferred ? [`${COMMAND_PREFIX}help ${preferred}`] : [];
+  if (visible[0]) examples.push(`${COMMAND_PREFIX}help ${visible[0].title.toLowerCase()}`);
+  return examples.join(' · ');
+}
+
 async function handleHelp(jid, command, context) {
   let query = command?.rawArgs?.trim() || '';
   if (query.startsWith(COMMAND_PREFIX)) query = query.slice(COMMAND_PREFIX.length).trim();
@@ -667,12 +773,13 @@ async function handleHelp(jid, command, context) {
     await handleHelpDetail(jid, query, context);
     return;
   }
-  const lines = [`*${BOT_NAME}*`, 'Pilih command atau lihat detail: ,help <command>'];
+  const lines = [`🤖 *${BOT_NAME}*`, replyHint('Pilih command di bawah. Detail: ,help <command>')];
   for (const section of HELP_SECTIONS) {
     const items = section.items.filter((item) => canShowHelpItem(item.name, jid, context));
-    if (items.length) lines.push('', `*${section.title}*`, items.map((item) => `${COMMAND_PREFIX}${item.name}`).join(' · '));
+    if (items.length) lines.push('', `${HELP_ICONS[section.title] || '•'} *${section.title}*`, items.map((item) => cmd(`${COMMAND_PREFIX}${item.name}`)).join('  '));
   }
-  lines.push('', 'Contoh: ,help task • ,help Media');
+  lines.push('', replyHint(`Contoh: ${helpExamples(jid, context)}`));
+  if (currentWorker() && await sendWorkerHelpGif(jid, lines.join('\n'))) return;
   await sendText(jid, lines.join('\n'));
 }
 
@@ -680,7 +787,13 @@ async function handleHelpDetail(jid, query, context) {
   const section = HELP_SECTIONS.find((item) => item.title.toLowerCase() === query);
   if (section) {
     const items = section.items.filter((item) => canShowHelpItem(item.name, jid, context));
-    await sendText(jid, [`*${section.title}*`, ...items.map((item) => item.text.replace(/\s{2,}/g, ' — ')), '', 'Detail: ,help <command>'].join('\n'));
+    await sendText(jid, [
+      `${HELP_ICONS[section.title] || '•'} *${section.title}*`,
+      '',
+      ...items.map((item) => helpItemLine(item.text)),
+      '',
+      replyHint(`Detail: ${COMMAND_PREFIX}help <command>`)
+    ].join('\n'));
     return;
   }
 
@@ -693,12 +806,17 @@ async function handleHelpDetail(jid, query, context) {
   const exact = allNames.map((name) => HELP_ALIASES[name] || name).find((name) => name === normalizedQuery);
   if (exact) {
     if (!canShowHelpItem(exact, jid, context)) {
-      await sendText(jid, `Command ${COMMAND_PREFIX}${exact} tidak tersedia untuk akses kamu.`);
+      await sendText(jid, `🔒 ${cmd(`${COMMAND_PREFIX}${exact}`)} tidak tersedia untuk akses kamu.`);
       return;
     }
     const brief = HELP_SECTIONS.flatMap((section) => section.items).filter((item) => item.name === exact).map((item) => item.text);
     const detail = HELP_DETAILS[exact] || brief;
-    await sendText(jid, [`Help ${COMMAND_PREFIX}${exact}:`, ...brief, '', ...detail].join('\n'));
+    const summary = brief.map((item) => item.replace(/^\S+\s+/, '')).join(' ');
+    await sendText(jid, [
+      `📖 *${COMMAND_PREFIX}${exact}*${summary ? ` — ${summary}` : ''}`,
+      '',
+      ...detail.map(helpDetailLine)
+    ].join('\n'));
     return;
   }
   const matches = allNames
@@ -707,12 +825,12 @@ async function handleHelpDetail(jid, query, context) {
     .filter((name, index, names) => names.indexOf(name) === index)
     .sort();
   if (!matches.length) {
-    await sendText(jid, `Tidak ada help yang cocok untuk "${query}".`);
+    await sendText(jid, `🔎 Tidak ada help untuk "${query}". Lihat semua: ${cmd(`${COMMAND_PREFIX}help`)}`);
     return;
   }
   await sendText(jid, [
-    `Help cocok untuk "${query}":`,
-    ...matches.map((name) => `- ${COMMAND_PREFIX}${name}`)
+    `🔎 *Mungkin maksudnya:*`,
+    ...matches.map((name) => `• ${cmd(`${COMMAND_PREFIX}${name}`)}`)
   ].join('\n'));
 }
 
@@ -1001,7 +1119,7 @@ function registerConfirmationPrompt(messageKey, jid, actorJid) {
     scope: `confirm:${jid}:${actorJid}`,
     onConfirm: async () => handleConfirm(jid, actorJid),
     onCancel: async () => {
-      if (state.confirmStore.cancel(jid, actorJid)) await sendText(jid, 'Konfirmasi dibatalkan.');
+      if (state.confirmStore.cancel(jid, actorJid)) await sendText(jid, botText('Konfirmasi dibatalkan.'));
     }
   });
 }
@@ -1009,10 +1127,10 @@ function registerConfirmationPrompt(messageKey, jid, actorJid) {
 async function handleConfirm(jid, actorJid = jid) {
   const action = state.confirmStore.take(jid, actorJid);
   if (!action) {
-    await sendText(jid, 'Tidak ada aksi yang menunggu konfirmasi, atau waktunya sudah habis.');
+    await sendText(jid, botText('Tidak ada aksi yang menunggu konfirmasi, atau waktunya sudah habis.'));
     return;
   }
-  await sendText(jid, `Menjalankan: ${action.title}`);
+  await sendText(jid, botText(`Menjalankan: ${action.title}`));
   await action.execute();
 }
 
@@ -1034,7 +1152,7 @@ async function listeningProgress(jid, recorded) {
   prompt.lastActivity = Date.now();
   const action = state.reactionActions.get(prompt.key, prompt.actorJid);
   if (action) action.expiresAt = Date.now() + 30 * 60 * 1000;
-  await editText(jid, prompt.key, `*Listening • ${recorded.count} item*\nTerbaru: ${recorded.type}\nSelesai: ,end atau ✅/👍/❤️\nBatal: ,cancel atau ❌/👎/❎`);
+  await editText(jid, prompt.key, [`🎙️ *Merekam* · ${recorded.count} item`, `• Terakhir: ${recorded.type}`, '', SESSION_FOOTER].join('\n'));
 }
 
 async function expireListeningSessions() {
@@ -1222,7 +1340,7 @@ async function handleSticker(message, command, actorJid) {
   const flag = parseStickerAudioFlag(command.rawArgs);
   const options = parseStickerArgs(flag.rest, {
     defaultAuthor: DEFAULT_STICKER_AUTHOR,
-    defaultTitle: DEFAULT_STICKER_TITLE
+    defaultTitle: null
   });
   let media = null;
   let audio = null;
@@ -1234,15 +1352,14 @@ async function handleSticker(message, command, actorJid) {
       throw new UserInputError(',s -a hanya untuk video (mp4) yang punya audio. Untuk menambah audio ke stiker, pakai ,stimpa.');
     }
     const animated = await isAnimatedMedia(media);
-    const sticker = await makeSticker(media, {
-      author: options.author,
-      title: options.title,
-      quality: options.quality,
-      tools: state.tools
-    });
-    // -a: the video's own audio, from the start like the sticker clip.
-    audio = flag.audio ? await audioFromMedia(state.sock, state.tools, media) : await sourceStickerAudio(media);
-    await sendStickerResult(jid, sticker, { isAnimated: animated, audio, strict: flag.audio });
+    const [stickerResult, audioResult] = await Promise.allSettled([
+      makeSticker(media, { ...options, animated, tools: state.tools }),
+      flag.audio ? audioFromMedia(state.sock, state.tools, media) : sourceStickerAudio(media, { strict: true })
+    ]);
+    if (audioResult.status === 'fulfilled') audio = audioResult.value;
+    if (stickerResult.status === 'rejected') throw stickerResult.reason;
+    if (audioResult.status === 'rejected') throw audioResult.reason;
+    await sendStickerResult(jid, stickerResult.value, { isAnimated: animated, audio, strict: true });
   } finally {
     await cleanupFiles([media?.path, audio?.path]);
   }
@@ -1269,14 +1386,22 @@ async function downloadSessionAudio(message, prefix) {
   }
 }
 
-// Direct link to an mp3/audio or video file -> sticker audio. Errors become a skip reason.
-async function downloadUrlAudio(url, prefix) {
+// Link -> sticker audio. Social media pages go through yt-dlp; direct mp3/video links are
+// fetched as before. Every downloaded file is removed right after conversion.
+async function downloadUrlAudio(url, prefix, { startSec = 0 } = {}) {
+  const fromSocial = () => withSocialAudio(state.tools, url, { startSec }, (media) => audioFromMedia(state.sock, state.tools, media));
+  if (isSocialUrl(url)) {
+    try { return { audio: await fromSocial() }; } catch (error) { return { ignored: true, reason: error.message }; }
+  }
   let media = null;
   try {
     media = await downloadUrlMedia(url, prefix);
-    if (!media || !isAudioSourceMedia(media)) throw new UserInputError('Link harus mengarah langsung ke file audio (mp3, dll.) atau video.');
+    if (!media || !isAudioSourceMedia(media)) throw new UserInputError('Link-nya harus file audio/video langsung, atau link sosmed.');
     return { audio: await audioFromMedia(state.sock, state.tools, media) };
   } catch (error) {
+    if (state.tools?.ytdlp && !media) {
+      try { return { audio: await fromSocial() }; } catch { /* keep the first reason */ }
+    }
     return { ignored: true, reason: error.message };
   } finally {
     await cleanupFiles([media?.path]);
@@ -1312,14 +1437,15 @@ async function handleQr(message, command, actorJid) {
   }
 }
 
+const SESSION_FOOTER = '✅ Selesai: `,end` atau ✅/👍/❤️\n✖️ Batal: `,cancel` atau ❌/👎/❎';
+
 function formatQrProgressMessage(session) {
-  const style = session.style;
-  const background = session.background;
   return [
-    `Sesi QR aktif (style=${style}, bg=${background}).`,
-    `Pesan diterima: ${session.items.length}.`,
-    'Kirim setiap teks/caption sebagai pesan terpisah. Gambar/GIF pada pesan akan menjadi ikon tengah QR.',
-    'Selesai: ,end atau reaction ✅/👍/❤️. Batal: ,cancel atau reaction ❌/👎/❎.'
+    `🔳 *Sesi QR* · ${session.items.length} pesan`,
+    `• Style: ${session.style} · bg: ${session.background}`,
+    replyHint('Kirim tiap isi QR sebagai pesan terpisah. Gambar/GIF jadi ikon tengah.'),
+    '',
+    SESSION_FOOTER
   ].join('\n');
 }
 
@@ -1346,7 +1472,6 @@ async function handleSmeme(message, command) {
     const animated = await isAnimatedMedia(media);
     const sticker = await makeSmemeSticker(media, {
       author: DEFAULT_STICKER_AUTHOR,
-      title: DEFAULT_STICKER_TITLE,
       tools: state.tools,
       smeme
     });
@@ -1384,7 +1509,7 @@ async function handleToImg(message) {
     if (!isPdfFile(media.path, media.mimetype) && !isPdfFile(media.fileName, media.mimetype)) {
       throw new UserInputError('Untuk sekarang ,toimg hanya mendukung file PDF.');
     }
-    await sendText(jid, 'Mengubah PDF menjadi image...');
+    await sendText(jid, botText('Mengubah PDF menjadi image...'));
     images = await pdfToImages(media.path, state.tools);
     if (!images.length) throw new Error('Tidak ada halaman PDF yang berhasil diubah menjadi image.');
     for (const image of images) {
@@ -1593,7 +1718,7 @@ async function maybeMirrorChangedMessage(message) {
         const stat = await fs.stat(media.path).catch(() => null);
         const maxBytes = state.runtimeConfig.changedmsgSettings().maxMediaBytes;
         if (stat?.size && stat.size > maxBytes) {
-          await sendText(logsJid, `Media view-once dilewati karena ${formatBytes(stat.size)} melebihi batas ${formatBytes(maxBytes)}.`);
+          await sendText(logsJid, botText(`Media view-once dilewati karena ${formatBytes(stat.size)} melebihi batas ${formatBytes(maxBytes)}.`));
         } else {
           logContentMessage = await sendDownloadedMedia(logsJid, media, { caption: media.node?.caption });
         }
@@ -1745,7 +1870,7 @@ async function handleSetup(message, command, context) {
   if (!feature || !mode) return setupMenu(jid, feature);
   if (feature === 'root') {
     await state.runtimeConfig.set('storage.root', command.args.slice(1).join(' '));
-    return sendText(jid, 'Root penyimpanan lokal disimpan. Tujuan aktif tiap fitur tidak berubah.');
+    return sendText(jid, botText('Root penyimpanan lokal disimpan. Tujuan aktif tiap fitur tidak berubah.'));
   }
   const input = rest.join(' ');
   if (feature === 'errors') {
@@ -1757,7 +1882,7 @@ async function handleSetup(message, command, context) {
   else throw new UserInputError('Mode tujuan: group atau local.');
   state.setupNotices.delete(feature);
   applyBotRuntimeState();
-  await sendText(jid, `Tujuan ${feature} disimpan. Hanya ${mode} yang aktif.`);
+  await sendText(jid, botText(`Tujuan ${feature} disimpan. Hanya ${mode} yang aktif.`));
 }
 
 async function notifyMissingSetup(feature) {
@@ -1773,7 +1898,7 @@ async function handleFailure(error, { jid, text, messageId } = {}) {
     return;
   }
   if (error instanceof UserInputError && jid) {
-    await sendText(jid, error.message);
+    await sendText(jid, userErrorText(error.message));
     return;
   }
   await logger.error('Operation failed', { jid, messageId, command: parseCommand(text || '')?.name, error: error.message, stack: error.stack });
@@ -1820,9 +1945,9 @@ async function showStatusContact(jid, input) {
   if (!input) throw new UserInputError('Format: ,statussave list <nomor> atau ,statussave show <nomor>.');
   const author = resolveStatusContact(input);
   const items = state.statusInbox.list(author).sort((a, b) => a.timestamp - b.timestamp);
-  if (!items.length) return sendText(jid, 'Belum ada status aktif nomor ini yang diterima bot.');
+  if (!items.length) return sendText(jid, botText('Belum ada status aktif nomor ini yang diterima bot.'));
   const name = state.contactNames.get(author) || displayPhoneFromJid(author);
-  await sendText(jid, `*Status ${name}*\n${items.length} status aktif, dari paling lama ke terbaru.`);
+  await sendText(jid, botText(`*Status ${name}*\n${items.length} status aktif, dari paling lama ke terbaru.`));
   const target = state.runtimeConfig.storageTarget('statussave');
   const counts = { success: 0, expired: 0, failed: 0 };
   for (const item of items) {
@@ -1837,7 +1962,7 @@ async function showStatusContact(jid, input) {
       counts[result]++;
     } catch (error) { counts.failed++; await handleFailure(error); }
   }
-  await sendText(jid, `Status ditampilkan: ${counts.success} berhasil, ${counts.expired} kedaluwarsa/terhapus, ${counts.failed} gagal.`);
+  await sendText(jid, botText(`Status ditampilkan: ${counts.success} berhasil, ${counts.expired} kedaluwarsa/terhapus, ${counts.failed} gagal.`));
 }
 
 function resolveStatusContact(input) {
@@ -1890,13 +2015,13 @@ async function handleStatusBrowse(message, command) {
     const item = state.statusInbox.list().find((entry) => entry.id === Number(args[0]));
     items = item ? [item] : [];
   }
-  if (!items.length) return sendText(jid, 'Status aktif tidak tersedia atau sudah kedaluwarsa. Bot hanya dapat dump status yang diterimanya.');
+  if (!items.length) return sendText(jid, botText('Status aktif tidak tersedia atau sudah kedaluwarsa. Bot hanya dapat dump status yang diterimanya.'));
   const counts = { success: 0, saved: 0, expired: 0, failed: 0 };
   for (const item of items) {
     try { counts[await archiveStatus(item)]++; }
     catch (error) { counts.failed++; await handleFailure(error); }
   }
-  await sendText(jid, `Dump selesai: ${counts.success} berhasil, ${counts.saved} sudah tersimpan, ${counts.expired} kedaluwarsa, ${counts.failed} gagal.`);
+  await sendText(jid, botText(`Dump selesai: ${counts.success} berhasil, ${counts.saved} sudah tersimpan, ${counts.expired} kedaluwarsa, ${counts.failed} gagal.`));
 }
 
 async function runConfiguredBackup() {
@@ -2049,12 +2174,12 @@ async function handleTask(message, command, actorJid = messageActorJid(message))
     const schedule = parseTaskRecordingArgs(command.args);
     const target = resolveDestinationInput(schedule.targetInput, actorJid);
     const session = state.taskRecorder.start(jid, schedule, actorJid, target);
-    const sent = await sendText(jid, `Mulai rekam task ke ${session.schedule.targetName}. Kirim teks, gambar, video, dokumen, audio, sticker, lokasi, kontak, poll, atau event. Selesai: ,end atau reaction ✅/👍/❤️. Batal: ,cancel atau reaction ❌/👎/❎.`);
+    const sent = await sendText(jid, botText(`Mulai rekam task ke ${session.schedule.targetName}. Kirim teks, gambar, video, dokumen, audio, sticker, lokasi, kontak, poll, atau event. Selesai: ,end atau reaction ✅/👍/❤️. Batal: ,cancel atau reaction ❌/👎/❎.`));
     registerSessionPrompt(sent.key, jid, actorJid);
     return;
   }
   const task = await createTask(state.sock, message, command.args);
-  await sendText(jid, `Task #${task.id} dibuat.\nBerikutnya: ${formatWib(task.nextRunAt)}`);
+  await sendText(jid, botText(`Task #${task.id} dibuat.\nBerikutnya: ${formatWib(task.nextRunAt)}`));
 }
 
 async function handleListTask(jid, command, actorJid) {
@@ -2089,7 +2214,7 @@ async function handleTaskStateChange(jid, actorJid, actionRaw, idRaw, formatHint
       execute: async () => {
         const result = await updateTaskState('del', id);
         invalidateListKind('tasks');
-        await sendText(jid, `Task #${id} dihapus.`);
+        await sendText(jid, botText(`Task #${id} dihapus.`));
         return result;
       }
     });
@@ -2129,6 +2254,30 @@ async function handleTopdf(message, command, actorJid) {
   registerSessionPrompt(sent.key, jid, actorJid);
 }
 
+// ,dl <link> [mp3]: TikTok / Instagram / YouTube / ... -> video or photos (or audio) in the chat.
+// The download folder is removed right after sending.
+async function handleSocialDownload(message, command) {
+  const jid = message.key.remoteJid;
+  const quoted = extractQuotedMessage(message);
+  const url = firstUrl(command.rawArgs) || firstUrl(quoted ? getMessageText(quoted) : '');
+  if (!url) throw new UserInputError(`Kirim link-nya: ${cmd(`${COMMAND_PREFIX}${command.name} <link>`)}, atau reply pesan yang berisi link.`);
+  const audioOnly = /(^|\s)(mp3|audio|-a)(\s|$)/i.test(String(command.rawArgs).replace(url, ' '));
+  const progress = await sendText(jid, `⏳ *Mengunduh${audioOnly ? ' audio' : ''}…*\n${replyHint(new URL(url).hostname.replace(/^www\./, ''))}`);
+  await withSocialDownload(state.tools, url, { audioOnly }, async ({ title, uploader, files }) => {
+    const caption = [title ? `*${title.slice(0, 200)}*` : '', uploader ? replyHint(uploader) : ''].filter(Boolean).join('\n');
+    for (const [index, file] of files.entries()) {
+      const text = index === 0 ? caption : '';
+      if (file.kind === 'video') await sendBotMessage(jid, { video: { url: file.path }, mimetype: 'video/mp4', caption: text });
+      else if (file.kind === 'image') await sendBotMessage(jid, { image: { url: file.path }, caption: text });
+      else await sendBotMessage(jid, { audio: { url: file.path }, mimetype: file.mimetype === 'audio/mpeg' ? 'audio/mpeg' : 'audio/mp4' });
+    }
+    await editText(jid, progress.key, `✅ *Terkirim* · ${files.length} file`).catch(() => {});
+  }).catch(async (error) => {
+    await editText(jid, progress.key, userErrorText(error.message)).catch(() => {});
+    if (!(error instanceof UserInputError)) throw error;
+  });
+}
+
 async function handleStimpa(message, command, actorJid) {
   const jid = message.key.remoteJid;
   assertNoActiveSession(jid);
@@ -2137,13 +2286,16 @@ async function handleStimpa(message, command, actorJid) {
   if (!media) throw new UserInputError('Reply stiker dengan ,stimpa.');
   try {
     const { session, preview } = await state.stimpaSessions.start(jid, actorJid, media);
-    const urlAudio = audioUrl ? await downloadUrlAudio(audioUrl, 'stimpa-url-audio') : null;
+    if (audioUrl) await sendText(jid, `⏳ Ambil audio dari link${isSocialUrl(audioUrl) ? ' sosmed' : ''}…`);
+    const urlAudio = audioUrl
+      ? await downloadUrlAudio(audioUrl, 'stimpa-url-audio', { startSec: startTimeFromArgs(command?.rawArgs, audioUrl) })
+      : null;
     if (urlAudio?.ignored) throw new UserInputError(`Audio dari link gagal: ${urlAudio.reason}`);
     const audio = urlAudio ? null : await sourceStickerAudio(media);
     if (urlAudio) await state.stimpaSessions.setAudio(jid, urlAudio.audio);
     else if (audio) await state.stimpaSessions.setAudio(jid, audio, { replaced: false });
     session.sourceAudio = Boolean(audio);
-    await sendBotMessage(jid, { image: preview, mimetype: 'image/png', caption: 'Kanvas ,stimpa: edit gambar ini di WhatsApp, lalu kirim hasilnya tanpa crop.' });
+    await sendBotMessage(jid, { image: preview, mimetype: 'image/png', caption: '🖌️ *Kanvas stimpa*\nEdit gambar ini di WhatsApp, lalu kirim hasilnya _tanpa crop_.' });
     const sent = await sendText(jid, formatStimpaSession(session));
     registerSessionPrompt(sent.key, jid, actorJid);
   } catch (error) {
@@ -2159,7 +2311,7 @@ async function collectStimpaItem(message) {
   if (found && isAudioSourceMedia({ type: found.type, node: found.node, mimetype: found.node?.mimetype })) {
     const result = await downloadSessionAudio(message, 'stimpa-audio');
     if (!result) return;
-    if (result.ignored) { await sendText(jid, `Audio dilewati: ${result.reason}`); return; }
+    if (result.ignored) { await sendText(jid, botText(`Audio dilewati: ${result.reason}`)); return; }
     const updated = await state.stimpaSessions.setAudio(jid, result.audio);
     if (!updated) return;
     const prompt = state.sessionPrompts.get(jid);
@@ -2168,8 +2320,9 @@ async function collectStimpaItem(message) {
   }
   const url = found ? null : firstUrl(getMessageText(message));
   if (url) {
-    const result = await downloadUrlAudio(url, 'stimpa-url-audio');
-    if (result.ignored) { await sendText(jid, `Audio dari link dilewati: ${result.reason}`); return; }
+    if (isSocialUrl(url)) await sendText(jid, '⏳ Ambil audio dari link sosmed…');
+    const result = await downloadUrlAudio(url, 'stimpa-url-audio', { startSec: startTimeFromArgs(getMessageText(message), url) });
+    if (result.ignored) { await sendText(jid, botText(`Audio dari link dilewati: ${result.reason}`)); return; }
     const updated = await state.stimpaSessions.setAudio(jid, result.audio);
     if (!updated) return;
     const prompt = state.sessionPrompts.get(jid);
@@ -2179,7 +2332,7 @@ async function collectStimpaItem(message) {
   const session = await state.stimpaSessions.add(state.sock, message);
   if (!session) return;
   if (session.ignored) {
-    if (mediaNode(message)) await sendText(jid, `Gambar dilewati: ${session.reason}`);
+    if (mediaNode(message)) await sendText(jid, botText(`Gambar dilewati: ${session.reason}`));
     return;
   }
   const prompt = state.sessionPrompts.get(jid);
@@ -2188,13 +2341,16 @@ async function collectStimpaItem(message) {
 
 function formatStimpaSession(session) {
   const audio = session.audio
-    ? `ada (${session.audio.seconds || '?'} detik${session.sourceAudio && !session.audioReplaced ? ', dari stiker' : ''})`
-    : 'tidak ada';
+    ? `🔊 ${session.audio.seconds || '?'} detik${session.sourceAudio && !session.audioReplaced ? ' (dari stiker)' : ''}`
+    : '🔇 belum ada';
   return [
-    session.edits.length ? `*Sesi stimpa* • ${session.edits.length} gambar edit diterima` : '*Sesi stimpa*',
-    session.edits.length ? 'Gambar lain yang cocok akan digabung.' : 'Kirim satu atau beberapa gambar hasil edit kanvas (tanpa crop). Semua edit yang cocok akan digabung.',
-    `Audio: ${audio}. Kirim audio/VN/video atau link langsung mp3/video untuk mengganti audio stiker.`,
-    `Buat ${session.animated ? 'stiker bergerak' : 'stiker'}: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.`
+    `🖌️ *Sesi stimpa*${session.edits.length ? ` · ${session.edits.length} edit` : ''}`,
+    `• Gambar: ${session.edits.length ? `${session.edits.length} diterima` : 'kirim hasil edit kanvas (tanpa crop)'}`,
+    `• Audio: ${audio}`,
+    replyHint('Ganti audio: kirim audio/VN/video, link mp3, atau link TikTok/IG/YouTube (+ waktu mulai, mis. 1:05).'),
+    '',
+    `✅ Buat ${session.animated ? 'stiker bergerak' : 'stiker'}: ${cmd(',end')} atau ✅/👍/❤️`,
+    `✖️ Batal: ${cmd(',cancel')} atau ❌/👎/❎`
   ].join('\n');
 }
 
@@ -2203,21 +2359,22 @@ async function finishStimpaByJid(jid, actorJid) {
   if (!session || !state.stimpaSessions.isActor(jid, actorJid)) return false;
   if (session.busy) return true;
   if (!session.edit && !session.audioReplaced) {
-    await sendText(jid, 'Kirim gambar kanvas yang sudah diedit atau audio baru sebelum ,end. Sesi masih aktif.');
+    await sendText(jid, `⚠️ Kirim dulu gambar edit atau audio baru, baru ${cmd(',end')}. Sesi masih jalan.`);
     return true;
   }
   const label = session.animated ? 'stiker bergerak' : 'stiker';
-  const progress = await sendText(jid, `*Membuat ${label} • 0%*\nMenunggu proses`);
+  const title = `Membuat ${label}`;
+  const progress = await sendText(jid, progressText(title, 0, 'Menunggu antrean'));
   let lastPercent = -1;
   try {
     await state.stimpaSessions.finish(jid, actorJid, async (percent, step) => {
       const value = Math.floor(percent);
       if (value <= lastPercent) return;
       lastPercent = value;
-      await editText(jid, progress.key, `*Membuat ${label} • ${value}%*\n${step}`).catch(() => {});
+      await editText(jid, progress.key, progressText(value >= 100 ? `${label[0].toUpperCase()}${label.slice(1)} jadi` : title, value, step)).catch(() => {});
     }, async (sticker, audio, { isAnimated = true } = {}) => sendStickerResult(jid, sticker, { isAnimated, audio }));
   } catch (error) {
-    await editText(jid, progress.key, `*Pembuatan stiker gagal*\n${error.message}\nSesi masih aktif; kirim gambar edit baru atau ketik ,end.`);
+    await editText(jid, progress.key, [`❌ *Stiker gagal dibuat*`, error.message, '', replyHint('Sesi masih jalan. Kirim gambar edit baru, lalu ,end lagi.')].join('\n'));
     if (error instanceof UserInputError) return true;
     throw error;
   }
@@ -2261,12 +2418,15 @@ function formatToVideoSession(session) {
     : options.durationMode === 'explicit' ? `${options.durationMs / 1000}s`
       : videoMediaKind(session.source) === 'video' ? 'mengikuti video' : '5s';
   return [
-    `*Sesi video* • ${options.format.toUpperCase()} • durasi ${duration} • speed=${options.speed || 1}× • q=${options.quality}`,
-    `Sumber: ${videoMediaKind(session.source) || 'menunggu gambar/video template'}. Stiker: ${session.stickers.length}. Musik: ${session.music ? (session.musicFromSticker ? 'dari stiker' : 'ada') : 'belum ada'}.`,
-    !session.source ? 'Kirim gambar/video template yang sudah menampilkan stiker pada posisi tujuan.' : null,
-    options.format === 'gif' && session.music ? 'Musik diabaikan pada GIF WhatsApp.' : null,
-    'Kirim stiker WhatsApp, audio, atau instruksi seperti duration=2m, speed=2, slow=2, sync, mute, vvol=50%, mvol=50%, q=80, format=gif.',
-    'Buat: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.'
+    `🎬 *Sesi video* · ${options.format.toUpperCase()}`,
+    `• Sumber: ${videoMediaKind(session.source) || 'kirim gambar/video template'}`,
+    `• Durasi: ${duration} · speed ${options.speed || 1}× · q=${options.quality}`,
+    `• Stiker: ${session.stickers.length} · Musik: ${session.music ? (session.musicFromSticker ? 'dari stiker' : 'ada') : 'belum ada'}`,
+    !session.source ? replyHint('Template harus sudah menampilkan stiker di posisi tujuan.') : null,
+    options.format === 'gif' && session.music ? replyHint('GIF WhatsApp tidak bersuara, musik diabaikan.') : null,
+    replyHint('Opsi: duration=2m, speed=2, slow=2, sync, mute, vvol=50%, mvol=50%, q=80, format=gif'),
+    '',
+    SESSION_FOOTER
   ].filter(Boolean).join('\n');
 }
 
@@ -2285,10 +2445,10 @@ async function finishToVideoByJid(jid, actorJid) {
   if (!session || !state.toVideoSessions.isActor(jid, actorJid)) return false;
   if (session.busy) return true;
   if (!session.source) {
-    await sendText(jid, 'Kirim gambar atau video template sebelum ,end. Sesi masih aktif.');
+    await sendText(jid, `⚠️ Kirim dulu gambar/video template, baru ${cmd(',end')}. Sesi masih jalan.`);
     return true;
   }
-  const progress = await sendText(jid, '*Membuat video • 0%*\nMenunggu proses');
+  const progress = await sendText(jid, progressText('Membuat video', 0, 'Menunggu antrean'));
   let lastPercent = -1;
   let lastEdit = 0;
   let progressQueue = Promise.resolve();
@@ -2298,7 +2458,7 @@ async function finishToVideoByJid(jid, actorJid) {
     if (value !== 100 && value <= lastPercent + 1 && now - lastEdit < 2000) return;
     lastPercent = value;
     lastEdit = now;
-    progressQueue = progressQueue.then(() => editText(jid, progress.key, `*Membuat video • ${value}%*\n${label}`)).catch(() => {});
+    progressQueue = progressQueue.then(() => editText(jid, progress.key, progressText(value >= 100 ? 'Video jadi' : 'Membuat video', value, label))).catch(() => {});
     await progressQueue;
   };
   try {
@@ -2311,7 +2471,7 @@ async function finishToVideoByJid(jid, actorJid) {
     });
   } catch (error) {
     await progressQueue;
-    await editText(jid, progress.key, `*Pembuatan video gagal*\n${error.message}\nSesi masih aktif; perbaiki sumber/opsi lalu ketik ,end.`);
+    await editText(jid, progress.key, [`❌ *Video gagal dibuat*`, error.message, '', replyHint('Sesi masih jalan. Perbaiki sumber/opsi, lalu ,end lagi.')].join('\n'));
     if (error instanceof UserInputError) return true;
     throw error;
   }
@@ -2319,7 +2479,7 @@ async function finishToVideoByJid(jid, actorJid) {
 }
 
 async function updatePdfProgressMessage(jid, session, latestItem = null) {
-  if (!session) return sendText(jid, 'Sesi PDF tidak ditemukan.');
+  if (!session) return sendText(jid, botText('Sesi PDF tidak ditemukan.'));
   if (latestItem?.skipped) {
     session.skippedItems = [...(session.skippedItems || []), latestItem].slice(-10);
   }
@@ -2336,32 +2496,31 @@ async function updatePdfProgressMessage(jid, session, latestItem = null) {
 
 function formatPdfProgressMessage(session) {
   const lines = [
-    `Sesi PDF "${session.fileName}" ${session.split ? '(split)' : ''}`.trim()
+    `📄 *Sesi PDF* · ${session.fileName}${session.split ? ' (split)' : ''} · ${session.files.length} file`
   ];
-  if (session.targetSizeBytes) lines.push(`Target ukuran tepat: ${formatBytes(session.targetSizeBytes)} (${session.targetSizeBytes} byte). Padding tidak meningkatkan kualitas.`);
-  if (session.maxSizeBytes || session.targetSizeBytes) lines.push('Jika perlu, kompresi PDF mengubah halaman menjadi gambar; teks tidak lagi bisa diseleksi.');
-  if (session.maxSizeBytes) lines.push(`Maksimal ukuran: ${formatBytes(session.maxSizeBytes)}.`);
-  if (session.split) lines.push('Mode split: setiap media akan dibuat menjadi PDF terpisah.');
+  if (session.targetSizeBytes) lines.push(`• Target ukuran: ${formatBytes(session.targetSizeBytes)} (${session.targetSizeBytes} byte)`);
+  if (session.maxSizeBytes) lines.push(`• Maks ukuran: ${formatBytes(session.maxSizeBytes)}`);
+  if (session.split) lines.push('• Mode split: tiap media jadi PDF sendiri');
+  if (session.maxSizeBytes || session.targetSizeBytes) lines.push(replyHint('Kalau perlu dikompres, halaman jadi gambar dan teks tidak bisa diseleksi.'));
   if (session.latestItem) {
     lines.push(
       session.latestItem.skipped
-        ? `Terbaru dilewati: ${session.latestItem.fileName} - ${session.latestItem.reason}`
-        : `Terbaru ditambahkan: ${session.latestItem.fileName} (#${session.latestItem.order})`
+        ? `⚠️ Dilewati: ${session.latestItem.fileName} (${session.latestItem.reason})`
+        : `➕ Masuk: ${session.latestItem.fileName} (#${session.latestItem.order})`
     );
   }
-  lines.push(`Total ditambahkan: ${session.files.length}`);
   if (session.files.length) {
-    lines.push('', 'File:');
+    lines.push('', '*File:*');
     for (const item of [...session.files].sort((a, b) => a.order - b.order || a.addedAt - b.addedAt)) {
       lines.push(`${item.order}. ${item.fileName}`);
     }
   }
   if (session.skippedItems?.length) {
-    lines.push('', 'Dilewati:');
-    for (const item of session.skippedItems) lines.push(`- ${item.fileName}: ${item.reason}`);
+    lines.push('', '*Dilewati:*');
+    for (const item of session.skippedItems) lines.push(`• ${item.fileName}: ${item.reason}`);
   }
-  lines.push('', 'Kirim/reply media atau dokumen. Caption/teks angka dipakai sebagai urutan halaman.');
-  lines.push('Selesai: ,end atau reaction ✅/👍/❤️. Batal: ,cancel atau reaction ❌/👎/❎.');
+  lines.push('', replyHint('Kirim/reply media atau dokumen. Caption angka = urutan halaman.'));
+  lines.push('', SESSION_FOOTER);
   return lines.join('\n');
 }
 
@@ -2372,7 +2531,7 @@ async function handleEndPdf(message, actorJid = messageActorJid(message)) {
 async function handleEndPdfByJid(jid, actorJid) {
   const session = state.pdfSessions.end(jid, actorJid);
   if (!session) {
-    await sendText(jid, 'Tidak ada sesi PDF aktif.');
+    await sendText(jid, botText('Tidak ada sesi PDF aktif.'));
     return false;
   }
   try {
@@ -2409,11 +2568,11 @@ async function handleSave(message, command, actorJid) {
     const { item, title } = await prepareSavedUpdate(update.query, update.newTitle);
     const previewCount = Math.min(2, visibleRecordedEntries(item.entries || []).length);
     if (previewCount) {
-      await sendText(jid, `Isi terakhir save #${item.id} "${item.title}" (${previewCount} item):`);
+      await sendText(jid, botText(`Isi terakhir save #${item.id} "${item.title}" (${previewCount} item):`));
       await sendRecentSaved(botSender(), jid, item);
     }
     const session = state.saveRecorder.startUpdate(jid, item, title, actorJid);
-    const sent = await sendText(jid, `Mulai tambah isi save #${item.id} "${item.title}"${title !== item.title ? ` menjadi "${title}"` : ''}. Kirim konten tambahan lalu ,end untuk simpan atau ,cancel untuk batal. Isi lama tetap ada dan ID tidak berubah.`);
+    const sent = await sendText(jid, botText(`Mulai tambah isi save #${item.id} "${item.title}"${title !== item.title ? ` menjadi "${title}"` : ''}. Kirim konten tambahan lalu ,end untuk simpan atau ,cancel untuk batal. Isi lama tetap ada dan ID tidak berubah.`));
     registerSessionPrompt(sent.key, jid, actorJid);
     return;
   }
@@ -2421,7 +2580,7 @@ async function handleSave(message, command, actorJid) {
   assertNoActiveSession(message.key.remoteJid);
   await assertSavedTitleAvailable(title);
   const session = state.saveRecorder.start(message.key.remoteJid, title, firstText, actorJid);
-  const sent = await sendText(message.key.remoteJid, `Mulai rekam save "${session.title}". Kirim teks, media, lokasi, kontak, poll, atau event lalu ,end untuk simpan atau ,cancel untuk batal.`);
+  const sent = await sendText(message.key.remoteJid, botText(`Mulai rekam save "${session.title}". Kirim teks, media, lokasi, kontak, poll, atau event lalu ,end untuk simpan atau ,cancel untuk batal.`));
   registerSessionPrompt(sent.key, message.key.remoteJid, actorJid);
 }
 
@@ -2454,7 +2613,7 @@ async function handleAnticall(message, command, actorJid) {
 
   if (action === 'on' || action === 'off') {
     const snapshot = await state.anticall.setEnabled(action === 'on');
-    await sendText(jid, `Anticall ${snapshot.enabled ? 'aktif' : 'nonaktif'}. Pesan: ${snapshot.hasMessage ? `${snapshot.entryCount} item` : 'belum ada'}.`);
+    await sendText(jid, botText(`Anticall ${snapshot.enabled ? 'aktif' : 'nonaktif'}. Pesan: ${snapshot.hasMessage ? `${snapshot.entryCount} item` : 'belum ada'}.`));
     return;
   }
 
@@ -2464,7 +2623,7 @@ async function handleAnticall(message, command, actorJid) {
 async function startAnticallRecording(jid, actorJid) {
   assertNoActiveSession(jid);
   await state.anticall.start(jid, actorJid);
-  const sent = await sendText(jid, 'Mulai rekam pesan anticall. Kirim teks, media, lokasi, kontak, poll, atau event lalu ,end untuk simpan atau ,cancel untuk batal.');
+  const sent = await sendText(jid, botText('Mulai rekam pesan anticall. Kirim teks, media, lokasi, kontak, poll, atau event lalu ,end untuk simpan atau ,cancel untuk batal.'));
   registerSessionPrompt(sent.key, jid, actorJid);
 }
 
@@ -2479,7 +2638,7 @@ async function handleAnticallException(jid, command, actorJid) {
     if (!input) throw new UserInputError('Format: ,anticall except add <nomor>');
     const item = await state.anticall.addException(input);
     invalidateListKind('anticall-exceptions');
-    await sendText(jid, `Exception anticall #${item.id} ${item.title} ditambahkan.`);
+    await sendText(jid, botText(`Exception anticall #${item.id} ${item.title} ditambahkan.`));
     return;
   }
   if (subaction === 'del') {
@@ -2487,7 +2646,7 @@ async function handleAnticallException(jid, command, actorJid) {
     if (!query) throw new UserInputError('Format: ,anticall except del <nomor|id>');
     const item = await state.anticall.deleteException(query);
     invalidateListKind('anticall-exceptions');
-    await sendText(jid, `Exception anticall #${item.id} ${item.title} dihapus.`);
+    await sendText(jid, botText(`Exception anticall #${item.id} ${item.title} dihapus.`));
     return;
   }
   throw new UserInputError('Format: ,anticall except list|add|del <nomor|id>');
@@ -2518,7 +2677,7 @@ async function handleLoad(message, command, actorJid) {
     if (!query || !newTitle) throw new UserInputError('Format: ,load rename <id|"judul-lama"> <judul-baru>');
     const item = await renameSaved(query, newTitle);
     invalidateListKind('saved');
-    await sendText(jid, `Save #${item.id} diganti judul menjadi "${item.title}".`);
+    await sendText(jid, botText(`Save #${item.id} diganti judul menjadi "${item.title}".`));
     return;
   }
   if (command.args[0].toLowerCase() === 'del') {
@@ -2530,7 +2689,7 @@ async function handleLoad(message, command, actorJid) {
       execute: async () => {
         const item = await deleteSaved(query);
         invalidateListKind('saved');
-        await sendText(jid, `Save #${item.id} "${item.title}" dihapus.`);
+        await sendText(jid, botText(`Save #${item.id} "${item.title}" dihapus.`));
       }
     });
     return;
@@ -2595,7 +2754,7 @@ async function finishSaveByJid(jid, actorJid) {
   if (!item) return false;
   invalidateListKind('saved');
   const action = item.appendedCount ? `ditambah ${item.appendedCount} item` : 'tersimpan';
-  await sendText(jid, `Save #${item.id} "${item.title}" ${action} (${item.entries.length} item total).`);
+  await sendText(jid, botText(`Save #${item.id} "${item.title}" ${action} (${item.entries.length} item total).`));
   return true;
 }
 
@@ -2615,13 +2774,13 @@ async function finishAnticallByJid(jid, actorJid) {
 
 async function cancelSave(message, actorJid = messageActorJid(message)) {
   const cancelled = await state.saveRecorder.cancel(message.key.remoteJid, actorJid);
-  if (cancelled) await sendText(message.key.remoteJid, 'Rekaman save dibatalkan.');
+  if (cancelled) await sendText(message.key.remoteJid, botText('Rekaman save dibatalkan.'));
   return cancelled;
 }
 
 async function cancelAnticall(message, actorJid = messageActorJid(message)) {
   const cancelled = await state.anticall.cancel(message.key.remoteJid, actorJid);
-  if (cancelled) await sendText(message.key.remoteJid, 'Rekaman anticall dibatalkan.');
+  if (cancelled) await sendText(message.key.remoteJid, botText('Rekaman anticall dibatalkan.'));
   return cancelled;
 }
 
@@ -2631,45 +2790,45 @@ async function cancelActiveSession(message, actorJid = messageActorJid(message))
 
 async function cancelActiveSessionByJid(jid, actorJid) {
   if (await state.saveRecorder.cancel(jid, actorJid)) {
-    await sendText(jid, 'Rekaman save dibatalkan.');
+    await sendText(jid, botText('Rekaman save dibatalkan.'));
     return true;
   }
   if (await state.taskRecorder.cancel(jid, actorJid)) {
-    await sendText(jid, 'Rekaman task dibatalkan.');
+    await sendText(jid, botText('Rekaman task dibatalkan.'));
     return true;
   }
   if (await state.anticall.cancel(jid, actorJid)) {
-    await sendText(jid, 'Rekaman anticall dibatalkan.');
+    await sendText(jid, botText('Rekaman anticall dibatalkan.'));
     return true;
   }
   if (await state.cintaRecorder?.cancel(jid, actorJid)) {
-    await sendText(jid, 'Rekaman cinta dibatalkan.');
+    await sendText(jid, botText('Rekaman cinta dibatalkan.'));
     return true;
   }
 
   const pdfSession = state.pdfSessions.end(jid, actorJid);
   if (pdfSession) {
     await state.pdfSessions.cleanup(pdfSession);
-    await sendText(jid, 'Sesi PDF dibatalkan.');
+    await sendText(jid, botText('Sesi PDF dibatalkan.'));
     return true;
   }
 
   if (await state.toVideoSessions.cancel(jid, actorJid)) {
-    await sendText(jid, 'Sesi video dibatalkan.');
+    await sendText(jid, botText('Sesi video dibatalkan.'));
     return true;
   }
   if (await state.stimpaSessions?.cancel(jid, actorJid)) {
-    await sendText(jid, 'Sesi stimpa dibatalkan.');
+    await sendText(jid, botText('Sesi stimpa dibatalkan.'));
     return true;
   }
 
   if (await state.qrSessions.cancel(jid, actorJid)) {
-    await sendText(jid, 'Sesi QR dibatalkan.');
+    await sendText(jid, botText('Sesi QR dibatalkan.'));
     return true;
   }
 
   if (await state.restoreSessions.cancel(jid, actorJid)) {
-    await sendText(jid, 'Sesi restore dibatalkan.');
+    await sendText(jid, botText('Sesi restore dibatalkan.'));
     return true;
   }
 
@@ -2681,10 +2840,10 @@ async function handleCancelByJid(jid, actorJid) {
   let cancelled = false;
   if (state.confirmStore.cancel(jid, actorJid)) {
     cancelled = true;
-    await sendText(jid, 'Konfirmasi dibatalkan.');
+    await sendText(jid, botText('Konfirmasi dibatalkan.'));
   }
   if (await cancelActiveSessionByJid(jid, actorJid)) cancelled = true;
-  if (!cancelled) await sendText(jid, 'Tidak ada sesi aktif atau konfirmasi pending.');
+  if (!cancelled) await sendText(jid, botText('Tidak ada sesi aktif atau konfirmasi pending.'));
   return cancelled;
 }
 
@@ -2700,7 +2859,7 @@ async function finishActiveSession(jid, actorJid) {
   if (await finishSaveByJid(jid, actorJid)) return true;
   const task = await state.taskRecorder.finish(jid, actorJid);
   if (task) {
-    await sendText(jid, `Task #${task.id} dibuat untuk ${task.targetName || `+${task.targetJid.split('@')[0]}`}. Berikutnya: ${formatWib(task.nextRunAt)}`);
+    await sendText(jid, botText(`Task #${task.id} dibuat untuk ${task.targetName || `+${task.targetJid.split('@')[0]}`}. Berikutnya: ${formatWib(task.nextRunAt)}`));
     return true;
   }
   if (await finishAnticallByJid(jid, actorJid)) return true;
@@ -2714,7 +2873,7 @@ async function finishActiveSession(jid, actorJid) {
     if (session.mode === 'save') {
       if (session.phase === 'upload') {
         const result = await state.restoreSessions.prepareSaved(session);
-        await sendText(jid, `Backup terbaca: ${result.count} save dari ${result.parts} part.\n1. Semua save\n2. Pilih save tertentu\n0. Kembali ke unggah ZIP\nKetik angka pilihan.`);
+        await sendText(jid, botText(`Backup terbaca: ${result.count} save dari ${result.parts} part.\n1. Semua save\n2. Pilih save tertentu\n0. Kembali ke unggah ZIP\nKetik angka pilihan.`));
       } else if (session.phase === 'select') {
         if (!session.selectedIds.size) throw new UserInputError('Pilih setidaknya satu save dari daftar.');
         session.phase = 'mode';
@@ -2743,7 +2902,7 @@ async function finishQrByJid(jid, actorJid) {
   let sentCount = 0;
   try {
     if (!session.items.length) {
-      await sendText(jid, 'Sesi QR selesai, tetapi belum ada pesan yang diterima.');
+      await sendText(jid, botText('Sesi QR selesai, tetapi belum ada pesan yang diterima.'));
       return true;
     }
     for (const [index, item] of session.items.entries()) {
@@ -2787,7 +2946,7 @@ async function finishRestoreByJid(jid, actorJid) {
       if (state.saveRecorder.sessions.size) throw new UserInputError('Selesaikan sesi ,save yang masih aktif sebelum restore save.');
       const result = await state.restoreSessions.restoreSaved(session);
       invalidateListKind('saved');
-      await sendText(jid, `Restore save selesai: ${result.restored} save dipulihkan (${result.mode === 'merge' ? 'gabung' : 'timpa'}). Total sekarang ${result.total} save.`);
+      await sendText(jid, botText(`Restore save selesai: ${result.restored} save dipulihkan (${result.mode === 'merge' ? 'gabung' : 'timpa'}). Total sekarang ${result.total} save.`));
     } finally {
       await state.restoreSessions.cleanup(session);
     }
@@ -2797,7 +2956,7 @@ async function finishRestoreByJid(jid, actorJid) {
   state.reminderScheduler?.stop();
   try {
     const result = await state.restoreSessions.restore(session);
-    await sendText(jid, `Restore selesai. ${result.parts} part diproses, ${result.extracted} file diekstrak ke data/.`);
+    await sendText(jid, botText(`Restore selesai. ${result.parts} part diproses, ${result.extracted} file diekstrak ke data/.`));
   } finally {
     if (isBotEnabled()) {
       state.scheduler?.start();
@@ -2816,15 +2975,15 @@ async function maybeCollectRestorePart(message) {
   }
   const item = await state.restoreSessions.add(state.sock, message);
   if (item) {
-    await sendText(message.key.remoteJid, `Restore part diterima: ${item.fileName}`);
+    await sendText(message.key.remoteJid, botText(`Restore part diterima: ${item.fileName}`));
     return true;
   }
-  await sendText(message.key.remoteJid, 'Kirim dokumen .zip untuk restore, atau ketik ,end jika semua part sudah dikirim.');
+  await sendText(message.key.remoteJid, botText('Kirim dokumen .zip untuk restore, atau ketik ,end jika semua part sudah dikirim.'));
   return true;
 }
 
 async function sendSaveRestoreScope(jid, session) {
-  await sendText(jid, `Backup berisi ${session.savedItems.length} save.\n1. Semua save\n2. Pilih save tertentu\n0. Kembali ke unggah ZIP`);
+  await sendText(jid, botText(`Backup berisi ${session.savedItems.length} save.\n1. Semua save\n2. Pilih save tertentu\n0. Kembali ke unggah ZIP`));
 }
 
 async function sendSaveRestoreList(jid, session) {
@@ -2839,7 +2998,7 @@ async function sendSaveRestoreList(jid, session) {
 }
 
 async function sendSaveRestoreMode(jid, session) {
-  await sendText(jid, `${session.selectedIds.size} save dipilih.\n1. Timpa seluruh koleksi save sekarang dengan pilihan backup\n2. Gabung sebagai save baru (judul bentrok diberi pembeda)\n0. Kembali`);
+  await sendText(jid, botText(`${session.selectedIds.size} save dipilih.\n1. Timpa seluruh koleksi save sekarang dengan pilihan backup\n2. Gabung sebagai save baru (judul bentrok diberi pembeda)\n0. Kembali`));
 }
 
 async function handleSaveRestoreChoice(jid, actorJid, text) {
@@ -2849,7 +3008,7 @@ async function handleSaveRestoreChoice(jid, actorJid, text) {
   if (session.phase === 'scope') {
     if (choice === '0') {
       session.phase = 'upload';
-      await sendText(jid, 'Kirim ZIP/part backup tambahan, lalu ketik ,end.');
+      await sendText(jid, botText('Kirim ZIP/part backup tambahan, lalu ketik ,end.'));
     } else if (choice === '1') {
       session.scopeSelection = 'all';
       session.selectedIds = new Set(session.savedItems.map((item) => item.id));
@@ -2916,25 +3075,25 @@ async function handleReminder(message, command) {
     const actorJid = messageActorJid(message);
     const target = resolveDestinationInput(PRIMARY_TARGET_NAME, actorJid);
     state.taskRecorder.start(jid, { targetInput: PRIMARY_TARGET_NAME, intervalMs, count: 1, loop: false }, actorJid, target);
-    const sent = await sendText(jid, 'Listening reminder. Kirim teks/media/VN/lokasi. Selesai: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.');
+    const sent = await sendText(jid, botText('Listening reminder. Kirim teks/media/VN/lokasi. Selesai: ,end atau ✅/👍/❤️. Batal: ,cancel atau ❌/👎/❎.'));
     registerSessionPrompt(sent.key, jid, actorJid);
     return;
   }
   const reminder = await createReminder(command.args);
-  await sendText(message.key.remoteJid, `Reminder #${reminder.id} dibuat. Terkirim dalam ${formatCountdown(new Date(reminder.dueAt).getTime() - Date.now())} ke ${PRIMARY_TARGET_NAME}.`);
+  await sendText(message.key.remoteJid, botText(`Reminder #${reminder.id} dibuat. Terkirim dalam ${formatCountdown(new Date(reminder.dueAt).getTime() - Date.now())} ke ${PRIMARY_TARGET_NAME}.`));
 }
 
 async function handleClear(jid) {
   if (hasAnyTempSession()) throw new UserInputError('Tidak bisa clear temp saat ada sesi save/anticall/PDF/QR/restore aktif.');
   await cleanupStartupTemp();
-  await sendText(jid, 'Temp dibersihkan.');
+  await sendText(jid, botText('Temp dibersihkan.'));
 }
 
 async function handleBackup(jid) {
   storageTarget('backup');
-  await sendText(jid, 'Membuat backup data/...');
+  await sendText(jid, botText('Membuat backup data/...'));
   const files = await runConfiguredBackup();
-  await sendText(jid, `Backup selesai ke ${formatDestinationLine('backup')}:\n${files.join('\n')}`);
+  await sendText(jid, botText(`Backup selesai ke ${formatDestinationLine('backup')}:\n${files.join('\n')}`));
 }
 
 async function handleLog(jid, command) {
@@ -2946,7 +3105,7 @@ async function handleLog(jid, command) {
     .sort()
     .reverse();
   if (!files.length) {
-    await sendText(jid, 'Belum ada file log.');
+    await sendText(jid, botText('Belum ada file log.'));
     return;
   }
   const content = await fs.readFile(path.join(LOG_DIR, files[0]), 'utf8');
@@ -3122,7 +3281,7 @@ async function handleAdminCommand(message, command, context) {
       execute: async () => {
         const item = await state.commandAccess.addAdmin(adminJid);
         invalidateListKind('admins');
-        await sendText(jid, `Admin #${item.id} ${item.title} ditambahkan.`);
+        await sendText(jid, botText(`Admin #${item.id} ${item.title} ditambahkan.`));
       }
     });
     return;
@@ -3136,7 +3295,7 @@ async function handleAdminCommand(message, command, context) {
       execute: async () => {
         const item = await state.commandAccess.deleteAdmin(query);
         invalidateListKind('admins');
-        await sendText(jid, `Admin #${item.id} ${item.title} dihapus.`);
+        await sendText(jid, botText(`Admin #${item.id} ${item.title} dihapus.`));
       }
     });
     return;
@@ -3191,7 +3350,7 @@ async function handleConfigCommand(message, command, context) {
       saved = await state.runtimeConfig.set(key, value);
     }
     if (key.startsWith('backup.')) applyBotRuntimeState();
-    await sendText(jid, `Config ${key} disimpan: ${formatConfigValue(saved)}`);
+    await sendText(jid, botText(`Config ${key} disimpan: ${formatConfigValue(saved)}`));
     return;
   }
   throw new UserInputError('Format: ,config [get|set] <key> <value>');
@@ -3211,7 +3370,7 @@ async function handleChangedMsgCommand(message, command, context) {
     const destination = resolveDestinationInput(input, context.actorJid, { requireGroup: true });
     const item = await state.changedMessages.addAllowed(destination);
     invalidateListKind('changedmsg-allow');
-    await sendText(jid, `Changedmsg allowlist #${item.id} ditambahkan: ${item.savedName} (${shortJid(item.jid)}).`);
+    await sendText(jid, botText(`Changedmsg allowlist #${item.id} ditambahkan: ${item.savedName} (${shortJid(item.jid)}).`));
     return;
   }
   if (action === 'del' || action === 'delete') {
@@ -3223,7 +3382,7 @@ async function handleChangedMsgCommand(message, command, context) {
       execute: async () => {
         const item = await state.changedMessages.deleteAllowed(query);
         invalidateListKind('changedmsg-allow');
-        await sendText(jid, `Changedmsg allowlist #${item.id} ${item.savedName} dihapus.`);
+        await sendText(jid, botText(`Changedmsg allowlist #${item.id} ${item.savedName} dihapus.`));
       }
     });
     return;
@@ -3260,7 +3419,7 @@ async function handleStatusSaveCommand(message, command, context) {
   }
   if (action === 'on' || action === 'off') {
     await state.runtimeConfig.set('statussave.enabled', action === 'on');
-    await sendText(jid, `Penyimpanan status otomatis ${action === 'on' ? 'diaktifkan' : 'dinonaktifkan'}. Tujuan: ${formatDestinationLine('saved')}`);
+    await sendText(jid, botText(`Penyimpanan status otomatis ${action === 'on' ? 'diaktifkan' : 'dinonaktifkan'}. Tujuan: ${formatDestinationLine('saved')}`));
     if (action === 'on') await resumeStatusAutoSave();
     return;
   }
@@ -3295,7 +3454,7 @@ async function handleStatusSaveCommand(message, command, context) {
       execute: async () => {
         const item = await state.statusSave.delete(query);
         invalidateListKind('statussave');
-        await sendText(jid, `Statussave #${item.id} ${item.title} dihapus.`);
+        await sendText(jid, botText(`Statussave #${item.id} ${item.title} dihapus.`));
       }
     });
     return;
@@ -3329,7 +3488,7 @@ async function handleRestoreStart(message, command, actorJid) {
 }
 
 async function handleRestartBot(jid) {
-  await sendText(jid, 'Restart bot dimulai. Proses akan keluar dengan aman; pastikan supervisor menjalankan ulang bot.');
+  await sendText(jid, botText('Restart bot dimulai. Proses akan keluar dengan aman; pastikan supervisor menjalankan ulang bot.'));
   await logger.info('restartbot requested', { jid });
   state.scheduler?.stop();
   state.reminderScheduler?.stop();
@@ -3347,7 +3506,7 @@ async function handlePullBot(jid) {
   const branchResult = await runTool('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: ROOT_DIR });
   const branch = String(branchResult.stdout || '').trim();
   if (!branch || branch === 'HEAD') throw new UserInputError('Branch aktif tidak terdeteksi (detached HEAD).');
-  await sendText(jid, `Menjalankan git pull ${UPDATE_REMOTE} ${branch}...`);
+  await sendText(jid, botText(`Menjalankan git pull ${UPDATE_REMOTE} ${branch}...`));
   const pull = await runTool('git', ['pull', UPDATE_REMOTE, branch], { cwd: ROOT_DIR });
   await sendText(jid, [
     `Pull branch ${branch} selesai.`,
@@ -3358,7 +3517,7 @@ async function handlePullBot(jid) {
 }
 
 async function handleUpdateBot(jid) {
-  await sendText(jid, `Menjalankan git pull ${UPDATE_REMOTE} ${UPDATE_BRANCH}...`);
+  await sendText(jid, botText(`Menjalankan git pull ${UPDATE_REMOTE} ${UPDATE_BRANCH}...`));
   const pull = await runTool('git', ['pull', UPDATE_REMOTE, UPDATE_BRANCH], { cwd: ROOT_DIR });
   const pullText = formatCommandOutput(pull) || 'git pull selesai tanpa output.';
 
@@ -3548,6 +3707,12 @@ async function handleCommand(message, command, context = commandContext(message)
     case 'stimpa':
       await handleStimpa(message, command, context.actorJid);
       break;
+    case 'dl':
+    case 'yt':
+    case 'ig':
+    case 'tt':
+      await handleSocialDownload(message, command);
+      break;
     case 'toimg':
       await handleToImg(message);
       break;
@@ -3645,7 +3810,7 @@ async function handleCommand(message, command, context = commandContext(message)
       await handleEndSession(jid, context.actorJid);
       break;
     default:
-      await sendText(jid, `Command tidak dikenal: ${COMMAND_PREFIX}${command.name}\nKetik ,help`);
+      await sendText(jid, botText(`Command tidak dikenal: ${COMMAND_PREFIX}${command.name}\nKetik ,help`));
       break;
   }
 }
@@ -4055,7 +4220,7 @@ async function handleJadibot(message, command, context) {
   request.id = nextJadibotRequestId++;
   request.createdAt = Date.now();
   jadibotRequests.set(request.id, request);
-  await sendText(jid, 'Permintaan jadibot dikirim ke admin. Tunggu persetujuan, ya.');
+  await sendText(jid, botText('Permintaan jadibot dikirim ke admin. Tunggu persetujuan, ya.'));
   const notice = await sendText(ownUserJid(), formatJadibotNotice(request));
   request.noticeKey = notice?.key || null;
 }
@@ -4212,7 +4377,7 @@ async function startJadibotPairing(request) {
   jadibotPairings.set(request.requesterJid, pairing);
   const target = request.mode === 'code' ? 'Kode tautan' : 'QR';
   if (request.byAdmin) {
-    await sendText(request.chatJid, `${target} untuk calon worker dikirim ${isPrivateChat ? 'di chat ini' : 'ke chat pribadi kamu'}. Berlaku 60 detik.`);
+    await sendText(request.chatJid, botText(`${target} untuk calon worker dikirim ${isPrivateChat ? 'di chat ini' : 'ke chat pribadi kamu'}. Berlaku 60 detik.`));
   } else {
     await sendText(request.chatJid, isPrivateChat
       ? `Disetujui admin! ${target} dikirim di chat ini.`
@@ -4375,14 +4540,14 @@ function createWorkerScope(worker, connection) {
       get connected() { return connection.connected; },
       chatDirectory: new ChatDirectory(),
       viewOnceCache: new ViewOnceCache(),
-      soundStickerCache: new SoundStickerAudioCache(),
+      soundStickerCache: createSoundStickerCache(dataDir),
       sessionPrompts: new Map(),
       confirmStore: new PendingConfirmStore(),
       reactionActions: new ReactionActionStore(),
       ignoredOwnMessageIds: new Set(),
       pdfSessions: new PdfSessions(ownerState.tools),
       toVideoSessions: new ToVideoSessions(ownerState.tools),
-      stimpaSessions: new StimpaSessions(),
+      stimpaSessions: new StimpaSessions(ownerState.tools?.tesseract),
       qrSessions: new QrSessions(),
       restoreSessions: new RestoreSessions(),
       saveRecorder: new SaveRecorder({ file: path.join(dataDir, 'saved-messages.json'), mediaDir: path.join(dataDir, 'saved-messages') }),
@@ -4409,11 +4574,13 @@ async function startWorker(worker) {
       onClose: () => handleWorkerClose(runtime),
       onLoggedOut: () => handleWorkerLoggedOut(runtime),
       onMessages: (event) => workerScope.run(runtime.scope, () => onWorkerMessageUpsert(runtime, event)),
-      onReactions: (updates) => workerScope.run(runtime.scope, () => onWorkerReactions(runtime, updates))
+      onReactions: (updates) => workerScope.run(runtime.scope, () => onWorkerReactions(runtime, updates)),
+      onContacts: (contacts) => rememberImportantContacts(runtime, contacts)
     }
   });
   runtime.scope = createWorkerScope(worker, runtime.connection);
   workerRuntimes.set(worker.id, runtime);
+  await runtime.scope.state.soundStickerCache.load();
   await runAsOwner(() => runtime.connection.start());
   return runtime;
 }
@@ -4481,6 +4648,7 @@ async function showWorkerTyping(jid, delayRange) {
 }
 
 async function onWorkerMessageUpsert(runtime, event) {
+  recordImportant(runtime, event);
   if (event.type !== 'notify') return;
   for (const message of event.messages || []) {
     if (!message.message || !message.key?.remoteJid) continue;
@@ -4657,7 +4825,7 @@ async function runWorkerCommand(runtime, worker, message, command, { actorJid, v
   const jid = message.key.remoteJid;
   if (!workerCommandAllowed(worker, command.name)) {
     const exitHint = viaAdmin ? ' Keluar dari sesi worker dengan ,worker exit.' : '';
-    await sendText(jid, `Command ${COMMAND_PREFIX}${command.name} tidak tersedia untuk worker ini. Ketik ,help${exitHint}`);
+    await sendText(jid, botText(`Command ${COMMAND_PREFIX}${command.name} tidak tersedia untuk worker ini. Ketik ,help${exitHint}`));
     return;
   }
   if (!viaAdmin && !['end', 'cancel', 'confirm'].includes(command.name)) {
@@ -4680,16 +4848,14 @@ async function runWorkerCommand(runtime, worker, message, command, { actorJid, v
 }
 
 async function handleWorkerStatus(jid, worker) {
+  const online = workerRuntimes.get(worker.id)?.connection.connected;
   await sendText(jid, [
-    `*Status worker #${worker.id}*`,
-    `Nomor: +${worker.phone}`,
-    `Koneksi: ${workerRuntimes.get(worker.id)?.connection.connected ? 'online' : 'offline'}`,
-    `Service: ${worker.service || 'default'}`,
-    `Terhubung sejak: ${worker.connectedAt ? formatWib(worker.connectedAt) : '-'}`,
-    worker.service === 'cinta' ? `Balasan cinta terkirim: ${worker.stats?.cintaReplies || 0}` : null,
+    `${online ? '🟢' : '🔴'} *Worker #${worker.id}* · ${online ? 'online' : 'offline'}`,
+    `• Nomor: +${worker.phone}`,
+    `• Terhubung sejak: ${worker.connectedAt ? formatWib(worker.connectedAt) : '-'}`,
     '',
-    'Berhenti jadi worker: logout perangkat tertaut di WhatsApp.'
-  ].filter((line) => line !== null).join('\n'));
+    replyHint('Berhenti jadi worker: logout perangkat tertaut di WhatsApp.')
+  ].join('\n'));
 }
 
 async function toPhoneJid(sock, jid) {
@@ -4773,13 +4939,13 @@ async function startAdminWorkerSession(jid, worker) {
 
 async function exitAdminWorkerSession(jid) {
   if (!adminWorkerSession) {
-    await sendText(jid, 'Tidak ada sesi worker yang aktif.');
+    await sendText(jid, botText('Tidak ada sesi worker yang aktif.'));
     return;
   }
   if (adminSessionHasActiveSession()) throw new UserInputError(`Masih ada sesi aktif di worker #${adminWorkerSession.workerId}. Selesaikan dengan ,end atau batalkan dengan ,cancel dulu, lalu ,worker exit.`);
   const workerId = adminWorkerSession.workerId;
   adminWorkerSession = null;
-  await sendText(jid, `Keluar dari sesi worker #${workerId}.`);
+  await sendText(jid, botText(`Keluar dari sesi worker #${workerId}.`));
 }
 
 async function handleAdminSessionMessage(message, text, command) {
@@ -4817,6 +4983,8 @@ async function handleWorkerAdminCommand(message, command, context) {
     await handleWorkerServiceCommand(jid, command.args.slice(1));
   } else if (action === 'default') {
     await handleWorkerDefaultCommand(jid, command.args.slice(1));
+  } else if (action === 'key') {
+    await handleWorkerKeyCommand(jid, command.args.slice(1));
   } else {
     throw new UserInputError(HELP_DETAILS.worker.join('\n'));
   }
@@ -4838,7 +5006,7 @@ async function sendWorkerInfo(jid, worker) {
   if (worker.hasProfilePicture && await fileExists(profilePath)) {
     await sendBotMessage(jid, { image: { url: profilePath }, caption });
   } else {
-    await sendText(jid, `${caption}\nFoto profil: tidak tersedia`);
+    await sendText(jid, botText(`${caption}\nFoto profil: tidak tersedia`));
   }
 }
 
@@ -4852,17 +5020,31 @@ async function handleWorkerServiceCommand(jid, args) {
   if (!serviceName) throw new UserInputError('Format: ,worker service <id|nomor> <nama|off>');
   if (serviceName === 'off') {
     await state.workerStore.update(worker.id, { service: null });
-    await sendText(jid, `Service worker #${worker.id} dilepas. Worker kembali memakai command default.`);
+    await syncImportantWeb();
+    await sendText(jid, card({ icon: ICON.ok, title: `Service worker #${worker.id} dilepas`, lines: ['Worker kembali pakai command default.'] }));
     return;
   }
   const service = findWorkerService(serviceName);
   if (!service) throw new UserInputError(`Service "${serviceName}" tidak ada. Lihat ,worker service list`);
   await state.workerStore.update(worker.id, { service: service.name });
-  await sendText(jid, [
-    `Worker #${worker.id} sekarang memakai service ${service.name}.`,
-    `Pakai service: ,worker session ${worker.id}, lalu ketik ,${service.commands[0]} di chat mana pun.`,
-    service.name === 'audit' ? 'Worker audit pasif dan hanya membalas di DM dengan nomor worker atau di grup yang sama.' : null
-  ].filter(Boolean).join('\n'));
+  await syncImportantWeb();
+  if (service.name === 'important') {
+    await sendText(jid, card({
+      icon: ICON.ok,
+      title: `Worker #${worker.id} pakai service important`,
+      lines: ['Semua chat masuk & keluar dicatat terenkripsi.', ...importantUrls().map((url) => `• ${url}`)],
+      hint: `Key login: ${cmd(',worker key')}`
+    }));
+    return;
+  }
+  await sendText(jid, card({
+    icon: ICON.ok,
+    title: `Worker #${worker.id} pakai service ${service.name}`,
+    lines: [
+      `Cara pakai: ${cmd(`,worker session ${worker.id}`)}, lalu ketik ${cmd(`,${service.commands[0]}`)} di chat mana pun.`,
+      service.name === 'audit' ? 'Worker audit pasif: hanya membalas di DM dengan nomor worker atau di grup yang sama.' : null
+    ]
+  }));
 }
 
 async function handleWorkerDefaultCommand(jid, args) {
@@ -4870,7 +5052,169 @@ async function handleWorkerDefaultCommand(jid, args) {
   const value = (args[1] || '').toLowerCase();
   if (!['on', 'off'].includes(value)) throw new UserInputError('Format: ,worker default <id|nomor> on|off');
   await state.workerStore.update(worker.id, { allowDefaultCommands: value === 'on' });
-  await sendText(jid, `Command default worker #${worker.id} ${value === 'on' ? 'diaktifkan' : 'dinonaktifkan'}.${worker.service ? '' : ' Worker tanpa service selalu memakai command default.'}`);
+  await sendText(jid, botText(`Command default worker #${worker.id} ${value === 'on' ? 'diaktifkan' : 'dinonaktifkan'}.${worker.service ? '' : ' Worker tanpa service selalu memakai command default.'}`));
+}
+
+// ---------- service "important": encrypted chat log + Web UI ----------
+const IMPORTANT_RETENTION_DAYS = 7;
+
+function importantWorkers() {
+  return (state.workerStore?.list() || []).filter((worker) => worker.service === 'important' && worker.status !== 'logged_out');
+}
+
+function isImportantWorker(id) {
+  return importantWorkers().some((worker) => worker.id === Number(id));
+}
+
+async function setupImportant() {
+  let root = IMPORTANT_ROOT;
+  try {
+    root = await prepareLocalPath(IMPORTANT_ROOT);
+  } catch (error) {
+    await logger.error('Important storage unavailable', { root: IMPORTANT_ROOT, error: error.message });
+  }
+  const vault = await new ImportantVault(path.join(ROOT_DIR, 'data', 'important-secret.json')).load();
+  const store = new ImportantStore(root, vault);
+  store.on('warn', (meta) => logger.warn('Important store warning', meta).catch(() => {}));
+  const auth = await new ImportantAuth(path.join(ROOT_DIR, 'data', 'important-auth.json')).load();
+  const recorder = new ImportantRecorder({
+    store,
+    logger,
+    downloadMedia: async (sock, message) => {
+      const media = await downloadMessageMedia(sock, message, 'important');
+      if (!media) return null;
+      let sound = null;
+      try {
+        const result = { buffer: await fs.readFile(media.path), mimetype: media.mimetype };
+        // Sound sticker: keep its audio too so the Web UI can play it.
+        if (media.type === 'stickerMessage' && stickerAudioOf(media)) {
+          sound = await downloadStickerAudio(sock, media, 'important-audio').catch(() => null);
+          if (sound) result.audio = { buffer: await fs.readFile(sound.path), mimetype: sound.mimetype };
+        }
+        return result;
+      } finally {
+        await cleanupFiles([media.path, sound?.path]);
+      }
+    }
+  });
+  const web = new ImportantWeb({
+    auth,
+    store,
+    exportSticker: exportImportantSticker,
+    logger,
+    host: IMPORTANT_HOST,
+    port: IMPORTANT_PORT,
+    workers: {
+      isImportant: isImportantWorker,
+      list: async () => importantWorkers().map((worker) => ({
+        id: worker.id,
+        name: worker.name || '',
+        phone: worker.phone,
+        status: worker.status,
+        hasAvatar: Boolean(worker.hasProfilePicture)
+      })),
+      avatar: async (id) => {
+        const worker = state.workerStore.get(id);
+        return worker ? fs.readFile(state.workerStore.profilePath(worker)).catch(() => null) : null;
+      },
+      retention: (id) => Boolean(state.workerStore.get(id)?.serviceConfig?.important?.retention7d),
+      setRetention: (id, enabled) => setImportantRetention(id, enabled)
+    }
+  });
+  state.important = { store, auth, recorder, web };
+  await syncImportantWeb();
+  setInterval(() => runImportantRetention().catch((error) => handleFailure(error)), 60 * 60 * 1000).unref();
+  runImportantRetention().catch((error) => handleFailure(error));
+}
+
+// Web UI download of a stored sticker: sound sticker -> mp4 with its audio,
+// animated -> gif, static -> png. Temp files are removed right away.
+async function exportImportantSticker(sticker, audio) {
+  const stickerPath = makeTempPath('important-sticker', '.webp');
+  const audioPath = audio ? makeTempPath('important-sticker-audio', '.ogg') : null;
+  try {
+    await fs.writeFile(stickerPath, sticker);
+    const media = { path: stickerPath, type: 'stickerMessage', mimetype: 'image/webp', fileName: 'sticker.webp' };
+    if (audio && state.tools?.ffmpeg) {
+      await fs.writeFile(audioPath, audio);
+      const video = await stickerToAudioVideo(media, audioPath, state.tools);
+      return { buffer: video.buffer, mimetype: 'video/mp4', ext: 'mp4' };
+    }
+    return await stickerToDownload(media, state.tools);
+  } finally {
+    await cleanupFiles([stickerPath, audioPath]);
+  }
+}
+
+async function setImportantRetention(id, enabled) {
+  const worker = state.workerStore.get(id);
+  if (!worker) return;
+  const serviceConfig = worker.serviceConfig || {};
+  await state.workerStore.update(worker.id, {
+    serviceConfig: { ...serviceConfig, important: { ...(serviceConfig.important || {}), retention7d: Boolean(enabled) } }
+  });
+}
+
+// The Web UI only runs while at least one worker uses the service.
+async function syncImportantWeb() {
+  const web = state.important?.web;
+  if (!web) return;
+  if (importantWorkers().length) await web.start().catch(() => {});
+  else if (web.running) await web.stop();
+}
+
+async function runImportantRetention() {
+  for (const worker of importantWorkers()) {
+    if (!worker.serviceConfig?.important?.retention7d) continue;
+    await state.important.store.purgeOlderThan(worker.id, IMPORTANT_RETENTION_DAYS);
+  }
+}
+
+function recordImportant(runtime, event) {
+  const worker = state.workerStore?.get(runtime.workerId);
+  if (worker?.service !== 'important' || !state.important) return;
+  state.important.recorder.record(worker.id, runtime.connection?.sock, event);
+}
+
+function rememberImportantContacts(runtime, contacts) {
+  if (state.workerStore?.get(runtime.workerId)?.service !== 'important' || !state.important) return;
+  state.important.recorder.rememberContacts(runtime.workerId, contacts).catch(() => {});
+}
+
+function importantUrls() {
+  const web = state.important?.web;
+  const port = IMPORTANT_PORT;
+  const urls = [`http://${TAILSCALE_HOSTNAME}:${port}`];
+  if (web?.host) urls.push(`http://${web.host}:${port}`);
+  return urls;
+}
+
+async function handleWorkerKeyCommand(jid, args) {
+  const auth = state.important?.auth;
+  if (!auth) throw new UserInputError('Web UI important belum siap. Coba lagi sebentar.');
+  const action = (args[0] || '').toLowerCase();
+  if (action && action !== 'reset') throw new UserInputError(`Format: ${cmd(',worker key')} atau ${cmd(',worker key reset')}`);
+  const status = state.important.web.running
+    ? '🟢 Web UI aktif (khusus Tailscale)'
+    : (importantWorkers().length ? '🟡 Web UI menunggu Tailscale' : '⚪ Web UI mati: belum ada worker dengan service important');
+  const links = importantUrls().map((url) => `• ${url}`);
+  if (!action && auth.hasKey()) {
+    await sendText(jid, card({
+      icon: ICON.key,
+      title: 'Key Web UI sudah ada',
+      lines: ['Demi keamanan, key hanya ditampilkan sekali saat dibuat.', '', status, ...links],
+      hint: `Lupa key? Ketik ${cmd(',worker key reset')}`
+    }));
+    return;
+  }
+  const key = await auth.createKey();
+  state.important.web.dropSessions();
+  await sendText(jid, card({
+    icon: ICON.key,
+    title: action === 'reset' ? 'Key baru dibuat' : 'Key Web UI',
+    lines: [`${cmd(key)}`, '', status, ...links, action === 'reset' ? '\nSemua login lama sudah dikeluarkan.' : null],
+    hint: 'Simpan baik-baik. Hapus pesan ini setelah dicatat.'
+  }));
 }
 
 function currentWorker() {
@@ -5011,7 +5355,7 @@ async function handleCintaCommand(worker, jid, command, actorJid) {
   } else if (action === 'trigger') {
     const triggers = parseCintaTriggers(command.rawArgs.replace(/^\S+/, ''));
     await updateCintaConfig(worker, { triggers });
-    await sendText(jid, `Trigger tersimpan: ${triggers.map((trigger) => `"${trigger}"`).join(', ')}`);
+    await sendText(jid, botText(`Trigger tersimpan: ${triggers.map((trigger) => `"${trigger}"`).join(', ')}`));
   } else if (action === 'emoji') {
     const reactionEmoji = parseReactionEmoji(command.args[1]);
     await updateCintaConfig(worker, { reactionEmoji });
@@ -5034,7 +5378,7 @@ async function handleCintaEmojiTrigger(worker, jid, command) {
   const input = command.rawArgs.replace(/^\S+/, '').trim();
   if (!input) {
     const current = cintaConfig(worker).reactionTriggers;
-    await sendText(jid, `Emoji pemicu: ${current.length ? current.join(',') : 'nonaktif'}\nUbah: ,cinta emojitrigger <emoji,emoji> atau - untuk mematikan.`);
+    await sendText(jid, botText(`Emoji pemicu: ${current.length ? current.join(',') : 'nonaktif'}\nUbah: ,cinta emojitrigger <emoji,emoji> atau - untuk mematikan.`));
     return;
   }
   const reactionTriggers = parseReactionTriggers(input);
@@ -5047,7 +5391,7 @@ async function handleCintaEmojiTrigger(worker, jid, command) {
 async function startCintaRecording(jid, actorJid) {
   assertNoActiveSession(jid);
   await state.cintaRecorder.start(jid, actorJid);
-  const sent = await sendText(jid, 'Mulai rekam pesan otomatis cinta. Kirim teks, gambar, atau media lain lalu ,end atau ✅ untuk simpan, ,cancel atau ❌ untuk batal. Rekaman baru menggantikan pesan otomatis lama.');
+  const sent = await sendText(jid, botText('Mulai rekam pesan otomatis cinta. Kirim teks, gambar, atau media lain lalu ,end atau ✅ untuk simpan, ,cancel atau ❌ untuk batal. Rekaman baru menggantikan pesan otomatis lama.'));
   registerSessionPrompt(sent.key, jid, actorJid);
 }
 
@@ -5060,7 +5404,7 @@ async function finishCintaByJid(jid, actorJid) {
   if (!entries) return false;
   await updateCintaConfig(worker, { entries: relativeEntries(entries, dataDir) });
   await removeStoredMedia(previousEntries, dataDir);
-  await sendText(jid, `Pesan otomatis cinta tersimpan (${entries.length} item). Ketik ,cinta test untuk mencoba.`);
+  await sendText(jid, botText(`Pesan otomatis cinta tersimpan (${entries.length} item). Ketik ,cinta test untuk mencoba.`));
   return true;
 }
 
@@ -5072,7 +5416,7 @@ async function resetCintaConfig(worker, jid, actorJid) {
     execute: async () => {
       await removeStoredMedia(cintaConfig(worker).entries, dataDir);
       await state.workerStore.update(worker.id, { serviceConfig: { ...worker.serviceConfig, cinta: {} } });
-      await sendText(jid, 'Pengaturan cinta dikembalikan ke bawaan.');
+      await sendText(jid, botText('Pengaturan cinta dikembalikan ke bawaan.'));
     }
   });
 }
@@ -5127,10 +5471,13 @@ async function main() {
   setInterval(() => state.statusInbox.serial(() => state.statusInbox.save()).catch((error) => handleFailure(error)), 60000).unref();
   try { state.reactionActions.prompts = new Set(JSON.parse(await fs.readFile(path.join(ROOT_DIR, 'data', 'prompt-keys.json'), 'utf8'))); } catch {}
   state.tools = await detectTools();
+  await state.soundStickerCache.load();
+  if (!state.tools.tesseract) await logger.warn('Tesseract unavailable; automatic sticker titles fall back to the configured title');
   state.workerStore = await new WorkerStore().load();
+  await setupImportant();
   state.pdfSessions = new PdfSessions(state.tools);
   state.toVideoSessions = new ToVideoSessions(state.tools);
-  state.stimpaSessions = new StimpaSessions();
+  state.stimpaSessions = new StimpaSessions(state.tools.tesseract);
   state.qrSessions = new QrSessions();
   state.restoreSessions = new RestoreSessions();
   state.saveRecorder = new SaveRecorder();
@@ -5154,7 +5501,9 @@ async function main() {
     ffprobe: Boolean(state.tools.ffprobe),
     office: Boolean(state.tools.office),
     pdftoppm: Boolean(state.tools.pdftoppm),
-    magick: Boolean(state.tools.magick)
+    magick: Boolean(state.tools.magick),
+    tesseract: Boolean(state.tools.tesseract),
+    ytdlp: Boolean(state.tools.ytdlp)
   });
   await connect();
   await startAllWorkers();
@@ -5167,6 +5516,13 @@ process.on('SIGINT', async () => {
   state.reminderScheduler?.stop();
   state.backupScheduler?.stop();
   state.typing?.detach();
+  await state.important?.store.flush().catch(() => {});
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  await logger.info('SIGTERM received');
+  await state.important?.store.flush().catch(() => {});
   process.exit(0);
 });
 

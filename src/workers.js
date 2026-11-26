@@ -167,6 +167,8 @@ export class WorkerStore {
   }
 }
 
+const STATUS_ICONS = { online: '🟢', offline: '🔴', logged_out: '⚫', connecting: '🟡', pending: '🟡' };
+
 export function workerStatusLabel(worker) {
   return STATUS_LABELS[worker.status] || worker.status;
 }
@@ -176,17 +178,17 @@ export function waLink(worker) {
 }
 
 export function formatWorkerList(workers) {
-  if (!workers.length) return 'Belum ada worker. User bisa mendaftar dengan ,jadibot.';
-  const lines = [`*Daftar worker* (${workers.length})`];
+  if (!workers.length) return '👥 Belum ada worker.\n_User bisa daftar lewat `,jadibot`._';
+  const lines = [`👥 *Worker* · ${workers.length}`];
   for (const worker of workers) {
     lines.push(
       '',
-      `#${worker.id} ${worker.name || worker.phone} - ${workerStatusLabel(worker)}`,
-      waLink(worker),
-      `Service: ${worker.service || 'default'}`
+      `${STATUS_ICONS[worker.status] || '⚪'} *#${worker.id} ${worker.name || `+${worker.phone}`}*`,
+      `• ${workerStatusLabel(worker)} · service ${worker.service || 'default'}`,
+      `• ${waLink(worker)}`
     );
   }
-  lines.push('', 'Detail: ,worker info <id|nomor>');
+  lines.push('', '_Detail: `,worker info <id|nomor>`_');
   return lines.join('\n');
 }
 
@@ -200,24 +202,21 @@ export function formatWorkerInfo(worker, { folder, notesCount = 0, linksCount = 
   const formatTime = (value) => (value ? formatWib(value) : '-');
   const defaultCommands = worker.service ? (worker.allowDefaultCommands ? 'aktif' : 'nonaktif') : 'aktif';
   return [
-    `*Worker #${worker.id}*`,
-    `Nama: ${worker.name || '-'}`,
-    `Nomor: +${worker.phone}`,
-    `Link: ${waLink(worker)}`,
-    `Status: ${workerStatusLabel(worker)}`,
-    `Service: ${worker.service || 'default'}`,
-    `Command default: ${defaultCommands}`,
-    `Akses publik: ${(worker.publicChats || []).length} chat`,
-    `Sesi admin: ${adminSession ? 'aktif' : 'tidak aktif'}`,
+    `${STATUS_ICONS[worker.status] || '⚪'} *Worker #${worker.id}* · ${worker.name || '-'}`,
+    `• Nomor: +${worker.phone} (${waLink(worker)})`,
+    `• Status: ${workerStatusLabel(worker)}`,
+    `• Service: ${worker.service || 'default'} · command default ${defaultCommands}`,
+    `• Akses publik: ${(worker.publicChats || []).length} chat · sesi admin ${adminSession ? 'aktif' : 'mati'}`,
+    worker.service === 'cinta' ? `• Balasan cinta: ${worker.stats?.cintaReplies || 0}` : null,
+    worker.service === 'important' ? `• Auto-hapus 7 hari: ${worker.serviceConfig?.important?.retention7d ? 'aktif' : 'mati'}` : null,
     '',
-    `Pertama login: ${formatTime(worker.createdAt)}`,
-    `Terhubung sejak: ${formatTime(worker.connectedAt)}`,
-    `Terakhir aktif: ${formatTime(worker.lastSeenAt)}`,
-    worker.loggedOutAt ? `Logout: ${formatTime(worker.loggedOutAt)}` : null,
-    `Pemohon: ${formatRequester(worker.requestedBy)}`,
+    '🕒 *Waktu*',
+    `• Pertama login: ${formatTime(worker.createdAt)}`,
+    `• Terhubung: ${formatTime(worker.connectedAt)}`,
+    `• Terakhir aktif: ${formatTime(worker.lastSeenAt)}`,
+    worker.loggedOutAt ? `• Logout: ${formatTime(worker.loggedOutAt)}` : null,
     '',
-    `Folder: ${folder || '-'}`,
-    `Note: ${notesCount}, link: ${linksCount}`,
-    worker.service === 'cinta' ? `Balasan cinta terkirim: ${worker.stats?.cintaReplies || 0}` : null
+    `📁 ${folder || '-'} · ${notesCount} note · ${linksCount} link`,
+    `_Pemohon: ${formatRequester(worker.requestedBy)}_`
   ].filter((line) => line !== null).join('\n');
 }

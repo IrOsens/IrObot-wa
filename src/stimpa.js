@@ -4,9 +4,8 @@ import os from 'node:os';
 import sharp from 'sharp';
 import webp from 'node-webpmux';
 import { UserInputError } from './errors.js';
-import { DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE } from './config.js';
 import { cleanupFiles, downloadMessageMedia } from './media.js';
-import { buildStickerExif, decodeStickerFrames, isAnimatedMedia } from './sticker.js';
+import { applyStickerMetadata, decodeStickerFrames, isAnimatedMedia } from './sticker.js';
 
 const SESSION_MS = 30 * 60 * 1000;
 const CANVAS = 512;
@@ -21,7 +20,10 @@ const PRESETS = [
 ];
 
 export class StimpaSessions {
-  constructor() { this.sessions = new Map(); }
+  constructor(tesseract = null) {
+    this.tesseract = tesseract;
+    this.sessions = new Map();
+  }
   has(jid) { return this.sessions.has(jid); }
   get(jid) { return this.sessions.get(jid) || null; }
   count() { return this.sessions.size; }
@@ -112,12 +114,9 @@ export class StimpaSessions {
     try {
       await onProgress(5, session.edit ? 'Membaca gambar edit' : 'Menyiapkan stiker');
       if (!session.edit) {
-        // Preserve the image while applying the configured sticker metadata.
-        const image = new webp.Image();
-        await image.load(session.media.path);
-        image.exif = buildStickerExif(DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE);
+        const result = await applyStickerMetadata(session.media.path, { tesseract: this.tesseract });
         await onProgress(92, 'Mengirim stiker');
-        await send(await image.save(null), session.audio, { isAnimated: session.animated });
+        await send(result, session.audio, { isAnimated: session.animated });
         await onProgress(100, 'Selesai');
         this.sessions.delete(jid);
         await cleanupFiles(session.files);
@@ -137,12 +136,14 @@ export class StimpaSessions {
       let result;
       for (const [index, preset] of PRESETS.entries()) {
         await onProgress(20 + Math.round(index * 13), `Membuat stiker (${preset.canvas}px)`);
-        result = session.animated
+        const rendered = session.animated
           ? await renderSticker(decoded, overlay, preset)
           : await renderStaticSticker(decoded, overlay, preset);
+        if (rendered.length > MAX_BYTES) continue;
+        result = await applyStickerMetadata(rendered, { tesseract: this.tesseract });
         if (result.length <= MAX_BYTES) break;
       }
-      if (result.length > MAX_BYTES) throw new UserInputError('Stiker hasil masih terlalu besar untuk WhatsApp. Sederhanakan gambar edit lalu coba lagi.');
+      if (!result || result.length > MAX_BYTES) throw new UserInputError('Stiker hasil masih terlalu besar untuk WhatsApp. Sederhanakan gambar edit lalu coba lagi.');
       await onProgress(92, 'Mengirim stiker');
       await send(result, session.audio, { isAnimated: session.animated });
       await onProgress(100, 'Selesai');
@@ -160,14 +161,10 @@ async function renderStaticSticker(decoded, overlay, preset) {
   const [frame] = decoded.frames;
   const overlayPng = await sharp(overlay, { raw: { width: CANVAS, height: CANVAS, channels: 4 } })
     .resize(preset.canvas, preset.canvas).png().toBuffer();
-  const buffer = await sharp(frame.data, { raw: { width: decoded.width, height: decoded.height, channels: 4 } })
+  return sharp(frame.data, { raw: { width: decoded.width, height: decoded.height, channels: 4 } })
     .resize(preset.canvas, preset.canvas, { fit: 'contain', background: '#00000000' })
     .composite([{ input: overlayPng, left: 0, top: 0 }])
     .webp({ quality: preset.quality, alphaQuality: 100, effort: 5 }).toBuffer();
-  const image = new webp.Image();
-  await image.load(buffer);
-  image.exif = buildStickerExif(DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE);
-  return image.save(null);
 }
 
 async function previewFrame(data, width, height) {
@@ -231,14 +228,5 @@ async function renderSticker(decoded, overlay, preset) {
     frames.push(await webp.Image.generateFrame({ buffer: image, delay, x: 0, y: 0, blend: false, dispose: false }));
   }
   if (frames.length < 2) throw new UserInputError('Animasi sumber terlalu pendek untuk dibuat menjadi stiker bergerak.');
-  const output = path.join(os.tmpdir(), `stimpa-${Date.now()}-${Math.random().toString(36).slice(2)}.webp`);
-  try {
-    await webp.Image.save(output, { width: preset.canvas, height: preset.canvas, frames, bgColor: [0, 0, 0, 0], loops: 0 });
-    const image = new webp.Image();
-    await image.load(output);
-    image.exif = buildStickerExif(DEFAULT_STICKER_AUTHOR, DEFAULT_STICKER_TITLE);
-    return await image.save(null);
-  } finally {
-    await fs.rm(output, { force: true });
-  }
+  return webp.Image.save(null, { width: preset.canvas, height: preset.canvas, frames, bgColor: [0, 0, 0, 0], loops: 0 });
 }
