@@ -20,7 +20,6 @@ import { getMessageText } from '../src/text.js';
 import { recordMessageEntry } from '../src/recordedMessages.js';
 import {
   isAnimatedMedia,
-  makeSmemeOverlaySvg,
   makeSmemeSticker,
   makeSticker,
   parseSmemeArgs,
@@ -687,22 +686,93 @@ test('save update preview replays recent media with its native type', async () =
   }
 });
 
-test('smeme text keeps emoji as colored emoji run', async () => {
+const hasImpact = await fs.access(new URL('../data/fonts/impact.ttf', import.meta.url))
+  .then(() => true, () => false);
+
+test('smeme separates colored emoji from text', () => {
   assert.deepEqual(splitSmemeTextRuns('halo 🐫 ok').map((run) => run.type), ['text', 'emoji', 'text']);
   assert.equal(splitSmemeTextRuns('halo 🐫 ok')[1].codepoint, '1f42b');
-  const overlay = (await makeSmemeOverlaySvg('halo 🐫', 'up', 512)).toString('utf8');
-  assert.match(overlay, /class="smeme-emoji"/);
-  assert.match(overlay, /HALO/);
-  assert.doesNotMatch(overlay, /01F42B|1F42B/);
 });
 
-test('smeme long text stays inside padded canvas', async () => {
-  const canvas = 512;
-  const overlay = (await makeSmemeOverlaySvg('ini teks sangat panjang sekali sampai harus mengecil dan tetap tidak keluar dari gambar kanan kiri', 'up', canvas)).toString('utf8');
-  const xs = [...overlay.matchAll(/<text class="smeme-text" x="([\d.]+)"/g)].map((match) => Number(match[1]));
-  assert.ok(xs.length > 0);
-  assert.ok(xs.every((x) => x >= 20 && x < canvas));
+test('smeme centers outlined captions inside photos and transparent stickers', {
+  skip: hasImpact ? false : 'Impact belum dipasang'
+}, async () => {
+  const tempRoot = path.join(process.cwd(), 'temp');
+  await fs.mkdir(tempRoot, { recursive: true });
+  const work = await fs.mkdtemp(path.join(tempRoot, 'smeme-test-'));
+  try {
+    const photo = path.join(work, 'photo.png');
+    await sharp({ create: { width: 512, height: 200, channels: 3, background: '#305db7' } }).png().toFile(photo);
+    const sticker = path.join(work, 'sticker.webp');
+    await sharp({
+      create: { width: 260, height: 380, channels: 4, background: '#305db7' }
+    }).extend({ left: 40, right: 212, top: 80, bottom: 52, background: '#00000000' })
+      .webp({ lossless: true }).toFile(sticker);
+    const animated = path.join(work, 'animated.webp');
+    const buffer = await fs.readFile(sticker);
+    const frames = await Promise.all([80, 120].map((delay) => (
+      webp.Image.generateFrame({ buffer, delay, blend: false })
+    )));
+    await webp.Image.save(animated, { width: 512, height: 512, frames });
+    const stickerBounds = { left: 40, top: 80, width: 260, height: 380 };
+    const sources = [
+      { path: photo, mimetype: 'image/png', bounds: { left: 0, top: 156, width: 512, height: 200 } },
+      { path: sticker, mimetype: 'image/webp', bounds: stickerBounds },
+      { path: animated, mimetype: 'image/webp', bounds: stickerBounds, animated: true }
+    ];
+    for (const source of sources) {
+      for (const position of ['up', 'down']) {
+        const output = await makeSmemeSticker(source, {
+          smeme: parseSmemeArgs([position, 'teks panjang yang tetap di tengah 🐫'])
+        });
+        await assertSmemeCaption(output, source.bounds, position);
+        if (source.animated) await assertSmemeCaption(output, source.bounds, position, 1);
+      }
+    }
+  } finally {
+    await fs.rm(work, { recursive: true, force: true });
+  }
 });
+
+async function assertSmemeCaption(output, bounds, position, page = 0) {
+  const { data, info } = await sharp(output, { page }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  let left = info.width;
+  let top = info.height;
+  let right = -1;
+  let bottom = -1;
+  let hasWhite = false;
+  let hasBlack = false;
+  let hasEmoji = false;
+  for (let y = 0; y < info.height; y += 1) {
+    for (let x = 0; x < info.width; x += 1) {
+      const offset = (y * info.width + x) * 4;
+      if (data[offset + 3] < 200) continue;
+      const r = data[offset];
+      const g = data[offset + 1];
+      const b = data[offset + 2];
+      const white = r > 210 && g > 210 && b > 210;
+      const black = r < 30 && g < 30 && b < 30;
+      const emoji = r > 130 && g > 65 && b < 115 && r > b + 50;
+      if (!(white || black || emoji)) continue;
+      hasWhite ||= white;
+      hasBlack ||= black;
+      hasEmoji ||= emoji;
+      left = Math.min(left, x);
+      top = Math.min(top, y);
+      right = Math.max(right, x);
+      bottom = Math.max(bottom, y);
+    }
+  }
+
+  assert.ok(hasWhite && hasBlack, 'caption has white fill and a black outline');
+  assert.ok(hasEmoji, 'caption renders the emoji in color');
+  assert.ok(left > bounds.left && right < bounds.left + bounds.width);
+  assert.ok(Math.abs((left + right) / 2 - (bounds.left + bounds.width / 2)) <= 3);
+  const edgeGap = position === 'up' ? top - bounds.top : bounds.top + bounds.height - 1 - bottom;
+  const expectedGap = 0.06 * Math.min(bounds.width, bounds.height);
+  assert.ok(Math.abs(edgeGap - expectedGap) <= 4, `expected a caption inset near ${expectedGap}, got ${edgeGap}`);
+  assert.ok(top > bounds.top && bottom < bounds.top + bounds.height);
+}
 
 test('recordMessageEntry ignores WhatsApp reactions', async () => {
   const result = await recordMessageEntry(null, {
@@ -941,16 +1011,18 @@ test('animated WebP stickers convert without ffmpeg decoder support', async () =
     assert.equal(stickerImage.hasAnim, true);
     assert.equal(stickerImage.frames.length, 2);
 
-    const smeme = await makeSmemeSticker(media, {
-      author: 'A',
-      title: 'T',
-      tools: {},
-      smeme: parseSmemeArgs(['up', 'halo'])
-    });
-    const smemeImage = new webp.Image();
-    await smemeImage.load(smeme);
-    assert.equal(smemeImage.hasAnim, true);
-    assert.equal(smemeImage.frames.length, 2);
+    if (hasImpact) {
+      const smeme = await makeSmemeSticker(media, {
+        author: 'A',
+        title: 'T',
+        tools: {},
+        smeme: parseSmemeArgs(['up', 'halo'])
+      });
+      const smemeImage = new webp.Image();
+      await smemeImage.load(smeme);
+      assert.equal(smemeImage.hasAnim, true);
+      assert.equal(smemeImage.frames.length, 2);
+    }
   } finally {
     await fs.rm(work, { recursive: true, force: true });
   }
